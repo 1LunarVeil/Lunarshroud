@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "open-file-dialog"
+description = "Allow open_file_dialog and open_directory_dialog commands"
+commands.allow = ["open_file_dialog", "open_directory_dialog"]

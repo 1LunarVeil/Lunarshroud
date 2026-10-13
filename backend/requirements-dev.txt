@@ -1,0 +1,8 @@
+-r requirements.txt
+pytest==9.1.1
+pytest-cov==7.0.0
+pyinstaller==6.21.0
+ruff==0.16.4
+# Icon generation (tools/gen_icons.py) and its geometry test. Deliberately a
+# dev-only dependency: backend.spec excludes PIL/Pillow from the packaged backend.
+Pillow==12.2.0

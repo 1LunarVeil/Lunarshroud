@@ -1,0 +1,23 @@
+# Ruff 配置（仅覆盖 backend/；前端有独立的 node --check 门禁）
+line-length = 120
+target-version = "py311"
+
+exclude = ["build", "dist", "github"]
+
+[lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # bugbear（常见陷阱）
+    "UP",  # pyupgrade（现代语法）
+]
+ignore = [
+    "E501",  # 行长由 line-length + format 工具处理；存量长字符串不强制拆行
+    "UP015", # 显式 open(..., "r") 保留，可读性更好
+    "UP042", # (str, Enum) 双继承是有意为之；迁移 StrEnum 无行为收益
+]
+
+[lint.per-file-ignores]
+"backend/tests/*" = ["B011"]  # 断言否定场景用 pytest.raises，B011 与之冲突的写法不涉及

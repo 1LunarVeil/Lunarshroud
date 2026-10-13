@@ -1,0 +1,88 @@
+# -*- mode: python ; coding: utf-8 -*-
+#
+# LunarShroud backend PyInstaller spec
+# 将 Python FastAPI 后端打包为独立 backend.exe
+#
+# 使用方式：
+#   pyinstaller backend.spec
+#   输出在 backend/dist/backend.exe
+
+from PyInstaller.utils.hooks import collect_submodules
+
+a = Analysis(
+    ['main.py'],
+    # pathex 使用相对路径，clone 仓库后可直接在本目录执行 pyinstaller backend.spec
+    pathex=['.'],
+    binaries=[],
+    datas=[],
+    hiddenimports=(
+        # uvicorn 及其子模块
+        collect_submodules('uvicorn')
+        # httpx 及其子模块
+        + collect_submodules('httpx')
+        # pydantic 及其子模块
+        + collect_submodules('pydantic')
+        + collect_submodules('pydantic_core')
+        + collect_submodules('pydantic.v1')
+        # websockets（uvicorn 依赖）
+        + collect_submodules('websockets')
+        # watchfiles（uvicorn 自动重载依赖，但打包时一并包含）
+        + collect_submodules('watchfiles')
+        # anyio 及其子模块
+        + collect_submodules('anyio')
+        + collect_submodules('sniffio')
+        + collect_submodules('httpcore')
+        + collect_submodules('h11')
+        # pynvml（GPU 监控可选依赖，try/except 导入需显式收集）
+        + collect_submodules('pynvml')
+    ),
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[
+        'tkinter', 'test', 'unittest', 'pytest',
+        'setuptools', 'pip', 'wheel',
+        'numpy', 'matplotlib', 'scipy', 'pandas',
+        'PIL', 'Pillow', 'cv2', 'opencv',
+        'tensorflow', 'torch', 'keras',
+        'IPython', 'jupyter', 'notebook',
+        'sphinx', 'docutils',
+        'cryptography', 'OpenSSL',
+        'zmq', 'pyzmq',
+        'boto3', 'botocore',
+        'celery', 'redis',
+        'flask', 'django',
+        'lxml', 'beautifulsoup4',
+        'yaml', 'PyYAML',
+        'Crypto', 'Cryptodome',
+        'socks', 'PySocks',
+        'pywin32', 'win32com',
+    ],
+    noarchive=False,
+)
+
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    [],
+    name='backend',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    # Keep release output independent of whether an arbitrary UPX binary is on PATH.
+    upx=False,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=False,       # 无控制台窗口（后台服务）
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon=None,
+)

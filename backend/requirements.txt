@@ -1,0 +1,19 @@
+# Direct runtime dependencies are pinned. Transitive dependency changes are
+# monitored by the security workflow and Dependabot.
+#
+# starlette is a *transitive* dependency but is pinned here anyway: main.py's
+# request_size_middleware writes to the private `Request._body` attribute and
+# relies on `_CachedRequest.wrapped_receive` replaying it. fastapi declares
+# `starlette>=0.46.0` with no upper bound, so an unpinned install can pull a
+# version where that private contract is gone and chunked request bodies are
+# silently dropped. If you bump this, re-run the chunked-body test first
+# (test_regressions.py, "chunked" cases) and check that a POST without
+# Content-Length still reaches the route handler.
+fastapi==0.141.1
+starlette==1.3.1
+uvicorn[standard]==0.52.1
+psutil==7.2.2
+pydantic==2.13.4
+httpx==0.28.1
+# GPU monitoring prefers NVML; falls back to spawning nvidia-smi when absent
+nvidia-ml-py==13.610.43

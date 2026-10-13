@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "默认权限：仅允许主窗口调用所需的自定义命令",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "open-file-dialog",
+    "get-backend-session"
+  ]
+}

@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "get-backend-session"
+description = "Allow the main window to obtain its private backend URL and session token"
+commands.allow = ["get_backend_session"]

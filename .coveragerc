@@ -1,0 +1,11 @@
+[run]
+source = backend
+relative_files = True
+
+[report]
+omit =
+    backend/tests/*
+    */backend/tests/*
+fail_under = 75
+show_missing = True
+skip_covered = True
