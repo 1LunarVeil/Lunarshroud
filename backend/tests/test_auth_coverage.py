@@ -167,13 +167,17 @@ def test_routes_reach_their_handler_when_authenticated(app):
 
 
 def test_ready_endpoint_is_the_only_unauthenticated_route(app):
-    """就绪探测：无需令牌、凭 session_id 证明身份；答错一律 404。"""
+    """就绪探测：无需令牌、凭 session_id + nonce 的 HMAC 证明身份；答错一律 404。"""
     from fastapi.testclient import TestClient
 
     with TestClient(app) as anonymous:
-        ok = anonymous.get("/api/system/ready", params={"session": SESSION_ID})
+        ok = anonymous.get(
+            "/api/system/ready",
+            params={"session": SESSION_ID, "nonce": "coverage-nonce"},
+        )
         assert ok.status_code == 200
         assert ok.json()["session_id"] == SESSION_ID
+        assert ok.json()["proof"], "带 nonce 时必须给出 HMAC 证明"
         assert "token" not in ok.text.lower()
 
         assert anonymous.get("/api/system/ready").status_code == 404

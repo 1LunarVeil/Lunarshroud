@@ -110,7 +110,7 @@ async function relaunchLastModel() {
   try {
     records = await ctx.Api.listHistory(1, 0);
   } catch (e) {
-    ctx.showToast(`${t('chat.reloadFailed')}: ${ctx.escapeHtml(String(e && e.message ? e.message : e))}`, 'error');
+    ctx.showToast(`${t('chat.reloadFailed')}: ${String(e && e.message ? e.message : e)}`, 'error');
     return;
   }
   const last = Array.isArray(records) ? records[0] : null;
@@ -231,7 +231,11 @@ function loadInstanceUI() {
   iframe.src = safeUrl;
   iframe.className = 'chat-iframe';
   iframe.setAttribute('frameborder', '0');
-  iframe.setAttribute('allow', 'clipboard-read; clipboard-write');
+  // 沙箱化跨源 WebUI（审计 F11）：只放行脚本、表单与"自身源"（localStorage /
+  // 同源 fetch 依赖它），顶层导航、弹窗、下载等一律关闭。
+  // clipboard-read 一并移除：复制按钮只需要 write，跨源帧"读剪贴板"是超范围权限。
+  iframe.setAttribute('sandbox', 'allow-scripts allow-forms allow-same-origin');
+  iframe.setAttribute('allow', 'clipboard-write');
   iframe.referrerPolicy = 'no-referrer';
   container.replaceChildren(iframe);
 

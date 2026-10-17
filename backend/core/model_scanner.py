@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import time
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,25 @@ def _detect_quant(filename: str) -> str:
     return "unknown"
 
 
+_FILE_ATTRIBUTE_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+
+def _is_link_entry(entry: os.DirEntry) -> bool:
+    """符号链接或重解析点（junction）—— 扫描与浏览都不得穿越。
+
+    Windows 上 os.walk(followlinks=False) 管不住 junction（把它当普通目录下钻，
+    审计 W2 已实证）；可靠判据是 follow_symlinks=False 的 stat 上的
+    FILE_ATTRIBUTE_REPARSE_POINT。取不到属性时按链接处理（fail closed）。
+    """
+    try:
+        if entry.is_symlink():
+            return True
+        attrs = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
+    except OSError:
+        return True
+    return bool(attrs & _FILE_ATTRIBUTE_REPARSE_POINT)
+
+
 def scan_models(
     directory: str,
     max_depth: int = 5,
@@ -38,6 +58,9 @@ def scan_models(
     timeout_seconds: float = 10.0,
 ) -> list[dict[str, Any]]:
     """递归扫描目录下的 .gguf 文件。
+
+    不会穿过 junction / 符号链接（Windows 上 followlinks=False 管不住 junction，
+    审计 W2 已实证），改为手动遍历以便逐目录判型。
 
     Args:
         directory: 扫描根目录
@@ -60,43 +83,46 @@ def scan_models(
 
     deadline = time.monotonic() + max(0.1, timeout_seconds)
     visited_entries = 0
-    try:
-        for current, dirs, files in os.walk(root):
-            if time.monotonic() >= deadline or visited_entries >= max_entries:
-                break
-            current_path = Path(current)
-            try:
-                current_depth = len(current_path.relative_to(root).parts)
-            except ValueError:
-                dirs.clear()
-                continue
-            if current_depth >= max(0, max_depth - 1):
-                dirs.clear()
-            visited_entries += len(dirs) + len(files)
-
-            for filename in files:
-                if len(models) >= max_results or time.monotonic() >= deadline:
-                    dirs.clear()
-                    break
-                if not filename.lower().endswith(".gguf"):
-                    continue
-                path = current_path / filename
-                try:
-                    stat = path.stat()
-                except OSError:
-                    continue
-
-                from datetime import datetime
-                models.append({
-                    "filename": path.name,
-                    "path": str(path),
-                    "size_bytes": stat.st_size,
-                    "size_human": format_size(stat.st_size),
-                    "quant": _detect_quant(path.name),
-                    "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                })
-    except (PermissionError, OSError):
-        pass
+    depth_limit = max(1, max_depth)
+    stack: list[tuple[Path, int]] = [(root, 0)]
+    while stack:
+        if time.monotonic() >= deadline or visited_entries >= max_entries:
+            break
+        current_path, depth = stack.pop()
+        try:
+            # with 是必须的：scandir 句柄要确定性释放，否则 Windows 下会
+            # 挡住该目录的重命名/删除。
+            with os.scandir(current_path) as entries:
+                children: list[tuple[Path, int]] = []
+                for entry in entries:
+                    if (
+                        len(models) >= max_results
+                        or time.monotonic() >= deadline
+                        or visited_entries >= max_entries
+                    ):
+                        break
+                    visited_entries += 1
+                    try:
+                        if entry.is_dir():
+                            if depth + 1 < depth_limit and not _is_link_entry(entry):
+                                children.append((Path(entry.path), depth + 1))
+                            continue
+                        if entry.is_file() and entry.name.lower().endswith(".gguf"):
+                            stat_result = entry.stat()
+                            from datetime import datetime
+                            models.append({
+                                "filename": entry.name,
+                                "path": entry.path,
+                                "size_bytes": stat_result.st_size,
+                                "size_human": format_size(stat_result.st_size),
+                                "quant": _detect_quant(entry.name),
+                                "modified": datetime.fromtimestamp(stat_result.st_mtime).isoformat(),
+                            })
+                    except OSError:
+                        continue
+                stack.extend(reversed(children))
+        except (PermissionError, OSError):
+            continue
 
     # 按文件名排序
     models.sort(key=lambda x: x["filename"].lower())
@@ -121,7 +147,9 @@ def list_directory(directory: str, max_items: int = 5000) -> list[dict[str, Any]
                         items.append({
                             "name": entry.name,
                             "path": entry.path,
-                            "type": "dir",
+                            # 目录形态的链接（junction/symlink）可展示、不可进入：
+                            # 与扫描器同一判据，防止浏览路径把用户带出目录树。
+                            "type": "link" if _is_link_entry(entry) else "dir",
                         })
                     elif entry.is_file() and entry.name.lower().endswith(".gguf"):
                         stat = entry.stat()

@@ -74,6 +74,8 @@ const ERROR_PATTERNS = [
   [/invalid launcher session/, 'err.invalidSession'],
   [/request body too large/, 'err.bodyTooLarge'],
   [/too many launch parameters/, 'err.tooManyParams'],
+  [/llama-server executable is not configured/, 'err.serverNotConfigured'],
+  [/previous launcher session ended while this instance was still running/, 'err.instanceInterrupted'],
 ];
 
 export function localizeBackendError(message) {

@@ -19,6 +19,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -39,7 +40,12 @@ from core.param_builder import (
     validate_param_values,
 )
 from core.param_schema import SPEC_TYPES_REQUIRING_DRAFT_MODEL, split_multi_value
-from core.server_probe import resolve_server_path, system_tool
+from core.server_probe import (
+    probe_server_cached_only,
+    resolve_server_path,
+    sanitized_child_env,
+    system_tool,
+)
 
 LOGGER = logging.getLogger("lunarshroud.backend.processes")
 
@@ -65,6 +71,7 @@ _FATAL_LOG_PATTERNS = (
     "cuda error",
     "out of memory",
     "ggml_abort",
+    "ggml_assert",
     "abort()",
     "assertion",
     "failed to alloc",
@@ -75,8 +82,50 @@ _FATAL_LOG_PATTERNS = (
 )
 
 
+# 断言行 → 可行动的规避办法。只在**日志里确实出现这条断言**时才说，绝不预测
+# "哪种组合会崩"（那是 llama.cpp 的内部状态，复刻必然误伤）。每条都对应一次
+# 本机实测复现与实测规避，见 tests/test_crash_hint.py。
+_ASSERT_WORKAROUNDS: tuple[tuple[str, str], ...] = (
+    (
+        "n_outputs_max",
+        "这条断言在 llama.cpp v0.7.0（build 11698）上实测出现于「嵌入/池化模型 + "
+        "单槽位（-np 1）且未开启嵌入端点」的组合：服务端把所有输入 token 都标成"
+        "输出，超出了上下文预留的上限。规避：勾选「启用嵌入端点」（--embeddings），"
+        "或把「并行槽位」设为 2 以上 —— 两种本机实测都能正常启动。",
+    ),
+)
+
+
+def explain_fatal_line(fatal: str) -> str:
+    """给认得的断言补一句规避办法；认不得就返回空串（不编造）。"""
+    lowered = (fatal or "").lower()
+    for needle, advice in _ASSERT_WORKAROUNDS:
+        if needle in lowered:
+            return advice
+    return ""
+
+
 # System32 工具与 llama-server 的路径解析都归 core.server_probe 一处实现，
 # 理由见 system_tool / resolve_server_path 的文档。
+# 实例落盘日志的单文件上限；超过则轮转出 .1（覆盖上一份）再开新文件。
+# 单个备份足够：实例日志是排障材料，不是审计材料（独立审计 L1）。
+INSTANCE_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+# 单条日志行的字符上限。llama-server/GGUF 元数据可能吐出一行几十 MB 的内容；
+# 环形缓冲只限制行数，不限制单行大小，于是这一行会被原样 JSON 序列化进
+# WebSocket、再塞进一个 DOM 文本节点。截断并显式标注，比让 UI 卡死好。
+MAX_LOG_LINE_CHARS = 16 * 1024
+
+
+
+def _rotate_instance_log_file(path: Path) -> None:
+    """把超限的实例日志挪成 .1（覆盖旧备份）。失败不影响主流程。"""
+    try:
+        os.replace(path, path.with_name(path.name + ".1"))
+    except OSError:
+        pass
+
+
 def _child_env() -> dict[str, str]:
     """llama-server 子进程的环境：剔除全部 ``LUNARSHROUD_*``。
 
@@ -85,11 +134,7 @@ def _child_env() -> dict[str, str]:
     config.json 里的 llama_server_path，让**之后每一次启动**都执行自己的载荷，
     把一次性执行升级成持久化。子进程不需要其中任何一个变量。
     """
-    return {
-        key: value
-        for key, value in os.environ.items()
-        if not key.upper().startswith("LUNARSHROUD_")
-    }
+    return sanitized_child_env()
 
 
 def last_fatal_log_line(instance: Instance) -> str:
@@ -151,6 +196,9 @@ def append_crash_detail(instance: Instance) -> None:
     fatal = last_fatal_log_line(instance)
     if fatal:
         instance.error_message = f"{instance.error_message}；最后一条错误输出：{fatal}"
+        advice = explain_fatal_line(fatal)
+        if advice:
+            instance.error_message = f"{instance.error_message} —— {advice}"
     hint = explain_startup_crash(
         instance.exit_code,
         instance.params,
@@ -229,6 +277,14 @@ class Instance:
     argv: list[str]                           # 命令行 argv
     command_string: str                       # 可读命令行字符串
     restarted_from: str | None = None         # 重启来源实例 ID（重启链路追踪）
+    # 反向指针：本实例已被哪一代替换。没有它，"重启"就没有"当前代次"的概念 ——
+    # 对着一个已经换代的 ID 再按一次重启，会去抢同一端口并抛出莫名其妙的
+    # "port is already in use"。见 restart_instance。
+    replaced_by: str | None = None
+    # 本实例所属重启链的**根**。重启必须按"逻辑实例"而不是"被点名的那一代"串行，
+    # 否则从旧 ID 进来的线程和从当前 ID 进来的线程会各自解析链路，结果是两条
+    # 记录同时标记 running、两个进程同时占同一个端口（实测复现，见 restart_instance）。
+    chain_root: str | None = None
     status: InstanceStatus = InstanceStatus.IDLE
     process: subprocess.Popen | None = None
     pid: int | None = None
@@ -259,6 +315,9 @@ class Instance:
     # 还是返回了非 200"都无从判断，只能靠猜。这两个字段就是为了下次不用猜。
     _probe_attempts: int = field(default=0, repr=False)
     _last_probe: str = field(default="", repr=False)
+    # 失败归因的缓存（见 to_dict）。只在 FAILED 时计算一次，避免 WS 每次推送
+    # 都重跑一遍日志正则。
+    _diagnosis: list[dict[str, str]] | None = field(default=None, repr=False)
 
     def to_dict(self, include_logs: bool = False, log_limit: int = 200) -> dict[str, Any]:
         """转为字典（用于 API 响应）"""
@@ -283,6 +342,17 @@ class Instance:
             "model_path": self.params.get("model", ""),
             "command": self.command_string,
         }
+        if self.status == InstanceStatus.FAILED:
+            if self._diagnosis is None:
+                # 延迟导入：diagnostics 只依赖 core 里的只读模块，但放在函数内
+                # 可以保证即使将来它反向需要 process_manager 也不会形成环。
+                from core.diagnostics import diagnose_instance
+
+                try:
+                    self._diagnosis = diagnose_instance(self)
+                except Exception:  # noqa: BLE001 - 归因失败不能把状态接口打成 500
+                    self._diagnosis = []
+            d["diagnosis"] = self._diagnosis
         if include_logs:
             d["logs"] = [
                 {"timestamp": e.timestamp, "source": e.source, "line": e.line}
@@ -327,6 +397,7 @@ class ProcessManager:
         name: str | None = None,
         on_launched: Callable[[Instance], None] | None = None,
         restarted_from: str | None = None,
+        chain_root: str | None = None,
     ) -> Instance:
         """启动一个新实例。
 
@@ -387,6 +458,7 @@ class ProcessManager:
                 host=host,
                 port=port,
                 restarted_from=restarted_from,
+                chain_root=chain_root,
             )
             # 日志环形缓冲按配置分配（config: log_buffer_lines，默认 5000）
             try:
@@ -491,6 +563,15 @@ class ProcessManager:
         if not address.is_loopback and not api_key.strip():
             raise ValueError("an API key is required for non-loopback listen addresses")
 
+        # F14 / W5（实测形态）：`effective_host_and_key` 先 strip 再校验，而
+        # `start_instance` 读的是 params 里的**原样值** —— `" 127.0.0.1 "` 能过
+        # 校验但 getaddrinfo 直接失败；空串过的是"默认回环"分支，原样流向
+        # bind 语义不明。把**校验用过的等价形式**写回 params，让预留键、
+        # socket.bind、探测 URL 三个消费点从同一份字符串出发（没有 host 键时
+        # 不补写，保持既有无 host 时的命令行输出）。
+        if "host" in params:
+            params["host"] = str(address)
+
         # 支持绝对路径、启动器目录下的相对路径，以及 PATH 中的命令名。
         # 解析逻辑与能力探测共用一份实现（core.server_probe.resolve_server_path），
         # 否则会出现"界面说探测不到、进程却能启动"这种自相矛盾的状态。
@@ -499,7 +580,9 @@ class ProcessManager:
         # 隐式找到一个文件并执行它（见 config.DEFAULT_CONFIG 的说明）。
         if not str(llama_server_path or "").strip():
             raise ValueError(
-                "llama-server executable is not configured; choose it in Settings before starting an instance"
+                "llama-server executable is not configured. Open Settings and set "
+                '"llama-server path" (the browse button works), see the README '
+                "section on getting llama-server for your GPU."
             )
         resolved_server_path = resolve_server_path(llama_server_path)
         if not resolved_server_path:
@@ -550,13 +633,32 @@ class ProcessManager:
 
         # schema 声明的 min/max/options 必须真正生效，否则约束只存在于前端 HTML
         # 属性上，直连 API 或导入外部预设即可绕过（-c 1e12 / -fa banana 之类）。
-        validate_param_values(params)
+        # 带上本机探测结果：select 的合法取值以这份构建声明的为准（上游会新增
+        # 取值），而 cached_only 保证校验不会为了跑 --help 而起子进程。
+        validate_param_values(
+            params, probe=probe_server_cached_only(resolved_server_path)
+        )
 
         return os.path.abspath(resolved_server_path)
 
+    def _port_is_reserved(self, host: str, port: int) -> bool:
+        """该端口是否已被预留；通配地址与具体地址视为互相冲突。
+
+        预留键是完整 (host, port)。只看完全相等的键会漏掉
+        ``("0.0.0.0", P)`` 与 ``("127.0.0.1", P)`` 这种"同一端口、不同写法"：
+        两个并发启动一个绑通配、一个绑回环，会在预留→Popen 的窗口里被分配到
+        同一个端口，第二个 bind 失败。
+        """
+        for reserved_host, reserved_port in self._reserved_ports:
+            if reserved_port != port:
+                continue
+            if reserved_host == host or "0.0.0.0" in (reserved_host, host):
+                return True
+        return False
+
     def _is_port_in_use(self, host: str, port: int) -> bool:
         """检查端口是否被占用"""
-        if (host, port) in self._reserved_ports:
+        if self._port_is_reserved(host, port):
             return True
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -594,6 +696,7 @@ class ProcessManager:
         instance.stopped_at = None
         instance.exit_code = None
         instance.error_message = ""
+        instance._diagnosis = None
 
         self._append_log(instance, "system", f"process started (PID={instance.pid})")
         self._append_log(instance, "system", f"command: {instance.command_string}")
@@ -606,24 +709,41 @@ class ProcessManager:
         instance._stdout_thread.start()
 
     def _read_stdout(self, instance: Instance) -> None:
-        """读取子进程 stdout 并写入日志缓冲"""
+        """读取子进程 stdout 并写入日志缓冲。
+
+        **管道只能由本线程关闭。** `TextIOWrapper.close()` 要拿同一把
+        IO 锁，而本线程在阻塞读时正握着它：任何别的线程（监控线程的
+        `_finalize_process_resources`、停止路径）去 close，都会无限期等这把锁，
+        而本线程在等一个永远不会到来的 EOF —— 死锁。曾经因此把停止请求和
+        监控线程一起挂死，直到子进程被外部杀掉才解冻。EOF（进程退出）或
+        停止事件（读到的下一行之后）都会让本线程走到 finally，由它自己收尾。
+        """
         # 快照句柄：停止路径可能并发地把 instance.process 置为 None
         process = instance.process
         if process is None or process.stdout is None:
             return
+        stream = process.stdout
 
         try:
-            for line in process.stdout:
+            for line in stream:
                 if instance._stop_event.is_set():
                     break
                 line = line.rstrip("\r\n")
+                if len(line) > MAX_LOG_LINE_CHARS:
+                    line = (
+                        line[:MAX_LOG_LINE_CHARS]
+                        + f"…（超长日志行已截断，原长 {len(line)} 字符）"
+                    )
                 if line:
                     self._append_log(instance, "stdout", line)
-        except Exception as e:
+        except (OSError, ValueError) as e:
             self._append_log(instance, "system", f"stdout read error: {e}")
         finally:
-            # stdout 关闭意味着进程即将结束
-            pass
+            # 关闭是尽力而为：管道已被另一端关闭时 close() 也可能抛 OSError。
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
 
     def _monitor_instance(self, instance: Instance) -> None:
         """监控线程：就绪探测 + 进程退出检测"""
@@ -756,7 +876,12 @@ class ProcessManager:
         url = f"http://{host}:{instance.port}/health"
         instance._probe_attempts += 1
         try:
-            r = httpx.get(url, timeout=1.0)
+            # trust_env=False 是必须的：httpx 默认读取 HTTP_PROXY/HTTPS_PROXY
+            # （Windows 上还会回退到注册表里的系统代理）。用户开着 Clash/V2Ray
+            # 之类的系统代理时，发往 127.0.0.1 的 /health 会被送进代理；代理没
+            # 运行就是 ConnectTimeout，于是 llama-server 明明已就绪，界面却报
+            # "startup timed out"。回环探测永远不该经过代理。
+            r = httpx.get(url, timeout=1.0, trust_env=False)
         except httpx.TimeoutException:
             instance._last_probe = f"{url} -> 连接超时（1.0s）"
             return False
@@ -786,18 +911,24 @@ class ProcessManager:
         """Stop one instance while its operation lock is held."""
 
         if instance.status in (InstanceStatus.STOPPED, InstanceStatus.FAILED):
-            return instance
+            # 终态通常可以直接返回；但 FAILED 可能意味着"终止失败、进程还活着"
+            # （taskkill 被拦、进程受保护）。那种记录必须允许再次 stop，否则
+            # 用户再也没有任何 API 能处理这个仍在占端口/显存的孤儿进程。
+            live = instance.process
+            if live is None or live.poll() is not None:
+                return instance
 
         LOGGER.info("stopping instance %s force=%s", instance.id, force)
         instance.status = InstanceStatus.STOPPING
         self._append_log(instance, "system", "stopping instance...")
         self._notify_status(instance)
 
+        # 必须在终止**之前**快照句柄：监控线程看到停止事件后可能先一步
+        # finalize（wait + 把 instance.process 置 None）。旧顺序在终止后才读，
+        # 读到 None 就再也拿不到退出码 —— 实测 e2e 偶发 `stopped code=None`。
+        snapshot = instance.process
         instance._stop_event.set()
         self._terminate_process_tree(instance, force=force)
-        # 快照句柄：monitor 线程可能在此期间把 instance.process 置为 None，
-        # 重复读取实例属性会在 None 上调用 poll() 抛 AttributeError
-        snapshot = instance.process
         process = snapshot
         if process is not None and process.poll() is None:
             try:
@@ -816,8 +947,13 @@ class ProcessManager:
             instance.status = InstanceStatus.FAILED
             instance.error_message = "process termination failed; still running"
             LOGGER.error("instance %s terminate failed, still running", instance.id)
-        else:
-            instance.status = InstanceStatus.STOPPED
+            # 进程没死：句柄、端口预留和落盘日志都必须保留。旧实现在这里
+            # 释放端口并 finalize（把 process 置 None），于是孤儿进程既停不掉、
+            # 也无法再被追踪，端口还会被分配给下一个实例。
+            self._append_log(instance, "system", instance.error_message)
+            self._notify_status(instance)
+            return instance
+        instance.status = InstanceStatus.STOPPED
         # 退出码优先取当前实例上的值；若监控线程已把句柄置空（竞态），
         # 退回到本次进入时快照的句柄，避免 exit_code 永久停留在 None
         if instance.exit_code is None:
@@ -830,11 +966,7 @@ class ProcessManager:
         LOGGER.info(
             "instance %s stopped code=%s", instance.id, instance.exit_code
         )
-        self._append_log(
-            instance,
-            "system",
-            "instance stopped" if instance.status == InstanceStatus.STOPPED else instance.error_message,
-        )
+        self._append_log(instance, "system", "instance stopped")
         self._notify_status(instance)
         self._finalize_process_resources(instance)
         self._prune_terminal_instances()
@@ -855,27 +987,78 @@ class ProcessManager:
             return
 
         if os.name == "nt" and isinstance(process, subprocess.Popen):
-            cmd = [system_tool("taskkill.exe"), "/F", "/T", "/PID", str(process.pid)]
-            try:
-                subprocess.run(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=5,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    check=False,
-                )
+            tool = system_tool("taskkill.exe")
+            if tool:
+                try:
+                    result = subprocess.run(
+                        [tool, "/F", "/T", "/PID", str(process.pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=5,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        check=False,
+                        # 系统工具同样不该拿到会话令牌：taskkill 只需要自己的参数。
+                        env=sanitized_child_env(),
+                    )
+                    if result.returncode == 0:
+                        return
+                    # taskkill 失败必须落到下面的兜底：它可能被安全软件拦下、
+                    # 被组策略禁用，或进程受保护。此前这里忽略返回码直接
+                    # return，停止流程会误以为树已死 —— 进程继续占着端口和
+                    # 显存，收尾线程还会因为管道仍被占用而死锁。
+                    LOGGER.warning(
+                        "taskkill returned %s for pid %s; falling back to psutil",
+                        result.returncode,
+                        process.pid,
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    LOGGER.warning(
+                        "taskkill could not run for pid %s; falling back to psutil",
+                        process.pid,
+                        exc_info=True,
+                    )
+
+            # 兜底：psutil 直接按父进程关系枚举树并 TerminateProcess。
+            # 它不依赖 taskkill 的可执行文件/权限模型，安全软件拦 taskkill 时
+            # 这条路通常仍可用。失败了再退回只杀直接子进程。
+            if self._kill_tree_with_psutil(process):
                 return
-            except (OSError, subprocess.TimeoutExpired):
-                pass
 
         if force:
             process.kill()
         else:
             process.terminate()
 
+    @staticmethod
+    def _kill_tree_with_psutil(process: subprocess.Popen) -> bool:
+        """用 psutil 杀掉 ``process`` 及其全部后代；失败返回 False 而不抛。"""
+        try:
+            import psutil  # 运行期依赖（requirements.txt），但保持导入局部化
+
+            parent = psutil.Process(process.pid)
+            children = parent.children(recursive=True)
+            for child in children:
+                try:
+                    child.kill()
+                except psutil.Error:
+                    pass
+            try:
+                parent.kill()
+            except psutil.Error:
+                pass
+            psutil.wait_procs(children + [parent], timeout=3)
+            return process.poll() is not None
+        except Exception:  # noqa: BLE001 - 兜底失败要退回调用方的最后一级
+            LOGGER.warning("psutil tree kill failed for pid %s", process.pid, exc_info=True)
+            return False
+
     def _finalize_process_resources(self, instance: Instance) -> None:
-        """Release OS handles while preserving terminal instance metadata."""
+        """Release OS handles while preserving terminal instance metadata.
+
+        **读线程活着时不得关闭 process.stdout**：它可能正阻塞在读里握着该
+        文件的 IO 锁，任何其他线程调 ``close()`` 都会挂死（见 ``_read_stdout``）。
+        读线程已退出（或从未启动）时，这里负责关掉管道，避免句柄泄漏。
+        """
         process = instance.process
         if process is not None:
             # 句柄置空前先固化退出码：stop 路径可能在监控线程之后才读取
@@ -889,11 +1072,23 @@ class ProcessManager:
                         code = None
                 if code is not None:
                     instance.exit_code = code
+            if process.poll() is None:
+                # 进程还活着：**绝不**把句柄置空。否则调用方失去唯一的进程
+                # 句柄，之后既不能再 kill，也无法判断它是否终于退出；端口
+                # 预留同样要保留到确认死亡为止。
+                LOGGER.warning(
+                    "instance %s still running; keeping its process handle", instance.id
+                )
+                return
+            # stdout 只在**没有活着的读线程**时由这里关闭。读线程可能正阻塞在
+            # 读里握着该文件的 IO 锁，任何其他线程调 close() 都会与它互等
+            # （见 _read_stdout 的说明）。有读线程时，由它自己在 EOF/停止后关闭。
+            reader = instance._stdout_thread
             stream = getattr(process, "stdout", None)
-            if stream is not None:
+            if stream is not None and (reader is None or not reader.is_alive()):
                 try:
                     stream.close()
-                except OSError:
+                except (OSError, ValueError):
                     pass
             instance.process = None
         # 关闭该实例的落盘日志文件（若开启）
@@ -907,20 +1102,30 @@ class ProcessManager:
                     pass
 
     def _prune_terminal_instances(self) -> None:
-        """Bound retained log buffers and terminal metadata during long sessions."""
+        """Bound retained log buffers and terminal metadata during long sessions.
+
+        被剪枝实例的落盘日志一并删除，避免 data/logs/instances 无界增长
+        （独立审计 L1）。文件删除放在锁外做，不给热路径添 I/O。
+        """
         with self._lock:
             terminal = [
                 item
                 for item in self._instances.values()
                 if item.status in (InstanceStatus.STOPPED, InstanceStatus.FAILED)
+                # 终止失败、进程仍活着的记录不得剪枝：剪掉等于丢掉唯一句柄，
+                # 也丢掉再次 stop 的机会（端口预留在 _release_port 前必须保留）。
+                and not (item.process is not None and item.process.poll() is None)
             ]
             excess = len(terminal) - self._terminal_retention
             if excess <= 0:
                 return
             terminal.sort(key=lambda item: item.stopped_at or 0)
-            for item in terminal[:excess]:
+            dropped = terminal[:excess]
+            for item in dropped:
                 self._instances.pop(item.id, None)
                 self._reserved_ports.discard((item.host, item.port))
+        for item in dropped:
+            self._delete_instance_log_files(item)
 
     def _terminate(self, instance: Instance) -> None:
         """优雅停止（SIGTERM）"""
@@ -952,30 +1157,106 @@ class ProcessManager:
         with self._lock:
             self._reserved_ports.discard((instance.host, instance.port))
 
-    def restart_instance(self, instance_id: str) -> Instance:
-        """重启实例：停止后用相同参数重新启动"""
-        old = self.get_instance(instance_id)
-        if old is None:
-            raise ValueError(f"instance not found: {instance_id}")
+    def _restart_chain(self, instance_id: str) -> list[Instance]:
+        """从被点名的 ID 出发，沿 ``replaced_by`` 走到当前代次，返回途经的每一代。
 
-        LOGGER.info("restarting instance %s", instance_id)
-        params = dict(old.params)
-        preset_id = old.preset_id
-        preset_name = old.preset_name
-        name = old.name
+        ``seen`` 不是多余的防御：链路一旦成环，这里会无限循环，而我们正打算把
+        整条链的锁都握在手里。
+        """
+        chain: list[Instance] = []
+        seen: set[str] = set()
+        current = self.get_instance(instance_id)
+        while current is not None and current.id not in seen:
+            chain.append(current)
+            seen.add(current.id)
+            if not current.replaced_by:
+                break
+            current = self.get_instance(current.replaced_by)
+        return chain
 
-        # 停止旧实例。stop_instance 返回即代表进程已退出、端口已释放；
-        # Windows 上被终止进程的监听端口立即可复用，无需固定 sleep 等待
-        self.stop_instance(instance_id, force=False)
+    def restart_instance(
+        self,
+        instance_id: str,
+        *,
+        on_launched: Callable[[Instance], None] | None = None,
+    ) -> Instance:
+        """重启实例：停止后用相同参数重新启动。
 
-        # 启动新实例，并记录重启来源供前端跟随日志/历史
-        return self.start_instance(
-            params=params,
-            preset_id=preset_id,
-            preset_name=preset_name,
-            name=name,
-            restarted_from=instance_id,
-        )
+        ``on_launched`` 透传给新世代的 start_instance：重启世代同样写启动
+        历史（独立审计 M1）。
+
+        **必须按整条链串行，而不是按被点名的那一代串行。** 第一版只锁锚点，
+        然后在锚点锁内解析链路 —— 但从下游 ID 进来的另一个线程根本不碰锚点锁，
+        于是它可能在解析之后、加锁之前把链路延长。实测后果不是报错而是更糟的
+        状态损坏：两条记录同时 running、同时占同一个端口、两个服务进程同时活着。
+
+        现在所有重启都先锁 `chain_root` 那一代：能延长链路的只有 restart_instance，
+        而它一定持有这把根锁，所以在根锁内解析出的链路是稳定值。
+        再加下游各代的锁用于 stop 纪律；顺序恒为"根 → 下游"，不构成环。
+        RLock 可重入，``_stop_instance_locked`` 里再取同一把安全。
+        """
+        with ExitStack() as stack:
+            anchor = self.get_instance(instance_id)
+            if anchor is None:
+                raise ValueError(f"instance not found: {instance_id}")
+
+            root = anchor
+            if anchor.chain_root:
+                root = self.get_instance(anchor.chain_root) or anchor
+            stack.enter_context(root._operation_lock)
+
+            chain = self._restart_chain(instance_id)
+            if not chain:
+                raise ValueError(f"instance not found: {instance_id}")
+            for inst in chain:
+                if inst is not root:
+                    stack.enter_context(inst._operation_lock)
+            target = chain[-1]
+
+            if target.id != instance_id and target.status in (
+                InstanceStatus.STARTING,
+                InstanceStatus.RUNNING,
+            ):
+                # 这个 ID 已经换代，而当前代活得好好的 —— 双击应当是空操作，
+                # 而不是去抢同一端口、抛一句让人摸不着头脑的"端口被占用"。
+                LOGGER.info(
+                    "restart on superseded id %s: current generation %s already live",
+                    instance_id, target.id,
+                )
+                return target
+
+            LOGGER.info("restarting instance %s", target.id)
+            params = dict(target.params)
+            preset_id = target.preset_id
+            preset_name = target.preset_name
+            name = target.name
+
+            # 停止旧实例。返回即代表进程已退出、端口已释放；Windows 上被终止进程
+            # 的监听端口立即可复用，无需固定 sleep 等待
+            self._stop_instance_locked(target, force=False)
+
+            if target.status == InstanceStatus.FAILED:
+                # 旧进程没死透就再起一代，等于同一个模型/端口上挂两个服务。
+                # 显式端口时 start_instance 的实测会**顺带**拦住它，但那样用户
+                # 只会看到一句莫名其妙的"端口被占用"，而且自动分配端口时根本拦不住
+                # —— 所以这里明确拒绝，而不是依赖下游的巧合。
+                raise RuntimeError(
+                    f"instance {target.id} could not be stopped"
+                    + (f": {target.error_message}" if target.error_message else "")
+                )
+
+            # 启动新实例，并记录重启来源供前端跟随日志/历史
+            new = self.start_instance(
+                params=params,
+                preset_id=preset_id,
+                preset_name=preset_name,
+                name=name,
+                restarted_from=target.id,
+                chain_root=root.id,
+                on_launched=on_launched,
+            )
+            target.replaced_by = new.id
+            return new
 
     def remove_instance(self, instance_id: str) -> bool:
         """从内存中移除已停止的实例"""
@@ -984,10 +1265,38 @@ class ProcessManager:
             return False
         if instance.status in (InstanceStatus.RUNNING, InstanceStatus.STARTING, InstanceStatus.STOPPING):
             raise RuntimeError(f"instance {instance_id} is still running; stop it before removing")
+        process = instance.process
+        if process is not None and process.poll() is None:
+            # FAILED 但进程句柄仍活着：必须先停掉，否则从列表删除就再也
+            # 无法通过 API 处理这个仍占端口/显存的进程。
+            raise RuntimeError(f"instance {instance_id} still has a live process; stop it before removing")
         with self._lock:
             del self._instances[instance_id]
             self._reserved_ports.discard((instance.host, instance.port))
+        # 落盘日志随实例一并清理（独立审计 L1）
+        self._delete_instance_log_files(instance)
         return True
+
+    def _delete_instance_log_files(self, instance: Instance) -> None:
+        """删除某实例的落盘日志（含轮转备份）。best-effort，失败不影响主流程。
+
+        先关流再删：正常终态路径里 finalize 已经关过（关已关的流是 no-op），
+        但手工构造/异常路径下漏关时，Windows 会拒绝删除仍被占用的文件。
+        """
+        with instance._log_file_lock:
+            stream = instance._log_file
+            instance._log_file = None
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        log_dir = Path(_config.DATA_DIR) / "logs" / "instances"
+        for name in (f"{instance.id}.log", f"{instance.id}.log.1"):
+            try:
+                (log_dir / name).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     # ========== 日志和订阅 ==========
 
@@ -1007,6 +1316,7 @@ class ProcessManager:
 
         崩溃/重启后内存环形缓冲即丢失，落盘使得事后排障成为可能；
         单实例写入失败只禁用该实例的落盘，不影响主流程。
+        单文件超过 INSTANCE_LOG_MAX_BYTES 时轮转出 .1（独立审计 L1）。
         """
         if not instance._log_persist_enabled or instance._log_persist_failed:
             return
@@ -1017,16 +1327,31 @@ class ProcessManager:
                     # 经 config 模块动态解析，测试中可被重定向到临时目录
                     log_dir = Path(_config.DATA_DIR) / "logs" / "instances"
                     log_dir.mkdir(parents=True, exist_ok=True)
+                    target = log_dir / f"{instance.id}.log"
+                    try:
+                        if target.stat().st_size >= INSTANCE_LOG_MAX_BYTES:
+                            _rotate_instance_log_file(target)
+                    except OSError:
+                        pass
                     stream = open(  # noqa: SIM115 - 显式按实例生命周期管理关闭
-                        log_dir / f"{instance.id}.log",
+                        target,
                         "a",
                         encoding="utf-8",
                         errors="replace",
                     )
                     instance._log_file = stream
+                    instance._log_file_path = target
+                    instance._log_file_bytes = 0
                 stamp = datetime.fromtimestamp(entry.timestamp).strftime("%Y-%m-%d %H:%M:%S")
-                stream.write(f"[{stamp}] [{entry.source}] {entry.line}\n")
+                line = f"[{stamp}] [{entry.source}] {entry.line}\n"
+                stream.write(line)
                 stream.flush()
+                instance._log_file_bytes += len(line.encode("utf-8", "replace"))
+                if instance._log_file_bytes >= INSTANCE_LOG_MAX_BYTES:
+                    stream.close()
+                    instance._log_file = None
+                    instance._log_file_bytes = 0
+                    _rotate_instance_log_file(instance._log_file_path)
         except OSError:
             instance._log_persist_failed = True
             LOGGER.warning(

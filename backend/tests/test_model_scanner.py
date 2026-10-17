@@ -73,3 +73,55 @@ def test_list_directory_honours_max_items(tmp_path):
     for i in range(5):
         (tmp_path / f"m{i}.gguf").write_bytes(b"\x00")
     assert len(list_directory(str(tmp_path), max_items=2)) == 2
+
+
+def _make_junction(link, target) -> bool:
+    import subprocess
+
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def test_scan_models_does_not_descend_into_junctions(tmp_path):
+    """junction 不是普通目录：扫描不得穿越（审计 W2 已实证）。"""
+    from core.model_scanner import scan_models
+
+    root = tmp_path / "models"
+    real = root / "real"
+    real.mkdir(parents=True)
+    (real / "inside-q4_k_m.gguf").write_bytes(b"\x00")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret-q4_k_m.gguf").write_bytes(b"\x00")
+
+    link = root / "portal"
+    if not _make_junction(link, outside):
+        pytest.skip("junction creation unavailable")
+
+    found = {m["filename"] for m in scan_models(str(root))}
+
+    assert "inside-q4_k_m.gguf" in found
+    assert not any("secret" in name for name in found), (
+        "扫描穿越了 junction：根外文件被收录"
+    )
+
+
+def test_list_directory_marks_junctions_as_links_not_dirs(tmp_path):
+    """list_directory 把目录形态的链接标成 link，调用方据此不下钻。"""
+    root = tmp_path / "models"
+    root.mkdir()
+    (root / "real").mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    link = root / "portal"
+    if not _make_junction(link, outside):
+        pytest.skip("junction creation unavailable")
+
+    by_name = {item["name"]: item for item in list_directory(str(root))}
+    assert by_name["portal"]["type"] == "link"
+    assert by_name["real"]["type"] == "dir"

@@ -1,4 +1,6 @@
 -r requirements.txt
+# CI installs the hash-locked requirements-dev.lock instead (audit F21); keep
+# this file and the lock in sync when changing dev pins.
 pytest==9.1.1
 pytest-cov==7.0.0
 pyinstaller==6.21.0

@@ -1,51 +1,42 @@
 # Sanitization Report
 
-Prepared on 2026-08-17 from an explicit source allowlist.
+Last reviewed: 2026-10-17 (Asia/Shanghai), release candidate `0.9.0-beta.2`.
 
-- Executables, installers, archives, logs, databases, caches, coverage artifacts, virtual environments, screenshots, and runtime data: none included.
-- Private-key/API-token patterns and development-machine absolute paths: no matches in the final source tree.
-- Included binary assets: one project logo and four Tauri icon files, documented in `ASSETS.md`.
-- User-created presets: excluded; only the three built-in presets are included.
-- Source parity: all copied files matched the reviewed working source by SHA-256 before final placement.
-- The portable-runtime deployment utility is generic, accepts explicit source/destination paths, validates SHA-256 using the .NET runtime, and has a regression test that does not touch a real desktop.
-- Repository-owner and unfinished-work placeholder scan: no markers remain.
+This report describes the **current** public-source mirror. Earlier sections of
+this file described snapshots with 86 and 131 files and, at one point, built-in
+preset templates; those snapshots are historical and no longer describe the
+tree.
 
-The dependency-audit workflows run separately because a clean source tree is not proof that third-party packages have no known advisory. This report is not a Git-history audit: the supplied workspace contained no `.git` history.
+## Current state
 
-The local dependency baseline is recorded in `DEPENDENCY_AUDIT.md`.
+- The public tree is `github/`, a curated mirror — not a copy of the private
+  working directory. `tools/check_release_mirror.py` is the gate and the only
+  supported way to refresh it (`--apply`), and it is fail-closed: missing,
+  drifted, stale, forbidden and privacy-unscanned files all fail the check.
+- At this revision the mirror contains 154 source and documentation files. It
+  contains no executables, installers, archives, logs, databases, coverage
+  artifacts, virtual environments, screenshots, build outputs or runtime data.
+- `data/` is excluded as an entire directory: `config.json`, `history.db` (and
+  its `-wal`/`-shm` sidecars), `logs/` and `presets/`. No preset ships with the
+  launcher; presets are created by the user.
+- Internal audit documents, maintainer-local history, AI coding-tool state and
+  ignore files are deliberately excluded; the reasons live in
+  `CURATED_EXCLUDES` in the gate, not in this document.
+- The privacy scan covers raw bytes decoded as UTF-8, UTF-16LE, UTF-16BE and
+  latin-1, plus gzip/zlib containers. The current mirror and the work-tree files
+  that would be published both scan clean for the maintainer's workspace/user
+  markers and for `C:\Users` paths.
+- The public Git repository was initialized from this final tree. Unreachable
+  objects from preparation (including a pre-sanitization draft) were removed
+  with `git gc --prune=now`; `git fsck --unreachable` reports nothing before
+  publication.
+- Binary assets are the project logo and the Tauri icon set, documented in
+  `ASSETS.md`; they are generated/checked by `tools/gen_icons.py` and
+  `backend/tests/test_icons.py`.
 
-## 2026-08-23 revalidation
+## Scope limits
 
-After current handover, status, history, and documentation-map files were
-added, the public-source tree was rechecked. It contains 86 files (1,421,754
-bytes); no executable, installer, archive, database, log, cache, build-output,
-or temporary directory was present. Its only `data/` content is the three
-reviewed built-in preset JSON files. Markdown links resolved, and the mirrored
-current documents matched their reviewed source copies by SHA-256.
-
-After the same-day backend-supervision and frontend-recovery changes, the
-mirror was refreshed and rescanned again: still 86 files (1,447,125 bytes),
-every file byte-identical to its reviewed working-tree source, and no new
-forbidden file, local absolute path, or secret pattern introduced.
-
-## 2026-09-19 revalidation
-
-- Public-source mirror: 131 files, byte-identical to the reviewed working
-  tree per `tools/check_release_mirror.py` (5-category gate: missing, drifted,
-  stale, forbidden paths, private-path leakage). Note: built-in preset
-  templates were removed since the 2026-08-23 report — the launcher no longer
-  ships any preset, and the mirror contains no `data/` content at all. The
-  "three built-in presets" statements above describe those earlier snapshots.
-- Plugin state exclusion: the security-scan hook created `.mimosa/` session
-  state (containing machine paths) inside the workspace during one session,
-  and a mirror `--apply` briefly copied it into the staging tree. The gate's
-  private-path check caught it immediately; `.mimosa` is now excluded by the
-  gate's rule table and `.gitignore`, and the mirrored copy was removed.
-- Built release artifacts byte-scanned for builder identity (user name,
-  `C:\Users` paths, model directories, plugin state, workspace path):
-  `backend\backend.exe` and the NSIS installer were clean; the launcher
-  initially embedded 316 cargo-registry paths containing the build machine's
-  user name via Rust panic location strings. Fixed by remapping
-  `%USERPROFILE%\.cargo\registry\src` to a neutral prefix at build time
-  (`RUSTFLAGS=--remap-path-prefix=...`), now encoded in the release workflow
-  and build instructions. All three rebuilt artifacts scan clean.
+This is a source-tree sanitization report, not a dependency audit. Known
+advisory results are in `DEPENDENCY_AUDIT.md`; licensing notes are in
+`THIRD_PARTY_NOTICES.md`. It is not a substitute for reviewing the final commit
+that is actually published.

@@ -86,6 +86,210 @@ def test_history_ordering_is_stable_when_timestamps_tie(monkeypatch, tmp_path):
     assert [r["instance_id"] for r in page2] == ["tie-1", "tie-0"]
 
 
+def test_corrupt_history_database_is_quarantined_and_rebuilt(monkeypatch, tmp_path):
+    """损坏的 history.db 不能让整个后端无法启动。
+
+    2026-10-17 故障注入：把一个非 SQLite 文件放到 ``history.db`` 后，打包后端
+    在 lifespan 的 ``history_store.init_db()`` 抛出 ``sqlite3.DatabaseError:
+    file is not a database``，进程以 exit 3 退出，启动器只能表现为“后端启动失败”。
+    损坏文件应像 ``config.json.corrupt`` 一样被隔离保留，再建一个可用的新库。
+    """
+    import sqlite3
+
+    import config as backend_config
+    from core import history_store
+
+    db_path = tmp_path / "history.db"
+    original = b"this is not a sqlite database\n" * 10
+    db_path.write_bytes(original)
+    monkeypatch.setattr(history_store, "HISTORY_DB", db_path)
+    monkeypatch.setattr(backend_config, "get_config", lambda: {"history_max_records": 0})
+    history_store._initialized_paths.discard(str(db_path))
+
+    history_store.init_db()
+
+    quarantine = tmp_path / "history.db.corrupt"
+    assert quarantine.exists()
+    assert quarantine.read_bytes() == original
+    with sqlite3.connect(str(db_path)) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+    assert "launch_history" in tables
+
+    record_id = history_store.record_launch(
+        instance_id="rebuilt",
+        preset_id=None,
+        preset_name=None,
+        model_path="model.gguf",
+        port=8080,
+        params={"model": "model.gguf"},
+        command_text="llama-server",
+        status="running",
+    )
+    assert record_id > 0
+
+
+def test_data_page_corruption_is_quarantined_not_just_non_sqlite_files(monkeypatch, tmp_path):
+    """页级损坏（合法头 + 坏数据页）也必须走隔离重建，而不是启动失败或 500。
+
+    旧测试只把整个文件换成非 SQLite 字节，``CREATE TABLE`` 当场就报错，于是
+    "隔离"看起来成立。真实故障形态是：sqlite_master 完好、某一页数据被覆盖 ——
+    建表语句不碰那些页，初始化"成功"，随后 ``mark_unfinished_as_interrupted``
+    或 ``/api/history`` 才抛 ``database disk image is malformed``：
+    前者让后端在 lifespan 退出（启动失败），后者让历史页永久 500。
+    """
+    import sqlite3
+
+    import config as backend_config
+    from core import history_store
+
+    db_path = tmp_path / "history.db"
+    monkeypatch.setattr(history_store, "HISTORY_DB", db_path)
+    monkeypatch.setattr(backend_config, "get_config", lambda: {"history_max_records": 0})
+    history_store._initialized_paths.discard(str(db_path))
+
+    for index in range(40):
+        history_store.record_launch(
+            instance_id=f"corrupt-{index}",
+            preset_id=None,
+            preset_name=None,
+            model_path="model.gguf",
+            port=8080,
+            params={"model": "model.gguf"},
+            command_text="llama-server",
+            status="running",
+        )
+    from contextlib import closing
+
+    with closing(sqlite3.connect(str(db_path))) as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    history_store._initialized_paths.discard(str(db_path))
+
+    # 覆盖第 2 页（4096 字节页的第一页数据），保留第 1 页的 schema。
+    data = bytearray(db_path.read_bytes())
+    assert len(data) > 8192, "测试前置条件：库必须已有多页数据"
+    data[4096:8192] = b"\xff" * 4096
+    db_path.write_bytes(bytes(data))
+
+    history_store.init_db()  # 不得抛异常；损坏库被隔离后重建
+
+    assert (tmp_path / "history.db.corrupt").exists()
+    assert history_store.list_history() == []
+    assert history_store.mark_unfinished_as_interrupted() == 0
+
+
+def test_unfinished_history_rows_are_marked_interrupted(monkeypatch, tmp_path):
+    """上一次后端进程留下的非终态记录必须在启动时收口。
+
+    窗口关闭时外壳关闭 Job Object 直接终止后端，lifespan 的清理钩子不执行，
+    于是 history.db 里会永久留下 'running' 记录（实测库里有数周前的行），
+    历史页一直显示一个早已不存在的实例"运行中"。
+    """
+    import config as backend_config
+    from core import history_store
+
+    monkeypatch.setattr(history_store, "HISTORY_DB", tmp_path / "history.db")
+    monkeypatch.setattr(backend_config, "get_config", lambda: {"history_max_records": 0})
+
+    def record(status: str) -> int:
+        return history_store.record_launch(
+            instance_id=f"inst-{status}",
+            preset_id=None,
+            preset_name=None,
+            model_path="model.gguf",
+            port=8080,
+            params={"model": "model.gguf"},
+            command_text="llama-server",
+            status=status,
+        )
+
+    running_id = record("running")
+    starting_id = record("starting")
+    stopping_id = record("stopping")
+    stopped_id = record("stopped")
+
+    assert history_store.mark_unfinished_as_interrupted() == 3
+    rows = {row["id"]: row for row in history_store.list_history(limit=20)}
+    for record_id in (running_id, starting_id, stopping_id):
+        assert rows[record_id]["status"] == history_store.INTERRUPTED_STATUS
+        assert rows[record_id]["error_message"] == history_store.INTERRUPTED_MESSAGE
+        # 真实停止时间未知：不能编一个，duration 留给前端显示 "-"
+        assert rows[record_id]["stopped_at"] is None
+        assert rows[record_id]["duration_seconds"] is None
+    assert rows[stopped_id]["status"] == "stopped"
+
+    # 幂等：第二次调用没有可收口的行
+    assert history_store.mark_unfinished_as_interrupted() == 0
+
+
+def test_startup_log_does_not_include_session_id(monkeypatch, tmp_path, caplog):
+    """session_id 不是管理令牌，但也不该被写进可被分享的日志。
+
+    第六轮核验记录 R10：``backend.log`` 的启动行带 ``session=<id>``。它每次
+    启动重新生成、答对也只能访问就绪探测，但支持日志会被用户贴到公开 issue；
+    没有必要把这次启动的共享标识一并交出。
+    """
+    import logging
+
+    import config as backend_config
+    import main as backend_main
+    from core import history_store
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(backend_main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(backend_main, "SESSION_ID", "do-not-log-this-session")
+    monkeypatch.setattr(backend_config, "HISTORY_DB", tmp_path / "history.db")
+    monkeypatch.setattr(history_store, "HISTORY_DB", tmp_path / "history.db")
+    monkeypatch.setattr(
+        backend_config, "get_config", lambda: dict(backend_config.DEFAULT_CONFIG)
+    )
+    monkeypatch.setattr(backend_main, "_warm_server_probe", lambda: None)
+    # configure_file_logging sets propagate=False; keep the record visible to caplog.
+    monkeypatch.setattr(
+        backend_main, "configure_file_logging", lambda _path: backend_main.LOGGER
+    )
+    monkeypatch.setattr(backend_main.LOGGER, "propagate", True)
+    backend_main.LOGGER.setLevel(logging.INFO)
+
+    with caplog.at_level(logging.INFO, logger="lunarshroud.backend"):
+        with TestClient(backend_main.app):
+            pass
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("backend started" in message for message in messages)
+    assert not any("do-not-log-this-session" in message for message in messages)
+
+
+def test_backend_startup_reconciles_unfinished_history(monkeypatch, tmp_path):
+    """lifespan 必须真的调用收口逻辑（不能只测纯函数）。"""
+    import config as backend_config
+    import main as backend_main
+    from core import history_store
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(backend_main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(backend_config, "HISTORY_DB", tmp_path / "history.db")
+    monkeypatch.setattr(history_store, "HISTORY_DB", tmp_path / "history.db")
+    monkeypatch.setattr(
+        backend_config, "get_config", lambda: dict(backend_config.DEFAULT_CONFIG)
+    )
+
+    calls: list[bool] = []
+
+    def fake_reconcile() -> int:
+        calls.append(True)
+        return 2
+
+    monkeypatch.setattr(history_store, "mark_unfinished_as_interrupted", fake_reconcile)
+    with TestClient(backend_main.app):
+        pass
+    assert calls, "lifespan 没有调用 mark_unfinished_as_interrupted"
+
+
 def test_instance_logs_are_persisted_and_closed(monkeypatch, tmp_path):
     """开启 persist_instance_logs 后，实例日志应写入 data/logs/instances/。"""
     import core.process_manager as process_manager
@@ -425,7 +629,7 @@ def test_schema_and_presets_expose_english_fields():
         assert param["label_en"], f"missing label_en for {param['key']}"
         assert param["help_en"], f"missing help_en for {param['key']}"
     group_keys = {g["key"] for g in schema["groups"]}
-    assert group_keys == {"model_basic", "performance", "speculative", "multimodal", "sampling", "server", "advanced"}
+    assert group_keys == {"model_basic", "performance", "speculative", "multimodal", "sampling", "server", "advanced", "agent"}
     for group in schema["groups"]:
         assert group["label_en"]
 

@@ -1,6 +1,10 @@
 # Direct runtime dependencies are pinned. Transitive dependency changes are
 # monitored by the security workflow and Dependabot.
 #
+# CI and setup.ps1 install the hash-locked backend/requirements-dev.lock instead
+# (audit F21); that lock is the runtime closure plus the dev tools. Keep the
+# pins here and in both locks in sync when either changes.
+#
 # starlette is a *transitive* dependency but is pinned here anyway: main.py's
 # request_size_middleware writes to the private `Request._body` attribute and
 # relies on `_CachedRequest.wrapped_receive` replaying it. fastapi declares

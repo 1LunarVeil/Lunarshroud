@@ -9,11 +9,14 @@ import json
 import logging
 import math
 import os
+import shutil
 import sys
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
-from core.atomic_json import atomic_write_json
+from core.atomic_json import atomic_write_json, cleanup_orphan_tmp_files
 
 LOGGER = logging.getLogger("lunarshroud.backend.config")
 
@@ -27,18 +30,91 @@ def is_frozen() -> bool:
 
 # ========== 路径常量 ==========
 
+def _dir_is_writable(path: Path) -> bool:
+    """能否在其中创建/写入一个探针文件（只用于选择用户数据目录）。"""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / f".write-probe-{os.getpid()}-{threading.get_ident()}"
+        probe.write_text("probe", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError as error:
+        LOGGER.warning("write probe failed for %s: %s", path, error)
+        return False
+
+
+def _seed_fallback_data_dir(preferred: Path, chosen: Path) -> None:
+    """受限环境回退时，把用户已有的配置/预设复制一份，别让界面变空白。
+
+    只做一次：目标已有 config.json 就以目标为准（用户在回退目录里的修改不能
+    每次启动被真实 APPDATA 覆盖）。历史库不复制：可能很大、正被占用，而且
+    旧的运行记录没有继续写入的意义。
+    """
+    if not preferred.is_dir() or (chosen / "config.json").exists():
+        return
+    try:
+        source_config = preferred / "config.json"
+        if source_config.is_file():
+            chosen.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_config, chosen / "config.json")
+        source_presets = preferred / "presets"
+        if source_presets.is_dir():
+            target_presets = chosen / "presets"
+            target_presets.mkdir(parents=True, exist_ok=True)
+            for item in source_presets.iterdir():
+                if item.is_file() and not (target_presets / item.name).exists():
+                    shutil.copy2(item, target_presets / item.name)
+    except OSError as error:
+        LOGGER.warning("could not seed fallback data dir from %s: %s", preferred, error)
+
+
+def _frozen_data_dir() -> Path:
+    """选一个真正可写的用户数据目录，而不是盲目信任 %APPDATA%。
+
+    正常用户机器上第一个候选（%APPDATA%\\LunarShroud）就是历史数据目录；
+    但启动器可能被 AI 编程工具的沙箱、受限令牌或异常环境变量启动 —— 那时
+    %APPDATA% 可能是只读/不存在的路径。旧实现直接用它，backed 在 lifespan
+    里创建日志/历史库失败，uvicorn 以 exit 3 退出，界面上却只剩“后端进程
+    启动失败”，用户和我们都拿不到原因。按优先级探测可写性，最后退回 exe
+    同目录/系统临时目录，保证后端至少能起来。
+    """
+    candidates: list[Path] = []
+    appdata = os.environ.get("APPDATA")
+    local = os.environ.get("LOCALAPPDATA")
+    home = os.path.expanduser("~")
+    if appdata:
+        candidates.append(Path(appdata) / "LunarShroud")
+    if local:
+        candidates.append(Path(local) / "LunarShroud")
+    if home and home != "~":
+        candidates.append(Path(home) / "LunarShroud")
+    candidates.append(Path(sys.executable).resolve().parent / "data")
+    candidates.append(Path(tempfile.gettempdir()) / "LunarShroud")
+    for candidate in candidates:
+        if _dir_is_writable(candidate):
+            preferred = Path(appdata) / "LunarShroud" if appdata else None
+            if preferred is not None and candidate != preferred:
+                LOGGER.warning(
+                    "preferred user data dir %s is not writable; using %s",
+                    preferred,
+                    candidate,
+                )
+                _seed_fallback_data_dir(preferred, candidate)
+            return candidate
+    return Path(tempfile.gettempdir()) / "LunarShroud"
+
+
 if is_frozen():
     # ── PyInstaller 打包模式 ──
-    # 代码在 sys._MEIPASS（临时解压目录，只读）
+    # 代码在 sys._MEIPASS（onedir 的 _internal，只读）
     # 运行时数据必须放在用户可写目录，避免安装到 Program Files 后无法写入
     _exe_dir = Path(sys.executable).resolve().parent
     PROJECT_ROOT = _exe_dir
     BACKEND_DIR = _exe_dir
     # 前端由 Tauri 托管，backend 不需要挂载前端静态文件
     FRONTEND_DIR = _exe_dir / "frontend"  # 不存在时跳过挂载
-    # 数据目录放在 %APPDATA%/LunarShroud（用户可写，持久化）
-    _appdata = Path(os.environ.get("APPDATA", os.path.expanduser("~"))) / "LunarShroud"
-    DATA_DIR = _appdata
+    # 数据目录优先 %APPDATA%/LunarShroud，但必须实测可写（见函数说明）。
+    DATA_DIR = _frozen_data_dir()
 else:
     # ── 正常 Python 开发模式 ──
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -270,11 +346,17 @@ def _env_port_override() -> int | None:
 def _load_config_from_file() -> dict[str, Any]:
     """加载 config.json，不存在则用默认值创建（不含环境变量覆盖逻辑）。"""
     ensure_dirs()
+    # 启动时清扫中断遗留的 .tmp 写入件（审计 R5）：放在这里而不是 lifespan，
+    # 因为所有入口（后端进程、工具脚本）都必经这一次配置加载。
+    cleanup_orphan_tmp_files(DATA_DIR)
+    cleanup_orphan_tmp_files(PRESETS_DIR)
     if not CONFIG_FILE.exists():
         save_config(DEFAULT_CONFIG)
         return DEFAULT_CONFIG.copy()
     try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        # utf-8-sig：记事本/Set-Content -Encoding utf8 会写 BOM，带 BOM 的配置
+        # 曾是"整个文件被当损坏、静默重建默认值"的根因（独立审计 L2）。
+        with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
             cfg = json.load(f)
         # 合并默认值（新增的默认键也能生效），只保留已知键，
         # 避免历史遗留的未知键被继续持久化；并修复旧配置中的坏值
@@ -315,6 +397,10 @@ def save_config(cfg: dict[str, Any]) -> None:
 # 全局配置单例（首次导入时加载）
 _config: dict[str, Any] | None = None
 
+# update_config 的"读-改-写-重绑"必须整体串行：并发 PUT 各自基于旧快照
+# 计算 candidate，后落盘者会把先落盘者的键覆盖回去（R4 静默丢更新）。
+_update_lock = threading.Lock()
+
 
 def get_config() -> dict[str, Any]:
     """获取全局配置单例"""
@@ -330,17 +416,20 @@ def update_config(updates: dict[str, Any]) -> dict[str, Any]:
     if unknown:
         raise ValueError(f"unsupported config key(s): {', '.join(sorted(unknown))}")
     global _config
-    candidate = dict(get_config())
-    candidate.update(updates)
-    validated = validate_config(candidate)
-    # 重绑模块全局，而不是 clear() + update() 就地改。
-    # 就地改会在这两行之间把共享单例暴露成空 dict：并发的
-    # process_manager.py:221 直接 cfg["llama_server_path"] 会 KeyError → 500，
-    # 用 .get() 的调用点则会静默回落默认值。名字重绑是原子的，
-    # 且已经拿到旧 dict 的调用者读到的是"上一份完整配置"，不是半成品。
-    #
-    # 先落盘再重绑：持久化失败时内存配置保持不变，
-    # 不会出现"界面显示已保存、重启后又是旧值"。
-    save_config(validated)
-    _config = validated
-    return _config
+    # 读-改-写-重绑整体持锁：否则并发 PUT 各自基于旧快照算 candidate，
+    # 后落盘者会把先落盘者的键覆盖回去 —— 静默丢更新（审计 R4）。
+    with _update_lock:
+        candidate = dict(get_config())
+        candidate.update(updates)
+        validated = validate_config(candidate)
+        # 重绑模块全局，而不是 clear() + update() 就地改。
+        # 就地改会在这两行之间把共享单例暴露成空 dict：并发的
+        # process_manager.py:221 直接 cfg["llama_server_path"] 会 KeyError → 500，
+        # 用 .get() 的调用点则会静默回落默认值。名字重绑是原子的，
+        # 且已经拿到旧 dict 的调用者读到的是"上一份完整配置"，不是半成品。
+        #
+        # 先落盘再重绑：持久化失败时内存配置保持不变，
+        # 不会出现"界面显示已保存、重启后又是旧值"。
+        save_config(validated)
+        _config = validated
+        return _config

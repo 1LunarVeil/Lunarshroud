@@ -15,7 +15,7 @@ from typing import Any
 import psutil
 from config import get_config
 
-from core.server_probe import system_tool, which_on_path
+from core.server_probe import sanitized_child_env, system_tool, which_on_path
 
 try:
     # 可选依赖（nvidia-ml-py）：优先走 NVML，避免每次采样拉起 nvidia-smi 子进程
@@ -144,20 +144,22 @@ def _hidden_console_flags() -> dict[str, int]:
     return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
 
 
-def _nvidia_smi() -> str:
-    """nvidia-smi 的绝对路径；解析不出来才退回裸名（保持原有行为）。
+def _nvidia_smi() -> str | None:
+    """nvidia-smi 的绝对路径；找不到返回 ``None``（**绝不退回裸名**）。
 
-    裸名会走 CreateProcess 搜索序，而"当前目录"排在 PATH 之前 —— 后端的 CWD
-    是用户可写的安装目录（lib.rs:539）。NVIDIA 驱动通常把它装进 System32，
-    但也有人只在 PATH 上（``Program Files\\NVIDIA Corporation\\...``），
-    所以两条都试；``which_on_path`` 不会把 CWD 算作命中。
+    裸名会走 CreateProcess 搜索序，而"应用程序所在目录"与"当前目录"都排在
+    System32 之前 —— 后端的 CWD 是用户可写的安装目录（lib.rs:539）。在
+    System32 与 PATH 都没有 nvidia-smi 时退化成裸名，等于让一个用户可写目录里
+    的植入件在每次采样（默认 5 秒一次）被零交互执行。NVIDIA 驱动通常装在
+    System32，旧版驱动在 PATH 上；两条都没有就说明本机没有可用的 GPU 工具，
+    此时返回 ``None``、跳过 GPU 指标，而不是去猜一个可执行文件。
     """
     if os.name != "nt":
         return "nvidia-smi"
     system = system_tool("nvidia-smi.exe")
     if os.path.isfile(system):
         return system
-    return which_on_path("nvidia-smi.exe") or "nvidia-smi"
+    return which_on_path("nvidia-smi.exe")
 
 
 def _parse_int(value: str) -> int | None:
@@ -265,10 +267,13 @@ class SystemMonitor:
         gpus = _nvml_query_gpus()
         if gpus is not None:
             return gpus
+        smi = _nvidia_smi()
+        if smi is None:
+            return []
         try:
             # 一次性查询所有指标
             cmd = [
-                _nvidia_smi(),
+                smi,
                 "--query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu",
                 "--format=csv,noheader,nounits",
             ]
@@ -283,6 +288,8 @@ class SystemMonitor:
                 encoding="utf-8",
                 errors="replace",
                 timeout=3,
+                # 采样工具同样是子进程：不得继承启动器的会话令牌。
+                env=sanitized_child_env(),
                 **_hidden_console_flags(),
             )
             if r.returncode != 0:
@@ -328,9 +335,12 @@ class SystemMonitor:
         procs = _nvml_gpu_processes(managed_pids)
         if procs is not None:
             return procs
+        smi = _nvidia_smi()
+        if smi is None:
+            return []
         try:
             cmd = [
-                _nvidia_smi(),
+                smi,
                 "--query-compute-apps=pid,process_name,used_memory",
                 "--format=csv,noheader,nounits",
             ]
@@ -345,6 +355,8 @@ class SystemMonitor:
                 encoding="utf-8",
                 errors="replace",
                 timeout=3,
+                # 采样工具同样是子进程：不得继承启动器的会话令牌。
+                env=sanitized_child_env(),
                 **_hidden_console_flags(),
             )
             if r.returncode != 0:

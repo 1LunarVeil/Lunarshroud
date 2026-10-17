@@ -67,8 +67,13 @@ EXCLUDED_DIR_PREFIXES = (
     "backend/build/",
     "backend/dist/",
     "backend/data/",
+    # PyInstaller onedir 的运行时目录：DLL/PYD/PYC 等构建产物，部署时与
+    # backend.exe 放在一起，但绝不进源码镜像。
+    "backend/_internal/",
     "src-tauri/target/",
     "src-tauri/gen/",
+    # build.rs 的 staging 目录：backend.exe + _internal，安装包资源来源。
+    "src-tauri/backend/",
     # data/ 整目录排除，不逐个列名：SQLite WAL 会产生 history.db-wal/-shm，
     # 配置损坏时 config.py:284 会写 config.json.corrupt（内含本机模型目录绝对路径）。
     # 这些派生名不可枚举，逐条列名必然漏 —— 审计已实证漏网并被 --apply 复制进镜像。
@@ -157,30 +162,50 @@ FORBIDDEN_GLOBS = (
     ".coverage", "*/.coverage", ".coverage.*", "*/.coverage.*", "coverage.xml",
     "*node_modules/*", "*htmlcov/*", "*wheelhouse/*", "*shots/*",
     "*src-tauri/target/*", "src-tauri/target/*",
+    "src-tauri/backend/*", "*src-tauri/backend/*",
     "*backend/dist/*", "backend/dist/*", "*backend/build/*", "backend/build/*",
+    "backend/_internal/*", "*backend/_internal/*",
     "data/*",
 )
 
 # 规则 4：镜像文本里不能出现本机痕迹。
-# 口径与既往隐私扫描一致：工作目录名 / 本机用户名 / 本机模型库盘符。
+# 口径与既往隐私扫描一致：工作目录名 / 本机用户名 + 任何 C:\Users 绝对路径。
 # 刻意不用泛化的 "X:\\" —— 文档里的示例路径会误报。
 #
-# ⚠️ 下面这组"本机标记"**必须用字符串拼接写**：本脚本自己也在镜像里，
-#    若写成裸字面量，扫描会命中脚本自身 → 门禁永远 FAIL。这不是笔误。
-_LOCAL_MARKERS = (
-    ("workdir", "agent" + "_try"),
-    ("username", "341" + "53"),
-    ("localmodels", "AI" + "-tools"),
-    ("modelstore", "lmstud" + "io"),
-)
+# **不要把本机用户名/工作区名硬编码在这里。** 这个脚本本身会进公开镜像：
+# 写成字面量等于把要藏的东西印在封面上（"拼一下就能读出来"也一样）。
+# 标记在运行时从环境/路径推导：
+#   - workdir  : LUNARSHROUD_PRIVACY_WORKDIR，否则工作区父目录名
+#   - username : USERNAME / USER 环境变量
+#   - 额外标记 : LUNARSHROUD_PRIVACY_MARKERS（逗号分隔，例如本机模型库路径片段）
+# 门禁的意义是证明"当前这台机器"的痕迹没有外泄，所以推导比写死更准确；
+# 公开仓库里跑（没有 github/）不会做比对，也就不需要这些标记。
+def _local_markers() -> tuple[tuple[str, str], ...]:
+    markers: list[tuple[str, str]] = []
+    workdir = os.environ.get("LUNARSHROUD_PRIVACY_WORKDIR") or Path(ROOT).parent.name
+    if workdir and len(workdir) >= 3:
+        markers.append(("workdir", workdir))
+    username = os.environ.get("USERNAME") or os.environ.get("USER")
+    if username and len(username) >= 3:
+        markers.append(("username", username))
+    extras = os.environ.get("LUNARSHROUD_PRIVACY_MARKERS", "")
+    for index, marker in enumerate(extras.split(",")):
+        marker = marker.strip()
+        if len(marker) >= 3:
+            markers.append((f"extra{index}", marker))
+    return tuple(markers)
 
-PRIVACY_PATTERNS = tuple(
-    (label, re.compile(re.escape(marker), re.I)) for label, marker in _LOCAL_MARKERS
-) + (
-    # 分隔符允许 1~2 个：JSON 里的绝对路径是转义过的（盘符 + 两个反斜杠 + Users），单分隔符正则会被它绕过（审计已实证）。
-    # 只允许单个分隔符的正则会被它绕过（审计已实证）。
-    ("userprofile", re.compile(r"[A-Za-z]:[\\/]{1,2}User[s][\\/]{1,2}", re.I)),
-)
+
+def privacy_patterns() -> tuple[tuple[str, re.Pattern[str]], ...]:
+    """按**本次运行**的环境推导隐私匹配表（测试可经环境变量注入标记）。"""
+    return tuple(
+        (label, re.compile(re.escape(marker), re.I))
+        for label, marker in _local_markers()
+    ) + (
+        # 分隔符允许 1~2 个：JSON 里的绝对路径是转义过的（盘符 + 两个反斜杠 + Users），
+        # 只允许单个分隔符的正则会被它绕过（审计已实证）。
+        ("userprofile", re.compile(r"[A-Za-z]:[\\/]{1,2}User[s][\\/]{1,2}", re.I)),
+    )
 
 
 def _matches_any(rel: str, patterns) -> bool:
@@ -339,7 +364,7 @@ def privacy_hits(base: Path, files) -> list[list[str]]:
                 f"{len(data)} 字节超过上限 {_MAX_SCAN_BYTES}，隐私扫描未覆盖",
             ])
             continue
-        for label, pattern in PRIVACY_PATTERNS:
+        for label, pattern in privacy_patterns():
             snippet = None
             for view in _decoded_views(data):
                 match = pattern.search(view)
@@ -461,11 +486,16 @@ def apply(root: Path = ROOT, mirror: Path = MIRROR, stream=sys.stdout) -> int:
         if rel not in expected and not _matches_any(rel, MIRROR_ONLY_ALLOWED):
             (mirror / rel).unlink()
             removed.append(rel)
-    # 清掉因删除而空掉的目录（只处理镜像顶层之下的空目录）
+    # 清掉因删除而空掉的目录（只处理镜像顶层之下的空目录）。
+    # **必须跳过 .git**：镜像本身是 Git 仓库时，`git gc`/pack-refs 之后
+    # `.git/refs/heads`、`.git/objects/info` 等目录可能是空的；把它们删掉
+    # 会让 `git` 直接报 "not a git repository"（实测：一次 --apply 就把
+    # 仓库的 refs 目录清空了）。`.git` 是仓库元数据，不是待发布内容。
     for current, _dirs, _files in os.walk(mirror, topdown=False):
         path = Path(current)
-        if path != mirror and not any(path.iterdir()):
-            path.rmdir()
+        if path != mirror and ".git" not in path.relative_to(mirror).parts:
+            if not any(path.iterdir()):
+                path.rmdir()
 
     print(f"--apply 完成：新增 {len(added)} / 修改 {len(changed)} / 删除 {len(removed)}",
           file=stream)

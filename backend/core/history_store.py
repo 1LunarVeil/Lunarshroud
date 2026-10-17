@@ -5,14 +5,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from contextlib import closing
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from config import HISTORY_DB
 
 from core.param_builder import redact_command_text, scrub_sensitive_params
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -28,16 +32,7 @@ def _get_conn() -> sqlite3.Connection:
 _initialized_paths: set[str] = set()
 
 
-def init_db() -> None:
-    """确保表结构存在（幂等；进程内每个库路径只真正执行一次）。
-
-    此前 8 个操作每次都重跑建表 + PRAGMA，其中 update_status 还由监控线程
-    在每次状态跃迁时触发 —— 白花一次连接和一次 DDL 写事务，而 lifespan
-    (main.py:174) 早已初始化过。
-    """
-    path = str(HISTORY_DB)
-    if path in _initialized_paths:
-        return
+def _create_schema() -> None:
     with closing(_get_conn()) as conn:
         try:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -65,6 +60,78 @@ def init_db() -> None:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_history_started ON launch_history(started_at DESC)"
             )
+
+
+def _quarantine_corrupt_db(path: Path) -> None:
+    """保留损坏库供取证，同时让新库可以立刻重建。
+
+    WAL 模式下主库旁边还有 ``-wal`` / ``-shm``；只移走主库会让新连接继续
+    读到旧 sidecar。移不动主库时重新抛出原异常（例如文件被其他进程锁住，
+    那不是“损坏”，不应假装已恢复）。
+    """
+    for candidate, suffix in (
+        (path, ""),
+        (Path(str(path) + "-wal"), "-wal"),
+        (Path(str(path) + "-shm"), "-shm"),
+    ):
+        if not candidate.exists():
+            continue
+        target = Path(str(path) + ".corrupt" + suffix)
+        try:
+            candidate.replace(target)
+            LOGGER.warning("quarantined history database file %s -> %s", candidate, target)
+        except OSError:
+            LOGGER.exception("failed to quarantine history database file %s", candidate)
+            if candidate == path:
+                raise
+
+
+def _assert_readable() -> None:
+    """在把库标记为"已初始化"之前真正读一遍全部页。
+
+    只建表不够：SQLite 对"页级损坏"是**惰性**报错的 —— ``CREATE TABLE IF NOT
+    EXISTS`` 可能只碰 schema 页，于是初始化"成功"，随后
+    ``mark_unfinished_as_interrupted()`` / ``/api/history`` 才抛
+    ``database disk image is malformed``。lifespan 没有兜住它，后端就整体退出；
+    接口路径没有兜住它，历史页就永久 500。``quick_check`` 会扫描所有页，
+    让损坏在建表阶段就暴露，走同一个隔离重建分支。
+
+    只隔离 SQLite 明确报告损坏的情况（调用方检查错误文本）；锁/权限错误
+    继续原样抛出。
+    """
+    with closing(_get_conn()) as conn:
+        row = conn.execute("PRAGMA quick_check(1)").fetchone()
+        result = str(row[0]).strip().lower() if row is not None else "no result"
+        if result != "ok":
+            raise sqlite3.DatabaseError(f"database disk image is malformed: {result}")
+
+
+def init_db() -> None:
+    """确保表结构存在（幂等；进程内每个库路径只真正执行一次）。
+
+    此前 8 个操作每次都重跑建表 + PRAGMA，其中 update_status 还由监控线程
+    在每次状态跃迁时触发 —— 白花一次连接和一次 DDL 写事务，而 lifespan
+    (main.py:174) 早已初始化过。
+
+    损坏的 ``history.db`` 曾让整个后端在 lifespan 里以 exit 3 退出：一个
+    坏文件不该把启动器变成“后端启动失败”。只对 SQLite 明确报告损坏的
+    错误做隔离重建；锁冲突、权限错误等仍然原样抛出，避免把可恢复问题
+    误判成损坏。
+    """
+    path = str(HISTORY_DB)
+    if path in _initialized_paths:
+        return
+    try:
+        _create_schema()
+        _assert_readable()
+    except sqlite3.DatabaseError as exc:
+        message = str(exc).lower()
+        if "not a database" not in message and "malformed" not in message:
+            raise
+        LOGGER.warning("history database is corrupt (%s); quarantining and rebuilding", exc)
+        _quarantine_corrupt_db(Path(path))
+        _create_schema()
+        _assert_readable()
     _initialized_paths.add(path)
 
 
@@ -91,6 +158,40 @@ def scrub_legacy_secrets() -> None:
                     "UPDATE launch_history SET params_json = ?, command_text = ? WHERE id = ?",
                     (json.dumps(safe_params, ensure_ascii=False), safe_command, row["id"]),
                 )
+
+
+INTERRUPTED_STATUS = "interrupted"
+INTERRUPTED_MESSAGE = (
+    "previous launcher session ended while this instance was still running"
+)
+
+
+def mark_unfinished_as_interrupted() -> int:
+    """Mark records left non-terminal by a previous backend process.
+
+    The Tauri shell stops the sidecar by closing its Job Object, which
+    terminates the process tree outright — the FastAPI lifespan shutdown hook
+    therefore never runs on a normal window close. Without reconciliation the
+    launch history keeps reporting instances as "starting"/"running" forever
+    (the shipped database had rows from weeks earlier still marked running),
+    and the UI shows a live badge for a process that no longer exists.
+
+    This runs once at backend startup, before any new instance can be created,
+    so every non-terminal row necessarily belongs to a previous process.
+    Idempotent: a second call updates nothing. ``stopped_at``/duration are left
+    NULL because the real stop time is unknown; inventing one would fabricate
+    evidence.
+    """
+    init_db()
+    with closing(_get_conn()) as conn, conn:
+        cursor = conn.execute(
+            """UPDATE launch_history
+               SET status = ?,
+                   error_message = COALESCE(error_message, ?)
+               WHERE status IN ('starting', 'running', 'stopping')""",
+            (INTERRUPTED_STATUS, INTERRUPTED_MESSAGE),
+        )
+        return cursor.rowcount
 
 
 def record_launch(

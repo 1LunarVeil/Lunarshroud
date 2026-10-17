@@ -13,18 +13,19 @@ schema 里的 ``draft-ngram`` 不是合法取值，用户一选就是启动失�
 输出格式的坑（都来自真实样本，不是推测）
 ----------------------------------------
 列 0 开头 = 新选项，缩进 = 上一项的续行（本机 246 个选项，0 例外）。
-``default:`` 的排版有六种变体::
+``default:`` 的排版有这些变体::
 
     (default: -1)
     (default: -1, -1 = infinity)              -> -1
     (default: 64, 0 = disabled, -1 = ctx_size)
+    (default: 0, disabled)                    -> 0（注解不带等号）
     (default: 'auto')                         -> 去引号
     (default: same as --threads)              -> 非字面量
     (-1 = disabled, default: 30)              -> default 不在括号开头
     (default:\\n none)                         -> 值在下一行
 
-所以解析前先把整个块折叠成单行、再找第一个 ``default:``，最后只取第一个
-逗号前的片段。
+所以解析前先把整个块折叠成单行、再找第一个 ``default:``，然后按逗号切分，
+只保留"干净的值"那几段（判据见 :func:`extract_default`）。
 
 这个模块只做解析与 IO，**不含任何业务判断**（谁该联动谁、缺什么参数）——
 那些属于 ``capabilities`` 层。
@@ -35,6 +36,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,7 +58,13 @@ _LEADING_FLAG = re.compile(r"\s*,?\s*(--[A-Za-z0-9][A-Za-z0-9-]*|-[A-Za-z0-9][A-
 # 逗号分隔的小写标识符序列，例如 none,draft-simple,draft-mtp
 _VALUE_LIST = re.compile(r"[a-z0-9][a-z0-9-]*(?:,[a-z0-9][a-z0-9-]*)*,?")
 _DEFAULT = re.compile(r"default:\s*([^)]*)")
+# 纯数字字面量（可带符号与小数）。用于分辨"数字 + 词"的注解写法与真正的
+# 取值列表 —— 见 extract_default 的第三种注解判据。
+_NUMERIC_LITERAL = re.compile(r"-?\d+(?:\.\d+)?$")
 _ALLOWED = re.compile(r"allowed values:\s*([^\n(]+)")
+# 参数位上的取值声明：{a,b,c} 或 [a|b|c]
+_HINT_VALUES = re.compile(r"^(?:\{(?P<braces>[^}]*)\}|\[(?P<brackets>[^\]]*)\])$")
+_HINT_TOKEN = re.compile(r"[a-z0-9][a-z0-9_.-]*")
 
 
 @dataclass(frozen=True)
@@ -172,6 +180,11 @@ def extract_default(block_text: str) -> str | None:
     判据是"这一段是不是干净的值"：含 ``=`` 或空格的就是注解，取值列表到此为止。
     等号左侧才是值的那种（``(default: 0 = loaded from model)``）只可能出现在
     **第一段**上，所以第一段单独按等号切一次。
+
+    还有第三种注解写法既没有 ``=`` 也没有空格：``(default: 0, disabled)``
+    （v0.7.0 的 ``--moe-cache-mib`` 就是这种）。判据是**首段是纯数字**——
+    数字后面跟一个词只可能是"这个数字表示什么"，不可能是同一个列表里的
+    另一个取值；反过来 ``0.1,0.2,0.3`` 与 ``ngram-mod,ngram-cache`` 都不受影响。
     """
     flat = " ".join(block_text.split())
     match = _DEFAULT.search(flat)
@@ -187,8 +200,11 @@ def extract_default(block_text: str) -> str | None:
             continue
         if "=" in piece or " " in piece:
             break
-        if piece:
-            kept.append(piece)
+        if not piece:
+            continue
+        if kept and _NUMERIC_LITERAL.match(kept[0]) and not _NUMERIC_LITERAL.match(piece):
+            break
+        kept.append(piece)
 
     value = ",".join(kept).strip().strip("'\"")
     return value or None
@@ -199,6 +215,32 @@ def extract_allowed_values(block_text: str) -> tuple[str, ...]:
     if not match:
         return ()
     return tuple(v.strip() for v in match.group(1).split(",") if v.strip())
+
+
+def extract_hint_values(arg_hint: str | None) -> tuple[str, ...]:
+    """从**参数位**取合法取值：``{a,b,c}`` 与 ``[a|b|c]`` 两种排版。
+
+    上游并不总用 ``allowed values:`` 那一行声明取值（实测 v0.7.0 的 258 个选项
+    里只有 10 个这么写），``--pooling {none,mean,cls,last,rank}`` 与
+    ``--reasoning [on|off|auto]`` 这类是写在参数位上的。拿不到它们，前端就只能
+    吃 schema 的静态快照 —— 而上游新增取值时用户永远选不到（``--spec-type``
+    已经踩过一次这个坑）。
+
+    两条防误判：``N`` / ``TYPE`` / ``<dev1,dev2,..>`` 这类**占位符**不是取值，
+    所以只认小写开头的标识符；单个 token（``[PATH]``）也不算，取值声明至少有
+    两个候选。
+    """
+    if not arg_hint:
+        return ()
+    match = _HINT_VALUES.match(arg_hint.strip())
+    if not match:
+        return ()
+    braces = match.group("braces")
+    raw = braces if braces is not None else (match.group("brackets") or "")
+    values = tuple(v.strip() for v in raw.split("," if braces is not None else "|"))
+    if len(values) < 2 or any(not _HINT_TOKEN.fullmatch(v) for v in values):
+        return ()
+    return values
 
 
 def extract_value_list(block_text: str, flag: str) -> tuple[str, ...]:
@@ -263,7 +305,7 @@ def parse_help(text: str) -> dict[str, OptionInfo]:
             flags=tuple(flags),
             arg_hint=arg_hint,
             default=extract_default(block),
-            allowed_values=extract_allowed_values(block),
+            allowed_values=extract_allowed_values(block) or extract_hint_values(arg_hint),
             description=description,
             deprecated="DEPRECATED" in block,
         )
@@ -338,6 +380,26 @@ def system_tool(name: str) -> str:
     return os.path.join(root, "System32", name)
 
 
+def sanitized_child_env() -> dict[str, str]:
+    """当前环境去掉全部 ``LUNARSHROUD_*``，供任何子进程使用。
+
+    会话令牌是外壳经环境变量注入后端的（lib.rs 的 ``start_backend``）。能力
+    探测会以用户配置的 llama-server 路径起 ``--help`` / ``--version`` 子进程，
+    而那个路径可以是任意构建、包装脚本甚至被替换的文件；它不该拿到管理 API
+    的令牌。``process_manager`` 的 llama-server 启动路径早已剥掉这些变量，但
+    **探测路径**曾经漏了 —— 同一个令牌可以经 ``PUT /api/system/config`` 改写
+    ``llama_server_path``，把一次执行升级成跨启动持久化（AGENTS §2.4）。
+
+    放在这个底层模块而不是 process_manager 里，是为了让探测、GPU 采样和
+    进程管理共用同一份实现，避免三处各写一遍再慢慢漂移。
+    """
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("LUNARSHROUD_")
+    }
+
+
 def which_on_path(name: str) -> str | None:
     """``shutil.which``，但**绝不**把当前目录算作命中。
 
@@ -385,6 +447,24 @@ _CacheKey = tuple[str, int, int]
 _CACHE: dict[_CacheKey, ServerProbe] = {}
 _CACHE_LOCK = threading.Lock()
 
+# 失败结果（probed=False）单独缓存一个短 TTL：失败是常态（未配置、路径错、
+# exe 卡死超时），而每次失败探测要起两个子进程。审计 R2：不缓存时每个请求
+# 都在放大这个代价，还能把 to_thread 线程池占满。失败只压 30 秒尖峰，
+# 之后允许重新验证（用户可能刚修好路径）。
+_FAILED_TTL_SECONDS = 30.0
+_FAILED_CACHE: dict[_CacheKey, tuple[float, ServerProbe]] = {}
+
+# 单飞（F10b）：同一把 exe 的并发冷探测共享一次执行，避免 N 个并发请求
+# 各起两个子进程。领先者持有 Event 直到结果落进缓存；跟随者等事件后重读。
+_INFLIGHT: dict[_CacheKey, threading.Event] = {}
+
+# 同一目标的并发等待者上限（第二轮复核 N1 的廉价闸门）：等待者要占着
+# to_thread 的工作线程直到结果落地或截止，无上限时 30+ 并发就能把默认线程池
+# （约 32）占满、连带让实例管理端点排队。超限调用立即返回带明确文案的失败
+# （背压，不入缓存）；限额内的等待语义不变。
+_MAX_FOLLOWERS_PER_KEY = 8
+_WAITER_COUNT: dict[_CacheKey, int] = {}
+
 
 def _cache_key(exe_path: str | Path | None) -> _CacheKey | None:
     """缓存键 = (路径, mtime_ns, 文件大小)；拿不到就返回 None（不可缓存）。"""
@@ -398,21 +478,95 @@ def _cache_key(exe_path: str | Path | None) -> _CacheKey | None:
     return (str(path), stat.st_mtime_ns, stat.st_size)
 
 
+def _terminate_probe_tree(process: subprocess.Popen) -> None:
+    """回收探测子进程的整棵树（与 process_manager 同一份 System32 纪律）。
+
+    探测对象可能是 .bat/.cmd 包装脚本：直接子进程只是 cmd.exe，真正干活的是
+    孙进程；只杀直接子进程会留下"拿着继承管道不放"的孤儿。
+
+    taskkill 的**返回码必须检查**：它可能被安全软件/组策略拦下（实测受限环境
+    返回 rc=1 + "Access denied"），旧实现忽略返回码直接返回，于是树没死、管道
+    没人关，后续 communicate() 只能靠 5s 超时兜底。失败时改用 psutil 按父子
+    关系杀树，再不济退回直接 kill。
+    """
+    if os.name == "nt":
+        tool = system_tool("taskkill.exe")
+        if tool:
+            try:
+                result = subprocess.run(
+                    [tool, "/F", "/T", "/PID", str(process.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    check=False,
+                    env=sanitized_child_env(),
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if result.returncode == 0:
+                    return
+            except (OSError, subprocess.TimeoutExpired):
+                pass  # taskkill 不可用/超时：继续走 psutil 兜底
+        try:
+            import psutil
+
+            parent = psutil.Process(process.pid)
+            children = parent.children(recursive=True)
+            for child in children:
+                try:
+                    child.kill()
+                except psutil.Error:
+                    pass
+            try:
+                parent.kill()
+            except psutil.Error:
+                pass
+            psutil.wait_procs(children + [parent], timeout=5)
+        except Exception:  # noqa: BLE001 - 兜底失败仍要退回直接 kill
+            pass
+    if process.poll() is None:
+        process.kill()
+
+
 def _run(exe: str, args: list[str], timeout: float) -> str:
-    result = subprocess.run(  # noqa: S603 - 参数来自本地配置，非用户输入拼接
+    """跑一次探测并返回输出；**超时按进程树回收**。
+
+    `subprocess.run(timeout=)` 在 Windows 包装脚本场景下不构成时间上界：
+    超时它只杀直接子进程（cmd.exe），孙进程仍握着继承来的 stdout 管道，
+    随后的 communicate() 会一直等管道 EOF —— 独立审计实测挂起 585s（H1）。
+    这里改为手动 Popen：超时后用 taskkill /F /T 收掉整棵树，再限时收管道。
+    """
+    process = subprocess.Popen(  # noqa: S603 - 参数来自本地配置，非用户输入拼接
         [exe, *args],
-        capture_output=True,
-        timeout=timeout,
-        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         # 子进程的 CWD 设成 exe 自己的目录：继承后端的 CWD 会让 DLL 搜索序里
         # 的"当前目录"那一级落在启动器安装目录（用户可写）上。
         cwd=os.path.dirname(exe) or None,
+        # 被测对象是用户指定的第三方构建：绝不让它继承启动器的会话令牌/会话 ID。
+        # 与 process_manager._child_env 共用同一份实现（见 sanitized_child_env）。
+        env=sanitized_child_env(),
         # 打包态 backend.exe 是无控制台程序：不带这个 flag，每次冷探测
         # （--help / --version）都会给 llama-server 弹一个可见控制台窗口
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
     )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_probe_tree(process)
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            # 树已杀还收不到 EOF（理论上不该发生）：封掉管道，绝不无限等
+            stdout, stderr = b"", b""
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+        raise
     # 不同构建把帮助写到 stdout 或 stderr 的都有，两边都收
-    for stream in (result.stdout, result.stderr):
+    for stream in (stdout, stderr):
         if stream:
             text = stream.decode("utf-8", errors="replace")
             if text.strip():
@@ -460,18 +614,86 @@ def probe_server_cached(exe_path: str | Path, **options: Any) -> ServerProbe:
     if key is None:
         return probe_server(exe_path, **options)
 
-    with _CACHE_LOCK:
-        hit = _CACHE.get(key)
-    if hit is not None:
-        return hit
+    # 跟随者的总等待上界（独立审计 H1 的第二半）：领先者正常耗时 ≤ 2×timeout
+    # （--help + --version），加 5s 余量。没有这个截止，领先者卡死时跟随者会
+    # 在 `wait(1.0)` 里每秒空转、**永不返回** —— asyncio.to_thread 的取消杀不掉
+    # 工作线程，默认执行器（约 32 线程）会被逐一占满，此后所有 to_thread 端点
+    # （启动/停止/重启/扫描/保存配置）永久排队，只能重启应用。
+    follower_budget = 2 * float(options.get("timeout") or DEFAULT_TIMEOUT) + 5.0
+    deadline = time.monotonic() + follower_budget
 
-    probe = probe_server(exe_path, **options)
-    if probe.probed:
-        with _CACHE_LOCK:
-            if len(_CACHE) >= 64:
-                _CACHE.clear()
-            _CACHE[key] = probe
-    return probe
+    joined_waitlist = False
+    try:
+        while True:
+            with _CACHE_LOCK:
+                hit = _CACHE.get(key)
+                if hit is None:
+                    failed = _FAILED_CACHE.get(key)
+                    if failed is not None:
+                        if time.monotonic() - failed[0] <= _FAILED_TTL_SECONDS:
+                            return failed[1]
+                        _FAILED_CACHE.pop(key, None)
+                if hit is not None:
+                    return hit
+                flight = _INFLIGHT.get(key)
+                if flight is None:
+                    _INFLIGHT[key] = flight = threading.Event()
+                    leader = True
+                else:
+                    leader = False
+            if not leader:
+                if not joined_waitlist:
+                    with _CACHE_LOCK:
+                        waiters = _WAITER_COUNT.get(key, 0)
+                        if waiters >= _MAX_FOLLOWERS_PER_KEY:
+                            # 背压：不缓存这个合成失败，调用方稍后重试即可
+                            return ServerProbe(
+                                path=str(exe_path),
+                                probed=False,
+                                error=(
+                                    f"探测进行中（等待队列已满 {_MAX_FOLLOWERS_PER_KEY}），"
+                                    "请稍后重试"
+                                ),
+                            )
+                        _WAITER_COUNT[key] = waiters + 1
+                    joined_waitlist = True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # 不把这个合成失败放进缓存：领先者稍后仍可能带着真实结果回来
+                    return ServerProbe(
+                        path=str(exe_path),
+                        probed=False,
+                        error=f"探测等待超时（{follower_budget:.0f}s，同一目标的探测仍在进行）",
+                    )
+                flight.wait(timeout=min(1.0, remaining))
+                continue
+
+            try:
+                probe = probe_server(exe_path, **options)
+                with _CACHE_LOCK:
+                    if probe.probed:
+                        if len(_CACHE) >= 64:
+                            _CACHE.clear()
+                        _CACHE[key] = probe
+                    else:
+                        if len(_FAILED_CACHE) >= 64:
+                            _FAILED_CACHE.clear()
+                        _FAILED_CACHE[key] = (time.monotonic(), probe)
+                return probe
+            finally:
+                with _CACHE_LOCK:
+                    finished = _INFLIGHT.pop(key, None)
+                if finished is not None:
+                    finished.set()
+    finally:
+        # 等待者离席（只计一次；上层任何返回路径都要减）
+        if joined_waitlist:
+            with _CACHE_LOCK:
+                left = _WAITER_COUNT.get(key, 0) - 1
+                if left > 0:
+                    _WAITER_COUNT[key] = left
+                else:
+                    _WAITER_COUNT.pop(key, None)
 
 
 def probe_server_cached_only(exe_path: str | Path | None) -> ServerProbe | None:
@@ -494,3 +716,4 @@ def probe_server_cached_only(exe_path: str | Path | None) -> ServerProbe | None:
 def clear_server_cache() -> None:
     with _CACHE_LOCK:
         _CACHE.clear()
+        _FAILED_CACHE.clear()

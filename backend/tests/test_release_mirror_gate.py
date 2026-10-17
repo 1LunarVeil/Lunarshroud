@@ -16,8 +16,14 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 import check_release_mirror as gate  # noqa: E402
 
-# 本机标记必须用拼接写，否则本测试文件自己会被隐私扫描命中
-_WORKDIR = "agent" + "_try"
+# 本机标记不写死：门禁从环境变量推导，测试用中性 fixture 标记注入
+_WORKDIR = "fixture" + "_workspace"
+
+
+@pytest.fixture(autouse=True)
+def _privacy_marker(monkeypatch):
+    """把"本机工作区标记"注入门禁；公开源码里不出现真实工作区名。"""
+    monkeypatch.setenv("LUNARSHROUD_PRIVACY_WORKDIR", _WORKDIR)
 
 RUNTIME_DERIVED = [
     "data/config.json.corrupt",
@@ -118,6 +124,54 @@ def test_ai_tool_config_files_are_excluded_and_forbidden(rel):
     assert gate.is_forbidden(rel), f"{rel} 出现在镜像里必须被判违规"
 
 
+def test_every_workflow_action_is_pinned_to_a_full_commit_sha():
+    """CI 里每个 action 都必须固定到完整 40 位 commit SHA。
+
+    这条约定一直写在 workflow 的注释风格里（`# v4.2.2` 之类），但**没有任何东西
+    守着** —— 结果 ci.yml 的 setup-node 曾固定在一个 39 位的截断 SHA 上：GitHub
+    解析不了，test job 从那一步起整个失败，而后面的前端测试、Rust、镜像门禁全部
+    跟着跑不到。约定不被强制，就等于没有约定。
+    """
+    import re
+
+    root = Path(__file__).resolve().parents[2]
+    workflows = sorted((root / ".github" / "workflows").glob("*.yml"))
+    assert workflows, "找不到 workflow 文件，本测试会假绿"
+
+    bad = []
+    checked = 0
+    for wf in workflows:
+        text = wf.read_text(encoding="utf-8")
+        for match in re.finditer(r"uses:\s*(\S+)", text):
+            ref = match.group(1)
+            name, _, pin = ref.partition("@")
+            assert pin, f"{wf.name}: {ref} 没有固定版本"
+            checked += 1
+            if not re.fullmatch(r"[0-9a-f]{40}", pin):
+                bad.append(f"{wf.name}: {name}@{pin} (长度 {len(pin)})")
+    assert checked >= 6, f"只解析到 {checked} 个 uses，正则可能已失效"
+    assert not bad, ("以下 action 没有固定到完整 40 位 SHA：" + chr(10) + chr(10).join(bad))
+
+
+def test_workflows_publish_an_installer_users_can_actually_download():
+    """release.yml 必须真正把安装包发到一个可匿名下载的 URL。
+
+    只 upload-artifact 不等于发布：workflow artifact 会过期、必须登录 GitHub 并
+    点进具体某次运行才能下载、仓库首页没有入口。项目的既定要求是"既能让用户
+    克隆源码自构建，也要给不懂命令行的用户一个能直接装的安装包"，缺这一步
+    第二条通道就是 0% 完成。
+    """
+    text = (Path(__file__).resolve().parents[2] / ".github" / "workflows"
+            / "release.yml").read_text(encoding="utf-8")
+    assert "gh release create" in text, "没有任何 GitHub Release 发布步骤"
+    # 必须只在打 tag 时发布，workflow_dispatch 试跑不得误发公开版本
+    assert "startsWith(github.ref, 'refs/tags/v')" in text
+    # 构建 job 的最小权限不该被写权限稀释
+    assert "contents: read" in text
+    build_job = text.split("  publish-release:")[0]
+    assert "contents: write" not in build_job, "写权限泄漏到了构建 job"
+
+
 def test_the_project_gitignore_still_mirrors():
     """反向保护：排除 AI 工具忽略文件时，别把项目自己的 .gitignore 也排掉。"""
     assert not gate.is_excluded(".gitignore")[0]
@@ -150,6 +204,31 @@ def test_privacy_scan_reads_wal_sidecar(tmp_path):
     (tmp_path / "data" / "history.db-wal").write_text("path=D:/" + _WORKDIR, encoding="utf-8")
     hits = gate.privacy_hits(tmp_path, ["data/history.db-wal"])
     assert hits and hits[0][1] == "workdir"
+
+
+def test_apply_never_deletes_mirror_git_metadata(tmp_path):
+    """`--apply` 的空目录清理不得进入 `.git/`。
+
+    实测事故：镜像仓库 `git gc`/pack-refs 之后 `.git/refs/heads` 是空目录，
+    `--apply` 的清理把它删了，下一次 git 命令直接报 "not a git repository"。
+    `.git` 是仓库元数据，不属于待发布内容，必须整棵跳过。
+    """
+    root = tmp_path / "work"
+    root.mkdir()
+    (root / "a.txt").write_text("a", encoding="utf-8")
+
+    mirror = tmp_path / "mirror"
+    for relative in (".git/refs/heads", ".git/refs/tags", ".git/objects/info"):
+        (mirror / relative).mkdir(parents=True)
+    (mirror / "stale.txt").write_text("stale", encoding="utf-8")
+
+    gate.apply(root, mirror, stream=io.StringIO())
+
+    assert (mirror / ".git" / "refs" / "heads").is_dir(), "refs 目录被空目录清理删除了"
+    assert (mirror / ".git" / "refs" / "tags").is_dir()
+    assert (mirror / ".git" / "objects" / "info").is_dir()
+    assert (mirror / "a.txt").is_file()
+    assert not (mirror / "stale.txt").exists()
 
 
 def test_privacy_scan_reads_ascii_markers_inside_binaries(tmp_path):

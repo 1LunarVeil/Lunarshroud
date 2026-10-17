@@ -439,6 +439,29 @@ def _normalize(
     # 选中时会被告知"不需要 -md" —— 这正是原来那个 Bug 的形态。
     provides_builtin_mtp = has_nextn_weights and not is_assistant_model
 
+    # 嵌入/重排模型是**编码器**：没有因果注意力掩码，或声明了池化方式。
+    # 这两个信号来自 GGUF 元数据本身（实测 nomic-embed-text-v1.5：
+    # nomic-bert.attention.causal=false、nomic-bert.pooling_type=1），
+    # 比"看文件名像不像 embedding"可靠。架构名兜底只覆盖常见的编码器家族，
+    # 拿不准时宁可返回 False —— 这是用于提示，不是用于阻断。
+    is_mmproj = arch == "clip" or "clip.has_vision_encoder" in meta
+    attention_causal = pick("attention.causal")
+    pooling_type = pick("pooling_type")
+    arch_lower = (arch or "").lower()
+    name_lower = str(meta.get("general.name") or path.stem).lower()
+    _ENCODER_ARCH_HINTS = (
+        "bert", "bge", "gte", "jina", "mxbai", "snowflake-arctic", "embed",
+    )
+    is_encoder_model = bool(not is_mmproj and (attention_causal is False or pooling_type is not None))
+    is_embedding_model = bool(
+        not is_mmproj
+        and (
+            is_encoder_model
+            or any(hint in arch_lower for hint in _ENCODER_ARCH_HINTS)
+        )
+    )
+    is_reranker_model = bool(not is_mmproj and "rerank" in name_lower)
+
     return {
         "path": str(path),
         "filename": path.name,
@@ -469,7 +492,13 @@ def _normalize(
         "has_vision_encoder": bool(meta.get("clip.has_vision_encoder")),
         "has_audio_encoder": bool(meta.get("clip.has_audio_encoder")),
         "clip_projector_type": meta.get("clip.projector_type"),
-        "is_mmproj": arch == "clip" or "clip.has_vision_encoder" in meta,
+        "is_mmproj": is_mmproj,
+        # 编码器 / 嵌入 / 重排（用于启动前提示与模型库徽章）
+        "attention_causal": attention_causal,
+        "pooling_type": pooling_type,
+        "is_encoder_model": is_encoder_model,
+        "is_embedding_model": is_embedding_model,
+        "is_reranker_model": is_reranker_model,
         "tensor_count": tensor_count,
         "metadata_count": kv_count,
         "metadata_parsed": metadata_parsed,
@@ -552,11 +581,17 @@ def find_companion_files(model_path: str | Path, *, max_entries: int = 4000) -> 
 
     self_name = p.name
     try:
-        entries = list(parent.iterdir())
+        entries = parent.iterdir()
     except OSError:
         return result
 
-    for entry in entries[:max_entries]:
+    # 边迭代边计数：目录可能有几千个文件，list(iterdir()) 会先物化全部
+    # Path 对象再切片（审计 R3 的 O(n²) 形态），这里在 max_entries 处直接停。
+    scanned = 0
+    for entry in entries:
+        if scanned >= max_entries:
+            break
+        scanned += 1
         if entry.name == self_name:
             continue
         if not entry.name.lower().endswith(".gguf"):

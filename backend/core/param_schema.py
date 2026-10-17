@@ -112,6 +112,7 @@ class ParamGroup(str, Enum):
     SAMPLING = "sampling"                # G5 采样参数
     SERVER = "server"                    # G6 服务器与网络
     ADVANCED = "advanced"                # G7 高级
+    AGENT = "agent"                      # G8 AI 工具与 MCP
 
 
 # ========== 参数元数据定义 ==========
@@ -190,6 +191,36 @@ PARAM_DEFINITIONS: list[ParamMeta] = [
     ),
 
     # ===== G2 性能与显存 =====
+    # MoE / 大模型显存降级族（对官方 build 11630 对齐新增；capability 驱动，
+    # 老构建自动置灰）
+    ParamMeta(
+        key="cpu_moe", label="MoE 全部放 CPU", cli="--cpu-moe",
+        group=ParamGroup.PERFORMANCE, type="switch",
+        default=False, cli_no_value=True,
+        help="把所有 MoE 专家权重保留在 CPU（显存不够时跑大 MoE 模型的降级方案）。只想放前 N 层用「MoE 放 CPU 层数」。",
+        order=15,
+    ),
+    ParamMeta(
+        key="n_cpu_moe", label="MoE 放 CPU 层数", cli="--n-cpu-moe",
+        group=ParamGroup.PERFORMANCE, type="number",
+        default=0, min=0,
+        help="把前 N 层的 MoE 专家权重保留在 CPU。0 = 不启用。",
+        order=16, skip_when_default=True,
+    ),
+    ParamMeta(
+        key="n_cpu_ffn", label="稠密 FFN 放 CPU 层数", cli="--n-cpu-ffn",
+        group=ParamGroup.PERFORMANCE, type="number",
+        default=0, min=0,
+        help="把前 N 层（稠密模型）的 FFN 权重保留在 CPU；MoE 模型请用上面的 MoE 项。0 = 不启用。",
+        order=17, skip_when_default=True,
+    ),
+    ParamMeta(
+        key="moe_cache_mib", label="MoE 专家 GPU 缓存 (MiB)", cli="--moe-cache-mib",
+        group=ParamGroup.PERFORMANCE, type="number",
+        default=0, min=0,
+        help="为留在 CPU 的 MoE 专家保留的 GPU 缓存（MiB）；多卡按张量分摊。0 = 关闭。",
+        order=18, skip_when_default=True,
+    ),
     ParamMeta(
         key="ctx_size", label="上下文长度", cli="-c",
         group=ParamGroup.PERFORMANCE, type="number",
@@ -277,7 +308,8 @@ PARAM_DEFINITIONS: list[ParamMeta] = [
         key="cache_ram", label="缓存内存上限", cli="-cram",
         group=ParamGroup.PERFORMANCE, type="number",
         default=8192, min=-1, max=1048576, step=256, unit="MiB", skip_when_default=True,
-        help="缓存占用的内存上限（MiB）。-1 = 不限，0 = 禁用缓存。机器内存紧张时调低。",
+        help="缓存占用的内存上限（MiB）。-1 = 不限，0 = 禁用缓存"
+             "（llama.cpp v0.7.0 起，决策/打分类模型建议设 0）。机器内存紧张时调低。",
         order=11,
     ),
     ParamMeta(
@@ -306,6 +338,24 @@ PARAM_DEFINITIONS: list[ParamMeta] = [
     ),
 
     # ===== G3 推测解码 =====
+    ParamMeta(
+        key="spec_draft_n_ubatch", label="草稿微批上限", cli="--spec-draft-n-ubatch",
+        group=ParamGroup.SPECULATIVE, type="number",
+        default=0, min=0,
+        depends_on_any={"spec_type": sorted(SPEC_TYPES_MODEL_BACKED)},
+        help="草稿上下文的物理最大批大小；调小可省显存（0 = 与 --n-ubatch 相同）。",
+        order=18, skip_when_default=True,
+    ),
+    ParamMeta(
+        key="spec_draft_sampling", label="草稿采样方式", cli="--spec-draft-sampling",
+        group=ParamGroup.SPECULATIVE, type="select",
+        default="greedy",
+        options=["greedy", "probabilistic"],
+        option_labels={"greedy": "greedy（取 argmax）", "probabilistic": "probabilistic（拒绝采样）"},
+        depends_on_any={"spec_type": sorted(SPEC_TYPES_MODEL_BACKED)},
+        help="greedy 取草稿的 argmax；probabilistic 先采样再由目标模型拒绝采样验证（概率质量更正确，速度略降）。",
+        order=19, skip_when_default=True,
+    ),
     # 说明：--spec-type 是逗号分隔的多值参数，可选值来自 llama-server --help。
     # 下面除 spec_default 外的所有参数都只在"手动选择实现"时才有意义，
     # 因此统一带上 depends_on={"spec_default": False}，避免与 --spec-default 撞车。
@@ -474,6 +524,28 @@ PARAM_DEFINITIONS: list[ParamMeta] = [
     ),
 
     # ===== G4 多模态 =====
+    # 视频输入族（官方 build 11630 新增；需要 ffmpeg/ffprobe）
+    ParamMeta(
+        key="video_fps", label="视频目标帧率", cli="--video-fps",
+        group=ParamGroup.MULTIMODAL, type="number",
+        default=4.0, min=0.1, step=0.1,
+        help="视频输入的目标帧率（默认 4）。帧率越高越吃上下文与算力。",
+        order=4, skip_when_default=True,
+    ),
+    ParamMeta(
+        key="video_ffmpeg_dir", label="ffmpeg 目录", cli="--video-ffmpeg-dir",
+        group=ParamGroup.MULTIMODAL, type="dir",
+        default="",
+        help="包含 ffmpeg 与 ffprobe 的目录；留空则从 PATH 查找。",
+        order=5,
+    ),
+    ParamMeta(
+        key="video_timestamp_interval", label="视频时间戳间隔 (ms)", cli="--video-timestamp-interval",
+        group=ParamGroup.MULTIMODAL, type="number",
+        default=5000, min=0,
+        help="视频转写文本时间戳之间的间隔（毫秒，默认 5000）。",
+        order=6, skip_when_default=True,
+    ),
     ParamMeta(
         key="mmproj", label="多模态投影模型", cli="--mmproj",
         group=ParamGroup.MULTIMODAL, type="file",
@@ -567,6 +639,46 @@ PARAM_DEFINITIONS: list[ParamMeta] = [
              "default = 不干预模板自己的设定。想更快出结果就调低。",
         order=9, skip_when_default=True,
     ),
+    ParamMeta(
+        key="reasoning", label="思考模式", cli="--reasoning",
+        group=ParamGroup.SAMPLING, type="select",
+        default="auto",
+        options=["auto", "on", "off"],
+        option_labels={
+            "auto": "auto（由对话模板决定）", "on": "on（强制思考）", "off": "off（不思考）",
+        },
+        # "auto" 就是上游默认（从模板检测），写出来是噪音；与 rope_scaling 的
+        # "none" 同一套哨兵机制。
+        omit_values=["auto"],
+        help="是否让模型先输出思考过程。**回复为空、或模型只思考不作答时把它设成 off** —— "
+             "思考段会吃掉「最大预测 token」的预算，短回答可能被思考耗尽。"
+             "auto = 由对话模板决定（上游默认，不下发该 flag）。",
+        order=10,
+    ),
+    ParamMeta(
+        key="reasoning_format", label="思考内容格式", cli="--reasoning-format",
+        group=ParamGroup.SAMPLING, type="select",
+        default="auto",
+        options=["auto", "none", "deepseek", "deepseek-legacy"],
+        option_labels={
+            "auto": "auto（自动）",
+            "none": "none（不解析，标签留在 content 里）",
+            "deepseek": "deepseek（思考放进 reasoning_content）",
+            "deepseek-legacy": "deepseek-legacy（content 保留 <think> 标签）",
+        },
+        help="思考内容在 API 响应里的呈现方式。客户端要单独折叠/展示思考过程时用 deepseek；"
+             "不想让服务端解析标签时用 none（原样留在 content 里）。",
+        order=11, skip_when_default=True,
+    ),
+    ParamMeta(
+        key="chat_template_kwargs", label="对话模板附加参数", cli="--chat-template-kwargs",
+        group=ParamGroup.SAMPLING, type="text",
+        default="", placeholder='例如 {"enable_thinking": false}',
+        help='透传给对话模板的 JSON 对象字符串，例如 {"enable_thinking": false}'
+             "（Qwen3 系模型用它在模板层关掉思考，比「思考模式 = off」更彻底：模板"
+             "根本不生成思考段）。必须是合法 JSON 对象；留空 = 不下发。",
+        order=12,
+    ),
 
     # ===== G6 服务器与网络 =====
     # host / port **故意不标** skip_when_default：即使探测到"与上游默认值相同"
@@ -592,7 +704,10 @@ PARAM_DEFINITIONS: list[ParamMeta] = [
         # 读到的是归一前的原始 params。声明 omit_values 与 n_gpu_layers=-1
         # 同一套机制 —— 真实启动永远不会带着 0 走到 build_argv。
         omit_values=["0"],
-        help="服务器监听端口。默认 8080；若被占用启动器会提示。多实例时自动递增分配。",
+        help="服务器监听端口。0 = 自动分配（从设置里的起始端口向上找可用端口），"
+             "多实例时自动递增；端口被占用时启动器会提示。启动器**总是**显式下发 "
+             "--port（实例身份、健康检查、Chat 内嵌都读它），因此不受上游默认端口"
+             "变化影响 —— llama.cpp v0.7.0 起上游默认端口已从 8080 改为 9931。",
         required=True, order=2,
     ),
     ParamMeta(
@@ -623,8 +738,123 @@ PARAM_DEFINITIONS: list[ParamMeta] = [
         help="启用 Prometheus 指标端点 /metrics。配合监控使用。",
         order=6,
     ),
+    ParamMeta(
+        key="rerank", label="启用重排序端点", cli="--rerank",
+        group=ParamGroup.SERVER, type="switch",
+        default=False, cli_no_value=True,
+        help="启用 /rerank 重排序端点（配合重排模型或 RAG 检索流程使用）。",
+        order=7,
+    ),
+    ParamMeta(
+        key="pooling", label="嵌入池化方式", cli="--pooling",
+        group=ParamGroup.SERVER, type="select",
+        default="",
+        options=["", "none", "mean", "cls", "last", "rank"],
+        option_labels={
+            "": "（跟随模型默认）",
+            "none": "none（不池化，逐 token 向量）",
+            "mean": "mean（平均池化）",
+            "cls": "cls（取分类位）",
+            "last": "last（取最后一个 token）",
+            "rank": "rank（重排序打分）",
+        },
+        help="嵌入的池化方式。留空 = 用模型元数据里的默认值（多数模型就该用它，"
+             "留空时不下发该 flag）。检索类 RAG 常用 mean 或 cls；重排序模型用 rank。",
+        order=8,
+    ),
+    ParamMeta(
+        key="embd_normalize", label="嵌入归一化", cli="--embd-normalize",
+        group=ParamGroup.SERVER, type="number",
+        default=2, min=-1, max=16, step=1, skip_when_default=True,
+        help="嵌入向量的归一化方式：-1 = 不归一化，0 = 按最大绝对值量化到 int16，"
+             "1 = taxicab(L1)，2 = 欧几里得(L2，上游默认)，>2 = p-norm。"
+             "余弦相似度检索用 2；要省传输带宽时用 0。",
+        order=9,
+    ),
+    ParamMeta(
+        key="cache_prompt", label="提示词缓存", cli="--cache-prompt",
+        group=ParamGroup.SERVER, type="switch",
+        default=True, cli_reverse=True,
+        help="缓存已处理过的提示词前缀。RAG 每轮都会重复同一段系统提示与检索片段，"
+             "开着能省掉大量重复计算；关闭可省一些显存。关闭后「缓存复用最小块」"
+             "（--cache-reuse）随之失效。",
+        order=10,
+    ),
+    ParamMeta(
+        key="models_dir", label="路由模型目录", cli="--models-dir",
+        group=ParamGroup.SERVER, type="dir",
+        default="", placeholder="留空 = 单模型模式",
+        help="llama.cpp v0.7.0 的路由（router）模式：指向一个装着多个 GGUF 的目录，"
+             "llama-server 按请求在它们之间切换，内置 WebUI 里也会出现模型管理器"
+             "（表格 / 搜索 / 筛选 / 收藏 / 下载）。留空 = 单模型模式（只用上面的模型文件）。",
+        order=11,
+    ),
+    ParamMeta(
+        key="models_max", label="同时加载模型数", cli="--models-max",
+        group=ParamGroup.SERVER, type="number",
+        default=4, min=0, max=64, step=1, skip_when_default=True,
+        depends_on_nonempty="models_dir",
+        help="路由模式下同时保持加载的模型数量上限；0 = 不限。显存小（8GB 级）时建议 1~2，"
+             "超出显存的模型会被换出，切回时要重新加载。",
+        order=12,
+    ),
+
+    # ===== G8 AI 工具与 MCP =====
+    # llama.cpp b10709+ 的实验能力：内置 agent 工具、MCP servers、WebUI MCP 代理。
+    # 全部跟随本机构建渲染：老构建没有这些 flag 时自动置灰/被丢弃（probe 驱动）。
+    ParamMeta(
+        key="agent", label="Agent 模式总开关", cli="--agent",
+        group=ParamGroup.AGENT, type="switch",
+        default=False, cli_no_value=True,
+        help="等价于同时开启 CORS 代理与全部内置工具（read_file / grep_search / exec_shell_command 等）。实验性，仅在可信环境使用；为安全会自动把 --cors-origins 限制在本机。",
+        order=1,
+    ),
+    ParamMeta(
+        key="tools", label="内置工具清单", cli="--tools",
+        group=ParamGroup.AGENT, type="text",
+        default="",
+        help="逗号分隔的工具列表：read_file, file_glob_search, grep_search, exec_shell_command, write_file, edit_file, get_info；all = 全开。实验性，仅在可信环境使用。",
+        order=2,
+    ),
+    ParamMeta(
+        key="tools_runtime", label="工具运行环境", cli="--tools-runtime",
+        group=ParamGroup.AGENT, type="text",
+        default="",
+        help="把内置工具跑在隔离环境里：docker:<image> / podman:<image>（用后清理）或 ssh:<target>（远端 POSIX，需密钥认证）。留空 = 本机宿主环境。",
+        order=3,
+    ),
+    ParamMeta(
+        key="ui_mcp_proxy", label="WebUI MCP 代理", cli="--ui-mcp-proxy",
+        group=ParamGroup.AGENT, type="switch",
+        default=False, cli_no_value=True,
+        help="允许 WebUI 通过 CORS 代理连接外部 MCP 服务器（实验性，不可信环境勿开）。开启后可在 Chat 界面的 MCP Servers 面板里配置。",
+        order=4,
+    ),
+    ParamMeta(
+        key="mcp_servers_config", label="MCP 服务器配置", cli="--mcp-servers-config",
+        group=ParamGroup.AGENT, type="file",
+        default="",
+        help="MCP server 定义 JSON（Cursor 兼容格式）的路径；为安全会自动把 --cors-origins 限制在本机。与下面的内联 JSON 二选一。",
+        order=5,
+    ),
+    ParamMeta(
+        key="mcp_servers_json", label="MCP 服务器 JSON（内联）", cli="--mcp-servers-json",
+        group=ParamGroup.AGENT, type="text",
+        default="",
+        help="内联的 MCP server 定义 JSON（Cursor 兼容格式），与上面的配置文件二选一；为安全会自动把 --cors-origins 限制在本机。",
+        order=6,
+    ),
 
     # ===== G7 高级 =====
+    ParamMeta(
+        key="lazy_mode", label="惰性张量读取", cli="--lazy-mode",
+        group=ParamGroup.ADVANCED, type="select",
+        default="auto",
+        options=["auto", "on", "off"],
+        option_labels={"auto": "auto（>4GiB 时启用）", "on": "on（全部按需读）", "off": "off（常驻内存）"},
+        help="按需读取部分张量（如逐层 embedding）：on 从磁盘按需读（需 mmap）；auto 只对大于 4 GiB 的张量启用；off 常驻内存。",
+        order=12, skip_when_default=True,
+    ),
     ParamMeta(
         key="mlock", label="锁定内存", cli="--mlock",
         group=ParamGroup.ADVANCED, type="switch",
@@ -715,6 +945,15 @@ PARAM_DEFINITIONS: list[ParamMeta] = [
              "（不被换出，运行更稳），mmap+mlock = 两者都要，dio = 直接 IO。",
         order=10, skip_when_default=True,
     ),
+    ParamMeta(
+        key="rpc", label="RPC 服务器", cli="--rpc",
+        group=ParamGroup.ADVANCED, type="text",
+        default="", placeholder="例如 192.168.1.20:50052,192.168.1.21:50052",
+        help="逗号分隔的 RPC 服务器列表（host:port），把张量计算分给远端机器上的 "
+             "llama-rpc-server。v0.7.0 的 RPC 协议是 v8 并支持张量并行，两端必须是"
+             "同版本构建（协议不匹配会直接连不上）。留空 = 不用 RPC。",
+        order=13,
+    ),
     # 必须是列表的**最后一项**：它按声明顺序追加到命令行末尾，长尾 flag
     # 因此不会被面板写出的东西盖掉。但**不允许**反过来覆盖启动器代管的 5 个
     # 参数 —— 那是安全边界被绕过的根因（audit S2），校验已在
@@ -784,11 +1023,36 @@ PARAM_LABELS_EN: dict[str, str] = {
     "seed": "Random seed",
     "n_predict": "Max predicted tokens",
     "reasoning_effort": "Reasoning effort",
+    "reasoning": "Thinking mode",
+    "reasoning_format": "Reasoning output format",
+    "chat_template_kwargs": "Chat template kwargs",
     "host": "Listen address",
     "port": "Listen port",
     "api_key": "API key",
     "path": "WebUI path",
     "embeddings": "Enable embeddings endpoint",
+    "rerank": "Enable reranking endpoint",
+    "pooling": "Embedding pooling type",
+    "embd_normalize": "Embedding normalization",
+    "cache_prompt": "Prompt caching",
+    "models_dir": "Router models directory",
+    "models_max": "Max models loaded at once",
+    "agent": "Agent mode (tools + CORS proxy)",
+    "tools": "Built-in tools",
+    "tools_runtime": "Tool runtime",
+    "ui_mcp_proxy": "WebUI MCP proxy",
+    "mcp_servers_config": "MCP servers config",
+    "mcp_servers_json": "MCP servers JSON (inline)",
+    "cpu_moe": "All MoE weights on CPU",
+    "n_cpu_moe": "MoE layers kept on CPU",
+    "n_cpu_ffn": "Dense FFN layers kept on CPU",
+    "moe_cache_mib": "MoE expert GPU cache (MiB)",
+    "spec_draft_n_ubatch": "Draft micro-batch limit",
+    "spec_draft_sampling": "Draft sampling mode",
+    "lazy_mode": "Lazy tensor loading",
+    "video_fps": "Target video frame rate",
+    "video_ffmpeg_dir": "ffmpeg directory",
+    "video_timestamp_interval": "Video timestamp interval (ms)",
     "metrics": "Enable metrics endpoint",
     "mlock": "Lock memory",
     "mmap": "Memory mapping",
@@ -800,6 +1064,7 @@ PARAM_LABELS_EN: dict[str, str] = {
     "verbosity": "Log level",
     "log_file": "Log file",
     "load_mode": "Model load mode",
+    "rpc": "RPC servers",
     "extra_args": "Extra CLI arguments",
     "ctx_checkpoints": "Context checkpoints",
     "checkpoint_min_step": "Checkpoint min spacing",
@@ -987,8 +1252,13 @@ PARAM_HELP_EN: dict[str, str] = {
         "LAN access (mind the security notes)."
     ),
     "port": (
-        "Server listen port. Default 8080; the launcher reports a conflict "
-        "if it is taken. Multi-instance launches auto-allocate ports."
+        "Server listen port. 0 = auto-allocate (searching upward from the "
+        "configured start port); multi-instance launches auto-allocate too, "
+        "and the launcher reports a conflict if a port is taken. The launcher "
+        "always passes --port explicitly (instance identity, health checks and "
+        "the embedded Chat page all read it), so upstream default changes do "
+        "not affect it -- llama.cpp v0.7.0 moved the upstream default from "
+        "8080 to 9931."
     ),
     "api_key": (
         "API access key. When set, requests must carry it in the "
@@ -999,6 +1269,28 @@ PARAM_HELP_EN: dict[str, str] = {
         "llama-server; point it at a custom frontend if needed."
     ),
     "embeddings": "Enable the /v1/embeddings endpoint for embedding models.",
+    "rerank": "Enable the /rerank endpoint (for reranker models or RAG retrieval pipelines).",
+    "pooling": "Pooling type for embeddings. Empty = the model's own default (right for most models; the flag is then omitted). Retrieval-style RAG usually wants mean or cls; reranker models want rank.",
+    "embd_normalize": "Normalization applied to embeddings: -1 = none, 0 = quantize to int16 by max absolute value, 1 = taxicab (L1), 2 = euclidean (L2, upstream default), >2 = p-norm. Use 2 for cosine-similarity retrieval, 0 to save bandwidth.",
+    "cache_prompt": "Cache processed prompt prefixes. RAG repeats the same system prompt and retrieved chunks every turn, so keeping this on avoids a lot of recomputation; turning it off saves some memory and disables cache reuse (--cache-reuse).",
+    "models_dir": "Router mode from llama.cpp v0.7.0: point at a directory of GGUF files and llama-server switches between them per request; its built-in WebUI then also shows a model manager (table, search, filters, favourites, downloads). Empty = single-model mode using the model file above.",
+    "models_max": "Maximum number of models kept loaded at once in router mode; 0 = unlimited. On small GPUs (8 GB class) use 1-2; models beyond VRAM are swapped out and reloaded on demand.",
+    "agent": "Enable the CORS proxy and all built-in tools (read_file / grep_search / exec_shell_command, ...). Experimental; trusted environments only. CORS origins are pinned to localhost for safety.",
+    "tools": "Comma-separated built-in tools: read_file, file_glob_search, grep_search, exec_shell_command, write_file, edit_file, get_info; use 'all' for everything. Experimental; trusted environments only.",
+    "tools_runtime": "Run built-in tools in an isolated environment: docker:<image> / podman:<image> (cleaned up on exit) or ssh:<target> (remote POSIX host, key auth). Empty = host environment.",
+    "ui_mcp_proxy": "Let the WebUI reach external MCP servers through the CORS proxy (experimental; do not enable in untrusted environments). Configure servers in the Chat page's MCP Servers panel.",
+    "mcp_servers_config": "Path to a Cursor-compatible JSON file with MCP server definitions; CORS origins are pinned to localhost for safety. Mutually exclusive with the inline-JSON field below.",
+    "mcp_servers_json": "Inline Cursor-compatible JSON with MCP server definitions, as an alternative to the config path above; CORS origins are pinned to localhost for safety.",
+    "cpu_moe": "Keep all MoE expert weights on the CPU (VRAM fallback for large MoE models). To offload only the first N layers use the MoE-layers-on-CPU option instead.",
+    "n_cpu_moe": "Keep the MoE expert weights of the first N layers on the CPU. 0 = disabled.",
+    "n_cpu_ffn": "Keep the dense FFN weights of the first N layers on the CPU (dense models; MoE models use the MoE option above). 0 = disabled.",
+    "moe_cache_mib": "GPU cache size in MiB for MoE experts kept on the CPU; split among GPUs like the layers. 0 = disabled.",
+    "spec_draft_n_ubatch": "Physical maximum batch size of the draft context; a smaller value spares VRAM (0 = same as --n-ubatch).",
+    "spec_draft_sampling": "How the draft is sampled: greedy takes its argmax; probabilistic samples and lets the target verify by rejection sampling (more correct distribution, slightly slower).",
+    "lazy_mode": "On-demand reading of certain tensors (e.g. per-layer embeddings): on = read rows from disk on demand (requires mmap); auto = only for tensors larger than 4 GiB; off = keep them resident.",
+    "video_fps": "Target video frame rate for video input (default 4). Higher rates cost context and compute.",
+    "video_ffmpeg_dir": "Directory containing ffmpeg and ffprobe; empty = search PATH.",
+    "video_timestamp_interval": "Interval in milliseconds between text timestamps of video transcripts (default 5000).",
     "metrics": "Enable the Prometheus /metrics endpoint for monitoring.",
     "mlock": (
         "Lock the model in RAM to prevent swapping to disk. Loading is "
@@ -1037,10 +1329,36 @@ PARAM_HELP_EN: dict[str, str] = {
         "affects models with a thinking mode; 'default' leaves the template alone. "
         "Lower it when you want faster answers."
     ),
+    "reasoning": (
+        "Whether the model emits its thinking process first. Set it to 'off' when "
+        "a reply comes back empty or the model only thinks without answering: the "
+        "thinking section consumes the max-predicted-tokens budget, so a short "
+        "answer can be eaten entirely by thinking. 'auto' (upstream default) lets "
+        "the chat template decide and the flag is then omitted."
+    ),
+    "reasoning_format": (
+        "How thinking content is returned by the API: 'deepseek' puts it in "
+        "reasoning_content so a client can fold it away; 'none' leaves the tags "
+        "unparsed inside content; 'deepseek-legacy' keeps <think> tags in content "
+        "while also populating reasoning_content."
+    ),
+    "chat_template_kwargs": (
+        "JSON object string passed through to the chat template, e.g. "
+        "{\"enable_thinking\": false} (Qwen3-style models use it to disable "
+        "thinking at the template level, which is more thorough than "
+        "--reasoning off: the template never emits a thinking section). "
+        "Must be a valid JSON object; empty = the flag is omitted."
+    ),
     "load_mode": (
         "How the model is loaded. Newer llama.cpp merged the old --mmap / --mlock "
         "flags into this one: mmap = memory-map (fast load, lower footprint), "
         "mlock = keep the model in RAM (no swapping), mmap+mlock = both, dio = DirectIO."
+    ),
+    "rpc": (
+        "Comma-separated list of RPC servers (host:port) running llama-rpc-server, "
+        "which take over part of the tensor computation. v0.7.0 speaks RPC protocol "
+        "v8 and supports tensor parallelism; both ends must be built from the same "
+        "version or they will not connect. Empty = no RPC."
     ),
     "ctx_checkpoints": (
         "Max context checkpoints kept per slot. Checkpoints make it cheap to jump "
@@ -1051,7 +1369,8 @@ PARAM_HELP_EN: dict[str, str] = {
         "Smaller spacing = finer checkpoints, at the cost of more memory."
     ),
     "cache_ram": (
-        "Upper bound for the cache in MiB. -1 = unlimited, 0 = caching disabled. "
+        "Upper bound for the cache in MiB. -1 = unlimited, 0 = caching "
+        "disabled (llama.cpp v0.7.0 recommends 0 for decision/scoring models). "
         "Lower it on machines with tight RAM."
     ),
     "cache_reuse": (
@@ -1108,6 +1427,25 @@ OPTION_LABELS_EN: dict[str, dict] = {
         "ngram-cache": "ngram-cache (persistent n-gram cache, no draft model)",
     },
     "rope_scaling": {"none": "No scaling", "linear": "Linear", "yarn": "YaRN (better)"},
+    "reasoning": {
+        "auto": "auto (chat template decides)",
+        "on": "on (force thinking)",
+        "off": "off (no thinking)",
+    },
+    "reasoning_format": {
+        "auto": "auto",
+        "none": "none (leave tags in content)",
+        "deepseek": "deepseek (into reasoning_content)",
+        "deepseek-legacy": "deepseek-legacy (keep <think> tags in content)",
+    },
+    "pooling": {
+        "": "(follow the model default)",
+        "none": "none (per-token vectors)",
+        "mean": "mean pooling",
+        "cls": "cls (classification token)",
+        "last": "last (final token)",
+        "rank": "rank (reranking score)",
+    },
     "reasoning_effort": {
         "default": "default (template default)",
         "minimal": "minimal",
@@ -1143,6 +1481,7 @@ GROUP_LABELS_EN: dict[str, str] = {
     "sampling": "Sampling",
     "server": "Server & Network",
     "advanced": "Advanced",
+    "agent": "AI Tools & MCP",
 }
 
 
@@ -1156,6 +1495,7 @@ GROUP_INFO: dict[ParamGroup, dict] = {
     ParamGroup.SAMPLING: {"label": "采样参数", "default_open": False, "order": 5},
     ParamGroup.SERVER: {"label": "服务器与网络", "default_open": True, "order": 6},
     ParamGroup.ADVANCED: {"label": "高级", "default_open": False, "order": 7},
+    ParamGroup.AGENT: {"label": "AI 工具与 MCP", "default_open": False, "order": 8},
 }
 
 

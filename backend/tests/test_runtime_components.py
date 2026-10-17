@@ -14,6 +14,22 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 
+def _free_port() -> int:
+    """Pick a loopback port that is free right now.
+
+    These tests used to hardcode 18080. That collides with a real launcher
+    listening on 18080 (for example a developer running the fresh-environment
+    check), turning ``_is_port_in_use`` into a false positive and the suite red
+    for an unrelated reason. The assertion surface is unchanged — only the
+    number is now chosen at runtime.
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
 def test_process_manager_launch_log_subscribe_stop_and_remove(monkeypatch, tmp_path):
     import core.process_manager as process_manager
     from core.process_manager import InstanceStatus, ProcessManager
@@ -54,21 +70,22 @@ def test_process_manager_launch_log_subscribe_stop_and_remove(monkeypatch, tmp_p
         def wait(self, timeout=None):
             return self.returncode
 
+    port = _free_port()
     monkeypatch.setattr(process_manager.subprocess, "Popen", Process)
     monkeypatch.setattr(
         process_manager,
         "get_config",
         lambda: {
             "llama_server_path": str(executable),
-            "instance_port_start": 18080,
-            "instance_port_end": 18090,
+            "instance_port_start": port,
+            "instance_port_end": port,
         },
     )
     monkeypatch.setattr(ProcessManager, "_monitor_instance", lambda self, instance: None)
 
     manager = ProcessManager()
     instance = manager.start_instance(
-        {"model": str(model), "port": 18080, "ctx_size": 2048}, name="test"
+        {"model": str(model), "port": port, "ctx_size": 2048}, name="test"
     )
     assert instance.status == InstanceStatus.STARTING
     assert instance.pid == 12345
@@ -95,6 +112,68 @@ def test_process_manager_launch_log_subscribe_stop_and_remove(monkeypatch, tmp_p
     assert instance.process is None
     assert manager.remove_instance(instance.id) is True
     assert manager.remove_instance("missing") is False
+
+
+def test_stop_keeps_the_exit_code_when_the_monitor_finalizes_first(monkeypatch):
+    """stop 必须在终止**之前**快照进程句柄。
+
+    监控线程看到停止事件后可能先一步 wait 并把 ``instance.process`` 置 None。
+    stop 若在 taskkill 之后才读句柄，就只看到 None，退出码永久丢失 ——
+    实测 e2e 在负载下偶发 ``stopped code=None``（test_launch_probe_stop_full_chain）。
+    """
+    import subprocess
+
+    from core.process_manager import Instance, InstanceStatus, ProcessManager
+
+    class Process:
+        pid = 4321
+        returncode = None
+
+        def __init__(self):
+            self.waits = 0
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.waits == 1:
+                # 第一次（监控线程 finalize）超时：句柄随即被清空，退出码没拿到
+                raise subprocess.TimeoutExpired(cmd="llama-server", timeout=timeout or 0)
+            self.returncode = 0
+            return 0
+
+        def terminate(self):
+            self.returncode = 0
+
+        def kill(self):
+            self.returncode = -9
+
+    manager = ProcessManager()
+    instance = Instance(
+        id="stop-race",
+        name="race",
+        preset_id=None,
+        preset_name=None,
+        params={},
+        argv=[],
+        command_string="",
+    )
+    instance.process = Process()
+    manager._instances[instance.id] = instance
+
+    def terminate_then_finalize(item, force):
+        # 模拟监控线程抢先 finalize：wait 超时、没拿到退出码，却清空了句柄
+        try:
+            item.process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        item.process = None
+
+    monkeypatch.setattr(manager, "_terminate_process_tree", terminate_then_finalize)
+    stopped = manager.stop_instance(instance.id)
+    assert stopped.status == InstanceStatus.STOPPED
+    assert stopped.exit_code == 0
 
 
 def test_process_monitor_reaches_running_then_detects_exit(monkeypatch):
@@ -288,14 +367,15 @@ def test_instance_lifecycle_is_written_to_the_log(monkeypatch, tmp_path, caplog)
         def wait(self, timeout=None):
             return self.returncode
 
+    port = _free_port()
     monkeypatch.setattr(process_manager.subprocess, "Popen", Process)
     monkeypatch.setattr(
         process_manager,
         "get_config",
         lambda: {
             "llama_server_path": str(executable),
-            "instance_port_start": 18080,
-            "instance_port_end": 18090,
+            "instance_port_start": port,
+            "instance_port_end": port,
         },
     )
     monkeypatch.setattr(ProcessManager, "_monitor_instance", lambda self, instance: None)
@@ -307,7 +387,7 @@ def test_instance_lifecycle_is_written_to_the_log(monkeypatch, tmp_path, caplog)
     manager = ProcessManager()
     with caplog.at_level(logging.INFO, logger="lunarshroud.backend.processes"):
         instance = manager.start_instance(
-            {"model": str(model), "port": 18080}, name="logged"
+            {"model": str(model), "port": port}, name="logged"
         )
         monkeypatch.setattr(
             manager,
@@ -320,7 +400,7 @@ def test_instance_lifecycle_is_written_to_the_log(monkeypatch, tmp_path, caplog)
 
     events = [record.message for record in caplog.records]
     joined = " | ".join(events)
-    assert "launching" in joined and "127.0.0.1:18080" in joined
+    assert "launching" in joined and f"127.0.0.1:{port}" in joined
     assert "pid=4242" in joined
     assert "stopping" in joined
     assert "stopped" in joined

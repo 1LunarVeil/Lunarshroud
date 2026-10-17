@@ -4,7 +4,8 @@
 文件隐身）、JSON 转义的用户目录路径。前一种早已由 test_release_mirror_gate.py
 覆盖，其余四种与新增的 fail-closed 行为、工作树侧扫描在这里钉死。
 
-本机标记一律用拼接构造：本文件自己也在镜像里，写成裸字面量会让门禁命中自身。
+本机标记不写死：门禁从环境变量推导，测试用中性 fixture 标记注入，
+这样公开仓库里既没有维护者的用户名/工作区名，测试也不依赖本机路径。
 """
 from __future__ import annotations
 
@@ -19,8 +20,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 import check_release_mirror as gate  # noqa: E402
 
 BS = chr(92)                       # 反斜杠，拼接用，避免源码里出现可匹配的形态
-_WORKDIR = "agent" + "_try"
+_WORKDIR = "fixture" + "_workspace"
 _USERPROFILE = "C:" + BS * 2 + "Users" + BS * 2 + "admin" + BS * 2 + "models"
+
+
+@pytest.fixture(autouse=True)
+def _privacy_marker(monkeypatch):
+    """把"本机工作区标记"注入门禁；公开源码里不出现真实工作区名。"""
+    monkeypatch.setenv("LUNARSHROUD_PRIVACY_WORKDIR", _WORKDIR)
 
 
 # ========== 编码绕过 ==========

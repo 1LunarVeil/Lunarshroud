@@ -1,12 +1,12 @@
 # Maintainer handover
 
-Last updated: 2026-09-19 (Asia/Shanghai)
+Last updated: 2026-10-17 (Asia/Shanghai)
 
 ## Read this first
 
 LunarShroud is a Windows desktop launcher for `llama-server.exe`: Tauri shell,
 FastAPI management backend, and static JavaScript frontend. The verified
-candidate is `0.9.0-beta.1`, still beta because real model/hardware soak
+candidate is `0.9.0-beta.2`, still beta because real model/hardware soak
 coverage is incomplete. [STATUS.md](STATUS.md) owns current facts and blockers;
 this file owns maintenance and recovery steps.
 

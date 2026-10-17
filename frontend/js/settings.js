@@ -358,7 +358,7 @@ async function openBrowse(key, type) {
   } catch (e) {
     console.error('open file dialog failed:', e);
     const errorMsg = e && e.message ? e.message : (e ? String(e) : t('params.unknownError'));
-    ctx.showToast(`${t('params.dialogFailed')}: ${ctx.escapeHtml(errorMsg)}`, 'error');
+    ctx.showToast(`${t('params.dialogFailed')}: ${errorMsg}`, 'error');
   }
 }
 

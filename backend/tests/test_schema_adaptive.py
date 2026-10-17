@@ -196,6 +196,95 @@ def test_new_params_stay_out_of_the_command_until_changed():
     assert _value_of(argv_changed, "-ctxcp") == "8"
 
 
+def test_v070_params_land_on_the_command_line():
+    """v0.7.0 对齐批次：嵌入/重排序、思考控制、路由多模型、RPC。
+
+    四件事一起钉住：设了值就落到 argv、默认值不产生噪音、旧构建上被丢弃且留痕、
+    上游在**参数位**声明的取值能进到 schema 输出（否则前端只能吃静态快照）。
+    下面的 --help 原文照抄本机 0.7.0-dev (build 11698) 的真实输出。
+    """
+    probe = full_probe(
+        "--pooling {none,mean,cls,last,rank}     pooling type for embeddings, use model default if unspecified",
+        "--embd-normalize N                      normalisation for embeddings (default: 2) (-1=none, 0=max absolute int16)",
+        "--cache-prompt, --no-cache-prompt       whether to enable prompt caching (default: enabled)",
+        "--models-dir PATH                       directory containing models for the router server (default: disabled)",
+        "--models-max N                          maximum number of models to load simultaneously (default: 4, 0 = unlimited)",
+        "-rea,  --reasoning [on|off|auto]        Use reasoning/thinking in the chat",
+        "--reasoning-format FORMAT               controls whether thought tags are allowed (default: auto)",
+        "--chat-template-kwargs STRING           sets additional params for the json template parser",
+        "--rpc SERVERS                           comma-separated list of RPC servers (host:port)",
+    )
+
+    # 1) 默认值一个都不落命令行（噪音即误导：命令预览里出现 --moe-cache-mib 0
+    #    这类东西，用户会以为自己配了什么）
+    argv = build_argv({**get_default_params(), "model": "D:/m.gguf"}, FAKE_EXE, probe=probe)
+    for flag in ("--pooling", "--embd-normalize", "--cache-prompt", "--no-cache-prompt",
+                 "--models-dir", "--models-max", "--reasoning", "--reasoning-format",
+                 "--chat-template-kwargs", "--rpc"):
+        assert flag not in argv, flag
+
+    # 2) 嵌入服务（RAG 的检索侧）
+    emb = {**get_default_params(), "model": "D:/m.gguf",
+           "embeddings": True, "pooling": "mean", "embd_normalize": 0}
+    argv_emb = build_argv(emb, FAKE_EXE, probe=probe)
+    assert "--embeddings" in argv_emb
+    assert _value_of(argv_emb, "--pooling") == "mean"
+    assert _value_of(argv_emb, "--embd-normalize") == "0"
+
+    # 3) 关掉提示词缓存要写出反向名（上游默认是 enabled，沉默等于关不掉）
+    assert "--no-cache-prompt" in build_argv(
+        {**get_default_params(), "model": "D:/m.gguf", "cache_prompt": False}, FAKE_EXE, probe=probe
+    )
+
+    # 4) 路由模式：models_max 只在给了目录时才活跃
+    router = {**get_default_params(), "model": "D:/m.gguf", "models_dir": "D:/models", "models_max": 2}
+    argv_router = build_argv(router, FAKE_EXE, probe=probe)
+    assert _value_of(argv_router, "--models-dir") == "D:/models"
+    assert _value_of(argv_router, "--models-max") == "2"
+    assert "--models-max" not in build_argv(
+        {**get_default_params(), "model": "D:/m.gguf", "models_max": 2}, FAKE_EXE, probe=probe
+    )
+
+    # 5) 思考控制：空回复的排查手段必须真的能下发
+    think = {**get_default_params(), "model": "D:/m.gguf", "reasoning": "off",
+             "reasoning_format": "deepseek", "chat_template_kwargs": '{"enable_thinking": false}'}
+    argv_think = build_argv(think, FAKE_EXE, probe=probe)
+    assert _value_of(argv_think, "--reasoning") == "off"
+    assert _value_of(argv_think, "--reasoning-format") == "deepseek"
+    assert _value_of(argv_think, "--chat-template-kwargs") == '{"enable_thinking": false}'
+
+    # 6) RPC
+    assert _value_of(
+        build_argv({**get_default_params(), "model": "D:/m.gguf", "rpc": "10.0.0.5:50052"},
+                   FAKE_EXE, probe=probe),
+        "--rpc",
+    ) == "10.0.0.5:50052"
+
+    # 7) 旧构建：全部丢弃且**留痕**（界面必须能提示，不能静默消失）
+    everything = {**get_default_params(), "model": "D:/m.gguf", "pooling": "mean",
+                  "embd_normalize": 0, "cache_prompt": False, "models_dir": "D:/models",
+                  "models_max": 2, "reasoning": "off", "reasoning_format": "deepseek",
+                  "chat_template_kwargs": "{}", "rpc": "10.0.0.5:50052"}
+    old_like = full_probe(drop=("--pooling", "--embd-normalize", "--cache-prompt",
+                                 "--models-dir", "--models-max", "--reasoning",
+                                 "--reasoning-format", "--chat-template-kwargs", "--rpc"))
+    argv_old = build_argv(everything, FAKE_EXE, probe=old_like)
+    for flag in ("--pooling", "--embd-normalize", "--no-cache-prompt", "--models-dir",
+                 "--models-max", "--reasoning", "--reasoning-format",
+                 "--chat-template-kwargs", "--rpc"):
+        assert flag not in argv_old, flag
+    assert set(suppressed_params(everything, FAKE_EXE, probe=old_like)) == {
+        "pooling", "embd_normalize", "cache_prompt", "models_dir", "models_max",
+        "reasoning", "reasoning_format", "chat_template_kwargs", "rpc",
+    }
+
+    # 8) 参数位声明的取值要能被看到（前端据此合并下拉框选项）
+    pooling_meta = next(m for m in PARAM_DEFINITIONS if m.key == "pooling")
+    reasoning_meta = next(m for m in PARAM_DEFINITIONS if m.key == "reasoning")
+    assert upstream_options_for(pooling_meta, probe) == ["none", "mean", "cls", "last", "rank"]
+    assert upstream_options_for(reasoning_meta, probe) == ["on", "off", "auto"]
+
+
 def test_switch_params_are_not_gated_by_the_default_comparison():
     """开关类参数走的是 switch 分支，不进 DefaultGate —— 别指望 skip 对它们生效。
 

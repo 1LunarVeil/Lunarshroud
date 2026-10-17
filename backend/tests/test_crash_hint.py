@@ -67,6 +67,55 @@ def test_no_fatal_line_returns_empty():
     assert last_fatal_log_line(inst) == ""
 
 
+# 实测原文（llama.cpp v0.7.0 / build 11698，嵌入模型 + -np 1 且未加 --embeddings）；
+# 路径部分按发布镜像的隐私门禁做了截断，断言匹配的是断言行本身。
+EMBEDDING_ASSERT = "llama-context.cpp:2384: GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max) failed"
+# 实测退出码：经启动器启动同一组合，abort 后报的是 0xC0000409
+EMBEDDING_ASSERT_EXIT = 3221226505
+
+
+def test_ggml_assert_line_is_recognized_and_comes_with_a_way_out():
+    """这条断言既不匹配 ``assertion`` 也不匹配 ``ggml_abort``。
+
+    结果是日志里明明写着死因、界面上却一个字都不显示；而它偏偏是**有确定规避
+    办法**的一类崩溃（经启动器实测：加 --embeddings、或把并行槽位设为 2，
+    两种都能正常启动并返回 768 维向量）。
+    """
+    inst = _instance(
+        params={"model": "D:/m/nomic-embed.gguf", "parallel": 1, "embeddings": False},
+        exit_code=EMBEDDING_ASSERT_EXIT,
+        error_message="process exited during startup (exit=3221226505)",
+        logs=deque([
+            LogEntry(timestamp=1.0, source="stderr",
+                     line="init: embeddings required but some input tokens were not marked as outputs -> overriding"),
+            LogEntry(timestamp=2.0, source="stderr", line=EMBEDDING_ASSERT),
+        ]),
+    )
+    assert "GGML_ASSERT" in last_fatal_log_line(inst)
+
+    append_crash_detail(inst)
+    assert "GGML_ASSERT" in inst.error_message
+    assert "启用嵌入端点" in inst.error_message
+    assert "并行槽位" in inst.error_message
+    # 已有具体死因 → 只补异常名，不再追加草稿模型 / mmproj 那套猜测
+    assert "STACK_BUFFER_OVERRUN" in inst.error_message
+    assert "草稿" not in inst.error_message
+
+
+def test_unrecognized_assert_gets_no_invented_advice():
+    """看不懂的断言不许编造规避办法 —— 宁可少说，也不能把人带错方向。"""
+    inst = _instance(
+        exit_code=EMBEDDING_ASSERT_EXIT,
+        error_message="process exited unexpectedly (exit=3221226505)",
+        logs=deque([
+            LogEntry(timestamp=1.0, source="stderr", line="llama-batch.cpp:88: GGML_ASSERT(something_else) failed"),
+        ]),
+    )
+    append_crash_detail(inst)
+    assert "GGML_ASSERT(something_else)" in inst.error_message
+    assert "启用嵌入端点" not in inst.error_message
+
+
 def test_concrete_cause_suppresses_the_speculative_blame():
     """已有具体死因时不要再提 mmproj / 草稿词表 —— 那次崩溃真是显存不够，
     而 mmproj 恰好挂着，提它就是把人往错方向带。"""

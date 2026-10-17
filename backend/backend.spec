@@ -1,11 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
 #
-# LunarShroud backend PyInstaller spec
-# 将 Python FastAPI 后端打包为独立 backend.exe
+# LunarShroud backend PyInstaller spec（onedir）
 #
-# 使用方式：
+# 使用方式（在 backend/ 目录）：
 #   pyinstaller backend.spec
-#   输出在 backend/dist/backend.exe
+#   输出：backend/dist/backend/backend.exe + backend/dist/backend/_internal/
+#
+# 为什么是 onedir 而不是 onefile：
+#   onefile 每次启动都要把 ~20 MB 运行时解压到临时目录。用户机器上
+#   %TEMP% 被重定向/只读/清理策略拦截、或安全软件扫描解压过程时，
+#   bootloader 只会弹 "Could not create temporary directory!"，启动器拿不到
+#   可读的原因；强杀时解压目录还会残留在用户 Temp 里（实测堆积过 2.2 GB）。
+#   onedir 直接把运行时放在安装目录，启动不做解压，既没有这个失败面，也更快。
+#   部署脚本/安装包必须把 backend.exe 和 _internal 一起复制，见
+#   tools/Publish-PortableRuntime.ps1 与 src-tauri/build.rs。
 
 from PyInstaller.utils.hooks import collect_submodules
 
@@ -66,10 +74,8 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='backend',
     debug=False,
     bootloader_ignore_signals=False,
@@ -79,10 +85,22 @@ exe = EXE(
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,       # 无控制台窗口（后台服务）
-    disable_windowed_traceback=False,
+    # 窗口化进程抛异常时不要弹模态对话框拖住 sidecar；崩溃详情由后端
+    # rotating log（backend.log）与崩溃翻译承接（审计 W4 / F23）。
+    disable_windowed_traceback=True,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
     icon=None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='backend',
 )

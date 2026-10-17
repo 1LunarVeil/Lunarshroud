@@ -7,6 +7,7 @@
 import { tauriInvoke } from './api.js?v=1';
 import { isParamEnabled, shouldAutoAssignPort, mergeUpstreamOptions } from './runtime.mjs';
 import { t, localizeBackendError } from './i18n.mjs';
+import { confirmLaunch } from './preflight.mjs';
 
 export const id = 'param_editor';
 export const title = '参数编辑器';
@@ -20,6 +21,7 @@ let currentValues = {};   // 当前参数值（唯一状态源：切分组重渲
 let schemaMap = {};      // key -> param def
 let groups = [];
 let presetCache = [];
+let recipes = [];         // 用途配方（后端按本机构建标注 unsupported）
 let locale = 'zh-CN';
 // 从模型库/顶栏选择器跳过来的目标模型；schema 未就绪时先存着，加载完成后再应用
 let pendingModelPath = null;
@@ -48,6 +50,8 @@ export function open(appCtx) {
   wrap.innerHTML = `
     <!-- 能力条：由 refreshModelCard() 按当前 model 填充，只读展示 + 一键应用推荐 -->
     <div class="pe-caps" id="model-caps-card"></div>
+    <!-- 用途配方：一键把面板切到某个用途（对话/嵌入/重排/只读工具/Agent） -->
+    <div class="pe-recipes" id="pe-recipes" hidden></div>
     <div class="pe-main">
       <nav class="pe-nav panel-nav" id="pe-nav"></nav>
       <div class="pe-pane" id="param-groups"></div>
@@ -94,6 +98,7 @@ export function open(appCtx) {
   `;
 
   bindEvents();
+  loadRecipes();
   // Ctrl+Enter 绑在浮层上（随浮层销毁自动解绑）；焦点放进浮层，键盘事件才能冒泡上来
   wrap.tabIndex = -1;
   wrap.focus({ preventScroll: true });
@@ -583,6 +588,8 @@ async function refreshModelCard() {
 
   if (caps && caps.probed) {
     lastCardPath = path;
+    // 上限防止长会话无界增长（审计 R7）
+    if (capsCache.size >= 64) capsCache.clear();
     capsCache.set(path, caps);
     modelCaps = caps;
     nativeCtxLimit = caps.context_length || null;
@@ -794,6 +801,91 @@ function applyRecommended() {
 }
 
 /**
+ * 用途配方：一键把面板切到某个用途。
+ *
+ * 与"应用推荐"的分工：推荐是**按模型**给出调优值（ctx / 推测解码 / mmproj），
+ * 配方是**按用途**给出意图值（这是嵌入服务、那是 Agent 服务），不碰任何调优
+ * 数字。配方内容来自后端（`/api/params/recipes`），并按本机构建标注了
+ * `unsupported` —— 界面置灰与命令行丢弃用的是同一条判定。
+ */
+async function loadRecipes() {
+  if (recipes.length) {
+    renderRecipes();
+    return;
+  }
+  try {
+    const payload = await ctx.Api.getParamRecipes();
+    recipes = (payload && payload.recipes) || [];
+  } catch {
+    // 配方是便利功能，拉不到就不显示这一行，绝不挡住调参
+    recipes = [];
+  }
+  renderRecipes();
+}
+
+function renderRecipes() {
+  const slot = root && root.querySelector('#pe-recipes');
+  if (!slot) return;
+  if (!recipes.length) {
+    slot.hidden = true;
+    slot.innerHTML = '';
+    return;
+  }
+  const buttons = recipes
+    .map((r) => {
+      const label = locale === 'en-US' && r.label_en ? r.label_en : r.label;
+      const hint = locale === 'en-US' && r.hint_en ? r.hint_en : r.hint;
+      const missing = (Array.isArray(r.unsupported) ? r.unsupported : []).map(
+        (key) => (schemaMap[key] ? paramLabel(schemaMap[key]) : key)
+      );
+      const title = missing.length
+        ? `${hint}\n${t('params.recipeUnsupported', { list: missing.join(', ') })}`
+        : hint;
+      return `<button type="button" class="pe-recipe" data-recipe="${ctx.escapeHtml(
+        r.id
+      )}" title="${ctx.escapeHtml(title)}"${missing.length ? ' disabled' : ''}>${ctx.escapeHtml(label)}</button>`;
+    })
+    .join('');
+  slot.hidden = false;
+  slot.innerHTML = `
+    <span class="pe-recipes-label" title="${ctx.escapeHtml(t('params.recipesHint'))}">${ctx.escapeHtml(t('params.recipesLabel'))}</span>
+    <div class="pe-recipes-list">${buttons}</div>
+  `;
+  slot.querySelectorAll('[data-recipe]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const recipe = recipes.find((r) => r.id === btn.dataset.recipe);
+      if (recipe) applyRecipe(recipe);
+    });
+  });
+}
+
+function applyRecipe(recipe) {
+  if (!schema) return;
+  const applied = [];
+  let firstGroup = null;
+  for (const [key, value] of Object.entries(recipe.values || {})) {
+    const def = schemaMap[key];
+    // 后端已经过滤过未知键，这里再挡一道：界面渲染不出来的键不许写进 params，
+    // 否则会出现"值改了、面板上没有对应控件"的隐形状态。
+    if (!def) continue;
+    currentValues[key] = value;
+    applied.push(paramLabel(def));
+    if (!firstGroup) firstGroup = def.group;
+  }
+  const name = locale === 'en-US' && recipe.label_en ? recipe.label_en : recipe.label;
+  if (!applied.length) {
+    ctx.showToast(t('params.recipeNothing', { name }), 'info');
+    return;
+  }
+  refreshAllControls();
+  updateCommandPreview();
+  // 跳到第一个被改动的分组：点了按钮必须**看得见**发生了变化
+  if (firstGroup) switchGroup(firstGroup);
+  const sep = locale === 'en-US' ? ', ' : '、';
+  ctx.showToast(t('params.recipeApplied', { name, list: applied.join(sep) }), 'success');
+}
+
+/**
  * 把 ctx_size 的上限收紧到模型原生上限，并在控件下方给出内联提示。
  * 原生上限是"状态"不是"说明"：只在接近（≥90%）或超过时出现在控件下方，
  * 不进 ? 提示圈 —— 静态说明归 tooltip，动态状态保持内联。
@@ -835,6 +927,19 @@ function applyCtxLimit() {
 
 // 防抖更新命令预览（连续输入时合并请求）
 let _cmdTimer = null;
+
+// 编辑器是单实例浮层：closeModal() 会整体移除 DOM，但两个防抖计时器挂在
+// 模块作用域上 —— 不自清的话关窗后仍会触发一次请求（审计 R6）。
+document.addEventListener('modal-closed', () => {
+  if (_cardTimer) {
+    clearTimeout(_cardTimer);
+    _cardTimer = null;
+  }
+  if (_cmdTimer) {
+    clearTimeout(_cmdTimer);
+    _cmdTimer = null;
+  }
+});
 
 function scheduleCommandPreview() {
   if (_cmdTimer) clearTimeout(_cmdTimer);
@@ -928,7 +1033,7 @@ async function openNativeFileDialog(param, type) {
   } catch (e) {
     console.error('open file dialog failed:', e);
     const errorMsg = e && e.message ? e.message : (e ? String(e) : t('params.unknownError'));
-    ctx.showToast(`${t('params.dialogFailed')}: ${ctx.escapeHtml(errorMsg)}`, 'error');
+    ctx.showToast(`${t('params.dialogFailed')}: ${errorMsg}`, 'error');
   }
 }
 
@@ -1056,8 +1161,10 @@ async function doLaunch() {
   // 避免连续启动第二个实例时撞默认端口（与仪表盘启动弹窗的行为一致）
   if (shouldAutoAssignPort(params, defaults)) params.port = 0;
   const name = sheet.querySelector('#launch-name').value.trim();
+  const body = { params, name };
+  if (!(await confirmLaunch(ctx, body))) return;
   try {
-    const inst = await ctx.Api.createInstance({ params, name });
+    const inst = await ctx.Api.createInstance(body);
     ctx.showToast(t('dash.launched', { name: inst.name, port: inst.port }), 'success');
     closeInlineSheet();
     ctx.closeModal(); // 启动完成即收起编辑器（与旧行为一致：确认弹窗关闭）

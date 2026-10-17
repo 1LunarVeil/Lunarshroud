@@ -51,7 +51,13 @@ export function isLoopbackHost(host) {
   const value = String(host || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
   if (!value) return true;
   if (value === 'localhost' || value === '::1' || value === '0:0:0:0:0:0:0:1') return true;
-  return /^127\./.test(value);
+  // 必须是完整的 IPv4 字面量，且四个字节都合法、第一个字节是 127。
+  // 只做 /^127\./ 前缀判断会把 `127.0.0.1.evil.com` 也当成回环（虽然当前
+  // 后端会用 ipaddress 再校验一次，前端也不该自己造出这个歧义）。
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(value);
+  if (!match) return false;
+  const octets = match.slice(1).map((part) => Number(part));
+  return octets[0] === 127 && octets.every((octet) => octet <= 255);
 }
 
 export function normalizeHttpUrl(value) {

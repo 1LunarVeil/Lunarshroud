@@ -151,6 +151,61 @@ def test_budget_exceeded_keeps_keys_parsed_so_far(tmp_path):
 # ========== MTP / NextN 判定 ==========
 
 
+def test_embedding_model_detected_from_non_causal_attention_and_pooling(tmp_path):
+    """编码器信号来自元数据本身，而不是文件名。
+
+    实测 nomic-embed-text-v1.5：``attention.causal=False`` 且
+    ``pooling_type=1``。启动前提示依赖这两个信号来识别"嵌入模型没开
+    --embeddings / 单槽位"这一上游断言组合。
+    """
+    p = write_gguf(
+        tmp_path / "nomic.gguf",
+        kvs=[
+            kv_str("general.architecture", "nomic-bert"),
+            kv_str("general.name", "nomic-embed-text-v1.5"),
+            kv_bool("nomic-bert.attention.causal", False),
+            kv_u32("nomic-bert.pooling_type", 1),
+            kv_u32("nomic-bert.context_length", 2048),
+            kv_u32("nomic-bert.embedding_length", 768),
+            kv_u32("nomic-bert.block_count", 12),
+        ],
+    )
+    info = probe_gguf(p)
+    assert info["attention_causal"] is False
+    assert info["pooling_type"] == 1
+    assert info["is_encoder_model"] is True
+    assert info["is_embedding_model"] is True
+
+
+def test_causal_lm_without_pooling_is_not_an_embedding_model(tmp_path):
+    p = write_gguf(
+        tmp_path / "qwen.gguf",
+        kvs=[
+            kv_str("general.architecture", "qwen3"),
+            kv_bool("qwen3.attention.causal", True),
+            kv_u32("qwen3.context_length", 4096),
+        ],
+    )
+    info = probe_gguf(p)
+    assert info["attention_causal"] is True
+    assert info["is_encoder_model"] is False
+    assert info["is_embedding_model"] is False
+
+
+def test_mmproj_file_is_never_classified_as_embedding(tmp_path):
+    p = write_gguf(
+        tmp_path / "mmproj.gguf",
+        kvs=[
+            kv_str("general.architecture", "clip"),
+            kv_bool("clip.has_vision_encoder", True),
+            kv_bool("clip.attention.causal", False),
+        ],
+    )
+    info = probe_gguf(p)
+    assert info["is_mmproj"] is True
+    assert info["is_embedding_model"] is False
+
+
 def test_builtin_mtp_from_metadata(tmp_path):
     p = write_gguf(
         tmp_path / "m.gguf",
@@ -503,3 +558,28 @@ def test_hostile_gguf_cannot_500_the_capabilities_endpoint(tmp_path):
     payload = build_capabilities(model_path=str(bad), exe_path=None)
     assert payload["model"]["probed"] is True   # 头部合法，只是元数据被截断
     assert payload["model"]["truncated"] is True
+
+
+def test_find_companion_files_stops_consuming_the_directory_at_max_entries(tmp_path, monkeypatch):
+    """扫描必须在 max_entries 处停止消费目录迭代器（审计 R3）。
+
+    list(iterdir()) 会先物化全部条目再切片；本函数按模型逐个调用，
+    大目录下是 O(n²)。这里通过计数包装 Path.iterdir 的产出钉住"提前停止"。
+    """
+    consumed = {"count": 0}
+    real_iterdir = Path.iterdir
+
+    def counting_iterdir(self):
+        for child in real_iterdir(self):
+            consumed["count"] += 1
+            yield child
+
+    monkeypatch.setattr(Path, "iterdir", counting_iterdir)
+
+    for index in range(30):
+        (tmp_path / f"m-{index:02d}.gguf").write_bytes(b"x")
+
+    result = find_companion_files(tmp_path / "m-00.gguf", max_entries=3)
+
+    assert set(result) == {"mmproj", "mtp", "draft"}
+    assert consumed["count"] <= 5, f"把整个目录都消费了: {consumed['count']}"

@@ -51,6 +51,28 @@ test('localizeBackendError maps known backend messages and passes unknowns throu
     localizeBackendError('no available port in range 8080-8090'),
     'No free port within the configured range'
   );
+
+  // 全新安装的第一道墙：llama_server_path 默认是空的，后端这条英文必须被本地化，
+  // 否则中文用户在仪表盘上只会看到一整句英文。
+  const unconfigured =
+    'llama-server executable is not configured. Open Settings and set "llama-server path"';
+  setLocale('zh-CN');
+  const zh = localizeBackendError(unconfigured);
+  setLocale('en-US');
+  const en = localizeBackendError(unconfigured);
+  assert.notEqual(zh, unconfigured, 'zh-CN 未映射该后端消息');
+  assert.notEqual(en, unconfigured, 'en-US 未映射该后端消息');
+  assert.match(zh, /设置/);
+  assert.match(en, /Settings/);
+
+  // 上一进程遗留的历史记录：后端写入英文原因，界面必须本地化
+  const interrupted =
+    'previous launcher session ended while this instance was still running';
+  setLocale('zh-CN');
+  assert.match(localizeBackendError(interrupted), /已中断/);
+  setLocale('en-US');
+  assert.match(localizeBackendError(interrupted), /interrupted/i);
+
   // 未匹配的原样返回
   assert.equal(localizeBackendError('something unexpected'), 'something unexpected');
 });
@@ -89,4 +111,18 @@ test('shouldAutoAssignPort only treats the schema-default port as unspecified', 
   assert.equal(shouldAutoAssignPort({ port: 9000 }, { port: 8080 }), false);
   assert.equal(shouldAutoAssignPort({ port: '8080' }, { port: 8080 }), false); // 类型不同视为显式
   assert.equal(shouldAutoAssignPort({}, { port: 8080 }), true); // 未填 = 自动分配
+});
+
+test('locale values never contain angle brackets (they are injected as HTML)', () => {
+  // t() 的返回值在前端多处经 innerHTML 注入，locale 文件因此是"可信 HTML"。
+  // 这条门禁把"当前全部键都不含 < / >"这一已验证性质固化为回归 —— 需要尖括号
+  // 的文案必须先经过安全评审（或改走转义通道，见审计 §11 前端 i18n 条目）。
+  for (const [name, dict] of [['zh-CN', ZH_CN], ['en-US', EN_US]]) {
+    for (const [key, value] of Object.entries(dict)) {
+      assert.ok(
+        !/[<>]/.test(String(value)),
+        `${name}["${key}"] contains an angle bracket: ${value}`
+      );
+    }
+  }
 });

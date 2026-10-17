@@ -16,6 +16,8 @@ let c2d = null;       // Canvas 2D 上下文
 let watcher = null;
 let metrics = [];     // 数据点列表：{t, cpu, mem, gpuUtil}
 const MAX_HISTORY_SECONDS = 60;
+// 数据点条数硬上限：时间戳乱序会让时间裁剪失效，防无界增长（审计 R7）
+const MAX_METRIC_POINTS = 1200;
 let overviewTimer = null;  // 进程关联轮询
 let connToastShown = false; // 每次断线只提示一次
 
@@ -178,6 +180,10 @@ function pushMetric(msg) {
   // 清理过期数据
   const cutoff = ts - MAX_HISTORY_SECONDS;
   while (metrics.length > 0 && metrics[0].t < cutoff) metrics.shift();
+  // 乱序时间戳会让上面的裁剪失效（首元素不过期就整段保留），补一道条数上限
+  if (metrics.length > MAX_METRIC_POINTS) {
+    metrics.splice(0, metrics.length - MAX_METRIC_POINTS);
+  }
 }
 
 // ========== Canvas 绘图 ==========
@@ -334,9 +340,21 @@ async function refreshOverview() {
     const r = await ctx.Api.getSystemOverview();
     updateProcTable(r.gpu_processes || []);
   } catch (e) {
-    // 静默失败
+    // 失败不能无声：进程表会一直显示旧数据却毫无提示（审计 R6）。
     console.warn('[monitor] failed to load gpu processes', e);
+    markProcTableStale();
   }
+}
+
+function markProcTableStale() {
+  const wrap = root.querySelector('#proc-table-wrap');
+  if (!wrap || wrap.querySelector('.proc-stale-hint')) return;
+  const hint = document.createElement('div');
+  hint.className = 'proc-stale-hint text-muted';
+  hint.style.fontSize = '12px';
+  hint.style.marginBottom = '6px';
+  hint.textContent = t('monitor.procStale');
+  wrap.prepend(hint);
 }
 
 const refreshOverviewOnce = createSingleFlight(refreshOverview);

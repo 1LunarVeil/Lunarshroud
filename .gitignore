@@ -45,6 +45,12 @@ Thumbs.db
 *.dmg
 *.AppImage
 *.deb
+*.zip
+*.7z
+# Tauri build.rs 把 backend/dist/backend.exe 暂存到这里（bundle resource）
+src-tauri/backend/
+# PyInstaller onedir 运行时（部署时与 backend.exe 同目录，构建产物）
+backend/_internal/
 
 # Logs
 debug.log
@@ -77,6 +83,9 @@ config.local.json
 *.key
 *.pfx
 *.p12
+*.db
+*.sqlite
+*.sqlite3
 credentials*.json
 secrets*.json
 *.sqlite

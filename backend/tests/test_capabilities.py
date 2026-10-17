@@ -22,7 +22,7 @@ from core.capabilities import (  # noqa: E402
 from core.gguf_probe import clear_probe_cache  # noqa: E402
 from core.param_schema import PARAM_DEFINITIONS, SPEC_TYPE_CHOICES  # noqa: E402
 from core.server_probe import ServerProbe, build_probe_from_text  # noqa: E402
-from gguf_fixtures import kv_str, kv_u32, tensor, write_gguf  # noqa: E402
+from gguf_fixtures import kv_bool, kv_str, kv_u32, tensor, write_gguf  # noqa: E402
 
 
 def meta(**kwargs) -> SimpleNamespace:
@@ -93,6 +93,34 @@ def test_numeric_default_that_is_not_a_number_is_unknown():
     result = compare_param_default(meta(key="ctx_size", cli="-c", type="number", default=8192), probe)
     assert result["agrees"] is None
     assert "不是可比对的数字" in result["note"]
+
+
+def test_annotated_numeric_default_keeps_only_the_number():
+    """llama.cpp v0.7.0 的 ``--moe-cache-mib`` 写作 ``(default: 0, disabled)``：
+    逗号后那段是"0 表示禁用"的**注解**，不是取值列表的第二项。
+
+    当成列表会得到 ``0,disabled``，两头都吃亏：比对不出数字（界面报
+    "默认值不是可比对的数字"这个假警报），而 ``skip_when_default`` 也永远
+    省不掉这个 flag —— 命令行上于是常驻一条 ``--moe-cache-mib 0`` 噪音。
+    """
+    probe = probe_with("--moe-cache-mib N                        GPU cache size (default: 0, disabled)\n")
+    assert probe.default_of("--moe-cache-mib") == "0"
+    result = compare_param_default(
+        meta(key="moe_cache_mib", cli="--moe-cache-mib", type="number", default=0), probe
+    )
+    assert result["agrees"] is True
+
+
+def test_numeric_list_default_is_not_truncated():
+    """反向守门：逗号两边都是数字时它们是**取值列表**，一个都不能丢。"""
+    probe = probe_with("--rates P0,P1                            synthetic rates (default: 0.1,0.2,0.3)\n")
+    assert probe.default_of("--rates") == "0.1,0.2,0.3"
+
+
+def test_word_list_default_is_not_truncated():
+    """反向守门：首段不是数字时，后续的词仍是取值（``--spec-type`` 就是这种）。"""
+    probe = probe_with("--spec-type none,ngram-mod               spec types (default: ngram-mod,ngram-cache)\n")
+    assert probe.default_of("--spec-type") == "ngram-mod,ngram-cache"
 
 
 # ========== 哨兵值：空值 / 空列表与上游的 unused / none 等价 ==========
@@ -449,3 +477,32 @@ def test_suggestion_is_none_when_there_is_no_projector(tmp_path):
     clear_probe_cache()
     main = _named_main(tmp_path / "main.gguf", name="Qwen3.5-4B")
     assert model_capabilities(main)["suggested_mmproj"] is None
+
+
+def test_model_capabilities_exposes_encoder_and_embedding_flags(tmp_path):
+    """模型库详情页直接启动依赖这两个字段来决定是否补 --embeddings。
+
+    只把这些字段加在 model_summary（列表）而漏掉 model_capabilities（详情）
+    会让列表显示"嵌入模型"、点进去却按普通模型启动 —— 本轮实际踩过。
+    """
+    path = write_gguf(
+        tmp_path / "nomic.gguf",
+        kvs=[
+            kv_str("general.architecture", "nomic-bert"),
+            kv_bool("nomic-bert.attention.causal", False),
+            kv_u32("nomic-bert.pooling_type", 1),
+            kv_u32("nomic-bert.context_length", 2048),
+            kv_u32("nomic-bert.embedding_length", 768),
+            kv_u32("nomic-bert.block_count", 12),
+        ],
+    )
+    detail = model_capabilities(path)
+    assert detail["is_encoder_model"] is True
+    assert detail["is_embedding_model"] is True
+    assert detail["pooling_type"] == 1
+    assert detail["truncated"] is False
+
+    summary = model_summary(path)
+    assert summary["is_embedding_model"] is True
+    assert summary["is_encoder_model"] is True
+    assert summary["truncated"] is False

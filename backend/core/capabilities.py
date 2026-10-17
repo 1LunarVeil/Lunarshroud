@@ -255,6 +255,11 @@ def model_capabilities(
         # 主模型自带 MTP 头 → --spec-type draft-mtp 不需要 -md
         "provides_builtin_mtp": info["provides_builtin_mtp"],
         "has_vision_encoder": info["has_vision_encoder"],
+        # 编码器/嵌入/重排：直接启动时据此补上 embeddings/rerank 端点
+        "is_encoder_model": info["is_encoder_model"],
+        "is_embedding_model": info["is_embedding_model"],
+        "is_reranker_model": info["is_reranker_model"],
+        "pooling_type": info["pooling_type"],
         "truncated": info["truncated"],
         "stopped_early": info["stopped_early"],
         "companions": companions,
@@ -287,9 +292,16 @@ def model_summary(model_path: str | Path) -> dict[str, Any]:
         "file_type_name": info["file_type_name"],
         "provides_builtin_mtp": info["provides_builtin_mtp"],
         "has_nextn_weights": info["has_nextn_weights"],
+        "truncated": info["truncated"],
+        "stopped_early": info["stopped_early"],
         "is_assistant_model": info["is_assistant_model"],
         "has_vision_encoder": info["has_vision_encoder"],
         "is_mmproj": info["is_mmproj"],
+        # 编码器/嵌入/重排：模型库据此显示徽章并提示启动方式。
+        "is_encoder_model": info["is_encoder_model"],
+        "is_embedding_model": info["is_embedding_model"],
+        "is_reranker_model": info["is_reranker_model"],
+        "pooling_type": info["pooling_type"],
         "companion_counts": {kind: len(items) for kind, items in companions.items()},
     }
 

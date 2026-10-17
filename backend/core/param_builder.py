@@ -560,7 +560,33 @@ def _build_argv(params: dict[str, Any], llama_server_path: str, gate: DefaultGat
     return argv
 
 
-def validate_param_values(params: dict[str, Any]) -> None:
+def allowed_option_values(meta: ParamMeta, probe: ServerProbe | None = None) -> set[str]:
+    """select 的合法取值：schema 快照 ∪ **本机构建声明的取值**。
+
+    前端下拉框已经把上游取值并进选项（``mergeUpstreamOptions``，数据来自
+    ``upstream_options_for``），校验却只认 ``meta.options`` 的话，用户能在界面里
+    选到一个值、点启动才被 400 拒掉。上游才是新增取值的一方（实测 build 10960
+    的 ``--spec-type`` 多了 ``draft-dspark``），所以以本机构建为准。
+
+    放宽的方向是安全的：多接受的只有"这份构建自己声明的取值"，与
+    :meth:`DefaultGate.supported` 同一个信任源；探测不可用（或不完整）时退回
+    快照，绝不"猜着放行"。
+    """
+    allowed = {str(option) for option in (meta.options or [])}
+    if probe is None or not probe.complete or not meta.cli:
+        return allowed
+    info = probe.options.get(meta.cli)
+    if info is not None:
+        allowed.update(info.allowed_values)
+    if meta.multiple and meta.cli == "--spec-type" and probe.spec_types:
+        # 与 upstream_options_for 同一口径：取值写在参数位，且 none 不是可选项
+        allowed.update(v for v in probe.spec_types if v != "none")
+    return allowed
+
+
+def validate_param_values(
+    params: dict[str, Any], probe: ServerProbe | None = None
+) -> None:
     """按 schema 的 min/max/options 校验取值；不合法抛 ValueError。
 
     为什么必须在这里做：ParamMeta 声明了 min/max/options，但 _build_argv 只是
@@ -569,6 +595,11 @@ def validate_param_values(params: dict[str, Any]) -> None:
     用户拿到的是 llama-server 的莫名崩溃，而不是一条说明白哪儿错了的 400。
 
     错误信息用英文（与 _validate_start 一致，前端 localizeBackendError 会本地化）。
+
+    ``probe`` 用于 select 取值：给了就以本机构建声明的取值为准（见
+    :func:`allowed_option_values`），不给就只认 schema 快照。调用方应当传
+    ``probe_server_cached_only(path)`` —— 校验在命令预览路径上，**不许**因此
+    起子进程跑 ``--help``。
     """
     for meta in PARAM_DEFINITIONS:
         # extra_args 是唯一的"原样追加"特例，它有自己的引号校验，不走范围检查
@@ -612,7 +643,7 @@ def validate_param_values(params: dict[str, Any]) -> None:
                     raise ValueError(f"{meta.key} exceeds the maximum {meta.max}: {number}")
 
         if meta.options:
-            allowed = {str(option) for option in meta.options}
+            allowed = allowed_option_values(meta, probe)
             for item in values:
                 if str(item) not in allowed:
                     raise ValueError(

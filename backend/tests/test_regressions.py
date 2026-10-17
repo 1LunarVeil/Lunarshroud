@@ -36,6 +36,108 @@ def test_preset_ids_cannot_escape_preset_directory(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="preset ID"):
         preset_store.get_preset("../outside")
 
+
+def test_preset_ids_reject_escape_forms_beyond_dotdot(monkeypatch, tmp_path):
+    """预设 ID 是白名单正则校验的路径片段，把 Windows 特有与编码变体钉死。
+
+    §7 指出：此前只测过 `../` 一种形态。
+    """
+    from core import preset_store
+
+    monkeypatch.setattr(preset_store, "PRESETS_DIR", tmp_path / "presets")
+    for bad in (
+        "..\\outside",
+        "C:\\evil",
+        "c:/evil",
+        "\\\\host\\share",
+        "%2e%2e%2foutside",
+        "a..b",
+        "UPPER",
+        "a b",
+        "a\x00b",
+        "x" * 65,
+    ):
+        with pytest.raises(ValueError, match="preset ID"):
+            preset_store.get_preset(bad)
+
+
+def test_frontend_file_resolution_rejects_windows_style_escapes(monkeypatch, tmp_path):
+    """Windows 特有的逃逸形态：反斜杠、绝对路径、盘符相对、UNC。
+
+    断言的是**最终解析结果**：无论词法上怎么绕，resolve() 之后的路径必须仍在
+    前端根之内，否则为 None（§7 指出此前只测过 `../`）。
+    """
+    import main as backend_main
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "app.js").write_text("safe", encoding="utf-8")
+    outside = tmp_path / "private.txt"
+    outside.write_text("secret", encoding="utf-8")
+    monkeypatch.setattr(backend_main, "FRONTEND_DIR", frontend)
+
+    for payload in (
+        "..\\private.txt",
+        "..\\..\\private.txt",
+        str(outside),
+        "C:\\Windows\\win.ini",
+        "C:private.txt",
+        "\\\\localhost\\C$\\Windows\\win.ini",
+    ):
+        assert backend_main.resolve_frontend_file(payload) is None, repr(payload)
+
+    # 正向保护：合法文件仍然可达
+    assert backend_main.resolve_frontend_file("app.js") == (frontend / "app.js").resolve()
+
+
+def test_frontend_file_resolution_rejects_a_junction_escape(monkeypatch, tmp_path):
+    """junction 让"词法上不越界"的路径在解析之后落到根之外。"""
+    import subprocess
+
+    import main as backend_main
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    (outside_dir / "private.txt").write_text("secret", encoding="utf-8")
+
+    link = frontend / "portal"
+    created = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(outside_dir)],
+        capture_output=True,
+        text=True,
+    )
+    if created.returncode != 0:
+        pytest.skip(f"junction creation unavailable: {created.stderr.strip()}")
+
+    monkeypatch.setattr(backend_main, "FRONTEND_DIR", frontend)
+    assert backend_main.resolve_frontend_file("portal/private.txt") is None
+
+
+def test_nul_in_ui_path_is_a_400_not_a_500(monkeypatch, tmp_path):
+    """URL 里 %00 解码后的内嵌 NUL：契约是 400（畸形输入），不是 500。
+
+    Path.resolve() 对含 NUL 的路径抛 ValueError，由全局处理器翻译成 400
+    （main.py:369-371）。任何本地客户端都发得出这一个字节，而这条链路此前无
+    测试（§7 零覆盖失败模式）。只钉状态码与"不崩溃"，不吃异常回显文本。
+    """
+    import main as backend_main
+    from fastapi.testclient import TestClient
+
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "index.html").write_text("<!doctype html><html></html>", encoding="utf-8")
+    monkeypatch.setattr(backend_main, "FRONTEND_DIR", frontend)
+    monkeypatch.setattr(backend_main, "SESSION_TOKEN", "test-token")
+    monkeypatch.setattr(backend_main, "INSECURE_DEV_MODE", False)
+
+    client = TestClient(backend_main.app, raise_server_exceptions=False)
+    response = client.get("/a%00b", headers={"X-LunarShroud-Token": "test-token"})
+    assert response.status_code == 400
+    assert "Traceback" not in response.text
+
+
 def test_server_entrypoint_disables_uvicorn_color_detection_without_console(
     monkeypatch, tmp_path
 ):
@@ -313,6 +415,45 @@ def test_non_loopback_llama_server_requires_api_key(monkeypatch, tmp_path):
     ) == str(executable)
 
 
+def test_whitespace_or_empty_host_is_normalized_before_any_consumer(monkeypatch, tmp_path):
+    """能过校验的 host 写法必须与消费点看到的一致（审计 W5 的实测形态）。
+
+    `effective_host_and_key` 先 strip 再校验，而 `start_instance` 读 params 原样值：
+    `" 127.0.0.1 "` 校验通过但 socket.getaddrinfo 直接失败；空串走的是"默认回环"
+    分支，原样流向 bind 的语义不明。归一化写回后，预留键 / bind / 探测 URL
+    三者从同一份点分字符串出发。
+    """
+    from core.process_manager import ProcessManager
+
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"x")
+    exe = tmp_path / "llama-server.exe"
+    exe.write_bytes(b"x")
+
+    padded = {"model": str(model), "host": " 127.0.0.1 "}
+    ProcessManager()._validate_start(padded, str(exe))
+    assert padded["host"] == "127.0.0.1"
+
+    empty = {"model": str(model), "host": ""}
+    ProcessManager()._validate_start(empty, str(exe))
+    assert empty["host"] == "127.0.0.1"
+
+    # 非规范字符串与整数的结局：校验直接拒绝，到不了任何消费点
+    for bad in ("127.1", 2130706433):
+        with pytest.raises(ValueError, match="valid IPv4"):
+            ProcessManager()._validate_start(
+                {"model": str(model), "host": bad}, str(exe)
+            )
+
+    # 缺省不补写；规范写法原样保留
+    absent = {"model": str(model)}
+    ProcessManager()._validate_start(absent, str(exe))
+    assert "host" not in absent
+    canonical = {"model": str(model), "host": "0.0.0.0", "api_key": "k"}
+    ProcessManager()._validate_start(canonical, str(exe))
+    assert canonical["host"] == "0.0.0.0"
+
+
 def test_model_scan_honors_result_limit(tmp_path):
     """A large model tree must be bounded before it can monopolize the API."""
     from core.model_scanner import scan_models
@@ -352,6 +493,130 @@ def test_websocket_requires_trusted_origin_and_session_protocol(monkeypatch):
             }
         )
     ) == (False, False)
+
+
+def test_websocket_without_an_origin_still_requires_the_token(monkeypatch):
+    """无 Origin 的 WS 客户端跳过来源校验，但令牌门槛不能跟着一起消失。
+
+    这是刻意决定：浏览器发 WebSocket 必带 Origin，来源检查挡的是"恶意页面"；
+    无 Origin 的调用方只能是本机非浏览器程序，此时令牌就是唯一门槛（缺了它，
+    任何本机进程都能订阅实例快照与日志）。该分支此前既无测试也无文档（§7）。
+    """
+    import main as backend_main
+
+    class FakeWebSocket:
+        def __init__(self, headers):
+            self.headers = headers
+
+    monkeypatch.setattr(backend_main, "SESSION_TOKEN", "private-token")
+
+    accepted = backend_main.websocket_session_is_valid(
+        FakeWebSocket({"sec-websocket-protocol": "lunarshroud, private-token"})
+    )
+    assert accepted == (True, True)
+
+    rejected = backend_main.websocket_session_is_valid(
+        FakeWebSocket({"sec-websocket-protocol": "lunarshroud"})
+    )
+    assert rejected[0] is False
+
+
+class _FakeWS:
+    def __init__(self, headers):
+        self.headers = headers
+
+
+def test_ws_trust_follows_the_configured_port_not_the_default(monkeypatch):
+    """改过 `launcher_port` 的人必须还能用 WebSocket。
+
+    真机 A/B 实测：后端跑在 17996 时页面每个 `/ws/instances` 握手都被 403 拒掉、
+    前端 2 分钟内重连 14 次；换回默认的 17520 一次错误都没有 —— 因为
+    `TRUSTED_WEBVIEW_ORIGINS` 把默认端口写死了。HTTP 侧同源不受影响，所以界面
+    看着完全正常，只有实时推送是死的 —— 这类"半死不活"最难被测试发现。
+
+    断言必须走 `current_trusted_origins()` / `websocket_session_is_valid()` 这条
+    **真实调用链**：只测 `trusted_origins()` 纯函数的话，把端口写死在调用点上
+    照样能全绿（本条测试的第一版就是这么空转的，靠红-绿验证才发现）。
+    """
+    import main as backend_main
+
+    monkeypatch.setattr(backend_main, "SESSION_TOKEN", "private-token")
+    monkeypatch.setattr(backend_main, "get_config", lambda: {"launcher_port": 17996})
+    # 模拟"本进程就在 17996 上监听"（导入期常量）
+    monkeypatch.setattr(backend_main, "LISTENING_PORT", 17996)
+
+    origins = backend_main.current_trusted_origins()
+    assert "http://127.0.0.1:17996" in origins
+    assert "http://localhost:17996" in origins
+    assert "http://127.0.0.1:17520" not in origins
+
+    accept = backend_main.websocket_session_is_valid(
+        _FakeWS({"origin": "http://127.0.0.1:17996",
+                 "sec-websocket-protocol": "lunarshroud, private-token"})
+    )
+    assert accept[0] is True
+    reject = backend_main.websocket_session_is_valid(
+        _FakeWS({"origin": "http://127.0.0.1:17520",
+                 "sec-websocket-protocol": "lunarshroud, private-token"})
+    )
+    assert reject[0] is False
+
+
+def test_default_port_still_trusted(monkeypatch):
+    """出厂默认端口不能被派生逻辑弄丢（否则首启就连不上实时推送）。"""
+    import main as backend_main
+
+    monkeypatch.setattr(backend_main, "LISTENING_PORT", 17520)
+    monkeypatch.setattr(backend_main, "get_config", lambda: {"launcher_port": 17520})
+    origins = backend_main.current_trusted_origins()
+    assert "http://127.0.0.1:17520" in origins
+    assert "http://localhost:17520" in origins
+
+
+def test_ws_trust_covers_the_listening_port_until_restart(monkeypatch):
+    """保存新 launcher_port 后、重启前，旧监听端口的 WS 不能被 403。
+
+    配置立即改变，但 uvicorn 仍监听旧端口；页面也从旧端口加载。只按配置算
+    来源表会让实时推送立刻死掉，而 HTTP 同源完全正常 —— 正是 R9 那种"半死
+    不活"的形态。两个端口都必须在表里，直到重启完成迁移。
+    """
+    import main as backend_main
+
+    monkeypatch.setattr(backend_main, "LISTENING_PORT", 17520)
+    monkeypatch.setattr(backend_main, "get_config", lambda: {"launcher_port": 17996})
+    origins = backend_main.current_trusted_origins()
+    assert "http://127.0.0.1:17520" in origins, "旧监听端口被排除，实时推送会 403"
+    assert "http://127.0.0.1:17996" in origins, "新配置端口未被信任"
+
+
+def test_bad_port_value_falls_back_to_default(monkeypatch):
+    """配置里端口被写坏时不能抛异常，也不能让来源表变成空集。"""
+    import main as backend_main
+
+    monkeypatch.setattr(backend_main, "LISTENING_PORT", 17520)
+    for bad in (None, "", "abc", 0, 70000, 3.5):
+        monkeypatch.setattr(backend_main, "get_config", lambda v=bad: {"launcher_port": v})
+        origins = backend_main.current_trusted_origins()
+        assert "http://127.0.0.1:17520" in origins, bad
+
+
+def test_websocket_tauri_origins_survive_a_port_change():
+    """Tauri 的三个来源与端口无关，改端口不能把自己的外壳挡在门外。"""
+    import main as backend_main
+
+    for port in (17520, 17996):
+        origins = backend_main.trusted_origins(port)
+        assert {"http://tauri.localhost", "https://tauri.localhost", "tauri://localhost"} <= origins
+
+
+def test_cors_and_websocket_share_one_origin_list():
+    """两张名单必须是同一份数据 —— 只修 WebSocket 而漏掉 CORS 是同一个 Bug 的第二形态。"""
+    import main as backend_main
+
+    cors = [item for item in backend_main.app.user_middleware
+            if getattr(item.cls, "__name__", "") == "CORSMiddleware"]
+    assert cors, "CORS 中间件不见了"
+    assert set(cors[0].kwargs["allow_origins"]) == set(backend_main.TRUSTED_WEBVIEW_ORIGINS)
 
 
 def test_startup_timeout_waits_for_child_cleanup(monkeypatch):
@@ -574,6 +839,150 @@ def test_stop_releases_process_and_pipe_handles(monkeypatch):
     assert instance.process is None
 
 
+def test_failed_termination_keeps_the_live_handle_and_reserved_port(monkeypatch):
+    """所有终止手段都失败时，不能丢掉仍在运行的进程句柄。
+
+    旧实现把 status 置为 FAILED 后照样 ``_release_port`` 并 finalize
+    （``instance.process = None``）：孤儿进程继续占着端口/显存，而 API 再也
+    没有句柄可以再次 kill；端口还会被自动分配给下一个实例，导致它 bind 失败。
+    这里模拟 taskkill / psutil / terminate / kill 全部无效，钉住三件事：
+    句柄保留、端口预留保留、再次 stop 会真的重试而不是直接返回。
+    """
+    import subprocess as real_subprocess
+
+    from core.process_manager import Instance, InstanceStatus, ProcessManager
+
+    class StuckProcess:
+        pid = 5555
+        stdout = None
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            raise real_subprocess.TimeoutExpired("stuck", timeout)
+
+    process = StuckProcess()
+    instance = Instance(
+        id="stuck",
+        name="stuck",
+        preset_id=None,
+        preset_name=None,
+        params={},
+        argv=[],
+        command_string="",
+        status=InstanceStatus.RUNNING,
+        process=process,
+        pid=process.pid,
+        port=18081,
+        started_at=time.time(),
+    )
+    pm = ProcessManager()
+    pm._instances[instance.id] = instance
+    pm._reserved_ports.add(("127.0.0.1", instance.port))
+
+    attempts = []
+    monkeypatch.setattr(
+        pm, "_terminate_process_tree", lambda inst, force: attempts.append(force)
+    )
+
+    first = pm.stop_instance(instance.id)
+    assert first.status == InstanceStatus.FAILED
+    assert instance.process is process, "终止失败后不得丢掉仍然存活的句柄"
+    assert ("127.0.0.1", instance.port) in pm._reserved_ports, "进程未死，端口不得释放"
+
+    with pytest.raises(RuntimeError, match="live process"):
+        pm.remove_instance(instance.id)
+
+    # 再按一次 stop：必须重新尝试终止，而不是因为状态是 FAILED 就直接返回。
+    pm.stop_instance(instance.id)
+    assert len(attempts) >= 2, f"第二次 stop 没有重试终止：{attempts}"
+
+
+def test_frozen_data_dir_falls_back_when_appdata_is_unwritable(tmp_path, monkeypatch):
+    """打包后端不能因为 %APPDATA% 不可写就在 lifespan 里 exit 3。
+
+    启动器可能被沙箱/受限令牌拉起：APPDATA 指向文件、只读目录或已删除的路径。
+    旧实现直接用 `APPDATA/LunarShroud`，configure_file_logging 抛异常 → uvicorn
+    exit 3，界面上只有"后端启动失败"。这里钉住可写性探测与回退顺序。
+    """
+    from config import _frozen_data_dir
+
+    # 首选可写 APPDATA
+    roaming = tmp_path / "roaming"
+    monkeypatch.setenv("APPDATA", str(roaming))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    assert _frozen_data_dir() == roaming / "LunarShroud"
+
+    # APPDATA 是一个文件（mkdir 必然失败）→ 退到 LOCALAPPDATA
+    blocked = tmp_path / "appdata-file"
+    blocked.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setenv("APPDATA", str(blocked))
+    assert _frozen_data_dir() == tmp_path / "local" / "LunarShroud"
+
+    # 两者都不可用 → 退到 USERPROFILE
+    monkeypatch.setenv("LOCALAPPDATA", str(blocked))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    assert _frozen_data_dir() == tmp_path / "home" / "LunarShroud"
+
+
+def test_fallback_data_dir_seeds_config_once_without_overwriting(tmp_path):
+    """受限环境回退到另一目录时，用户配置/预设要复制过去，且只复制一次。
+
+    不复制的话，用户看到的是一个空白配置的"新应用"；每次都复制则会覆盖用户
+    在回退目录里做的修改。历史库刻意不复制（可能很大/被占用）。
+    """
+    from config import _seed_fallback_data_dir
+
+    preferred = tmp_path / "roaming" / "LunarShroud"
+    preferred.mkdir(parents=True)
+    (preferred / "config.json").write_text('{"theme": "dark"}', encoding="utf-8")
+    (preferred / "presets").mkdir()
+    (preferred / "presets" / "qwen.json").write_text('{"name": "qwen"}', encoding="utf-8")
+    (preferred / "history.db").write_bytes(b"do not copy")
+    chosen = tmp_path / "appdata" / "data"
+
+    _seed_fallback_data_dir(preferred, chosen)
+    assert (chosen / "config.json").read_text(encoding="utf-8") == '{"theme": "dark"}'
+    assert (chosen / "presets" / "qwen.json").read_text(encoding="utf-8") == '{"name": "qwen"}'
+    assert not (chosen / "history.db").exists()
+
+    # 第二次启动不得覆盖回退目录里的修改
+    (chosen / "config.json").write_text('{"theme": "light"}', encoding="utf-8")
+    _seed_fallback_data_dir(preferred, chosen)
+    assert (chosen / "config.json").read_text(encoding="utf-8") == '{"theme": "light"}'
+
+
+def test_port_reservation_conflicts_across_wildcard_and_loopback():
+    """预留键按 (host, port) 保存，但通配地址与具体地址必须互相冲突。
+
+    两个并发启动分别绑 ``0.0.0.0:P`` 与 ``127.0.0.1:P`` 时，只看完全相等的
+    键会把它们当成不同端口；在"预留完成、子进程尚未 bind"的窗口里，第二个
+    会被分配到同一个端口并在 bind 时失败。通配地址覆盖所有接口，因此只要
+    任一侧是 0.0.0.0 就必须视为冲突。
+    """
+    from core.process_manager import ProcessManager
+
+    manager = ProcessManager()
+    manager._reserved_ports.add(("0.0.0.0", 18200))
+    assert manager._port_is_reserved("127.0.0.1", 18200)
+    assert manager._is_port_in_use("127.0.0.1", 18200) is True
+    with pytest.raises(RuntimeError, match="no available port"):
+        manager.find_available_port("127.0.0.1", 18200, 18200)
+
+    manager = ProcessManager()
+    manager._reserved_ports.add(("127.0.0.1", 18201))
+    assert manager._port_is_reserved("0.0.0.0", 18201)
+    # 不同端口的回环预留互不影响
+    assert not manager._port_is_reserved("127.0.0.1", 18202)
+
+
 def test_concurrent_stop_requests_are_serialized(monkeypatch):
     """Double-clicking stop must issue only one process-tree termination."""
     from core.process_manager import Instance, InstanceStatus, ProcessManager
@@ -783,6 +1192,69 @@ def test_config_write_failure_preserves_the_previous_file(monkeypatch, tmp_path)
     assert json.loads(config_file.read_text(encoding="utf-8")) == original
 
 
+def test_concurrent_update_config_does_not_lose_updates(monkeypatch, tmp_path):
+    """并发调用 update_config 不能静默丢更新（审计 R4）。
+
+    修复前：两个线程各自 read-modify-write，后落盘者基于同一份旧快照，
+    把先落盘者的键覆盖回去。这里用 barrier 对齐起点 + 慢 save 放大窗口，
+    使丢更新在无锁版本下是确定性的（红-绿验证过）。
+    """
+    import config as backend_config
+
+    monkeypatch.setattr(backend_config, "_config", backend_config.DEFAULT_CONFIG.copy())
+
+    def slow_save(_cfg):
+        time.sleep(0.2)
+
+    monkeypatch.setattr(backend_config, "save_config", slow_save)
+
+    gate = threading.Barrier(2, timeout=5)
+    failures: list[BaseException] = []
+
+    def worker(key, value):
+        try:
+            gate.wait()
+            backend_config.update_config({key: value})
+        except BaseException as exc:  # pragma: no cover - 仅在失败时用于报错
+            failures.append(exc)
+
+    first = threading.Thread(target=worker, args=("launcher_port", 18000))
+    second = threading.Thread(target=worker, args=("theme", "light"))
+    first.start()
+    second.start()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert not failures, failures
+    final = backend_config.get_config()
+    assert final["launcher_port"] == 18000
+    assert final["theme"] == "light"
+
+
+def test_stale_atomic_tmp_files_are_swept_on_config_load(monkeypatch, tmp_path):
+    """中断遗留的 .tmp 写入件在配置加载时被清扫；新鲜的绝不误删（审计 R5）。"""
+    import config as backend_config
+
+    stale = tmp_path / ".config.json.old123.tmp"
+    stale.write_text("{}", encoding="utf-8")
+    old = time.time() - 3 * 3600
+    os.utime(stale, (old, old))
+    fresh = tmp_path / ".config.json.live456.tmp"
+    fresh.write_text("{}", encoding="utf-8")
+    unrelated = tmp_path / "notes.tmp"
+    unrelated.write_text("keep", encoding="utf-8")
+
+    monkeypatch.setattr(backend_config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(backend_config, "PRESETS_DIR", tmp_path / "presets")
+    monkeypatch.setattr(backend_config, "CONFIG_FILE", tmp_path / "config.json")
+
+    backend_config._load_config_from_file()
+
+    assert not stale.exists(), "过期孤儿 tmp 未被清理"
+    assert fresh.exists(), "新鲜 tmp 被误删（可能是别的进程正在写的）"
+    assert unrelated.exists(), "非原子写形态的 .tmp 被误删"
+
+
 def test_preset_write_failure_preserves_the_previous_file(monkeypatch, tmp_path):
     """Preset updates use the same atomic durability guarantee as settings."""
     import core.preset_store as preset_store
@@ -841,17 +1313,24 @@ def test_restart_does_not_launch_a_replacement_when_stop_failed(monkeypatch):
     pm._instances[instance.id] = instance
     launched = False
 
-    def failed_stop(*args, **kwargs):
-        raise RuntimeError("process still alive")
+    def failed_stop(inst, force):
+        """真实形状：杀不掉进程时 `_stop_instance_locked` 置 FAILED 并**正常返回**。
+
+        守护必须写在 restart 里 —— 旧版测试靠 monkeypatch 让 stop 抛异常，
+        那在真实代码里根本不会发生。
+        """
+        inst.status = InstanceStatus.FAILED
+        inst.error_message = "process termination failed; still running"
+        return inst
 
     def unexpected_start(*args, **kwargs):
         nonlocal launched
         launched = True
 
-    monkeypatch.setattr(pm, "stop_instance", failed_stop)
+    monkeypatch.setattr(pm, "_stop_instance_locked", failed_stop)
     monkeypatch.setattr(pm, "start_instance", unexpected_start)
 
-    with pytest.raises(RuntimeError, match="process still alive"):
+    with pytest.raises(RuntimeError, match="could not be stopped"):
         pm.restart_instance(instance.id)
 
     assert launched is False
@@ -1019,6 +1498,13 @@ def test_update_config_never_exposes_empty_singleton(monkeypatch, tmp_path):
             if missing:
                 observed_empty.append(",".join(missing))
                 return
+            # 采样器必须显式让出 GIL：四个全速自旋的读者会把写者按进亚毫秒
+            # 时间片 —— 实测 200 次更新从 0.34s 被拖到 109s，套件时长随之
+            # 出现 10 倍抖动（审计 §7）。1ms 采样对任何 ≥1ms 的暴露窗口仍是
+            # 必中；两行紧邻的微秒级窗口本来就无法被并发调度命中（GIL 下
+            # 写者不释放解释器，读者根本没有插入机会），钉住长窗口即可
+            # （例如 clear() 与 update() 之间插入了 I/O 的回归形态）。
+            time.sleep(0.001)
 
     threads = [threading.Thread(target=reader, daemon=True) for _ in range(4)]
     for t in threads:
@@ -1033,6 +1519,163 @@ def test_update_config_never_exposes_empty_singleton(monkeypatch, tmp_path):
 
     assert not observed_empty, f"并发读者看到了残缺配置: {observed_empty[:3]}"
     assert backend_config.get_config()["history_max_records"] == 299
+
+
+def test_restart_and_relaunch_wire_launch_history(monkeypatch):
+    """重启 / 历史重启必须写启动历史（独立审计 M1）。
+
+    两条端点此前都不传 on_launched：重启世代在历史页无迹可查，与页面承诺
+    "记录每次启动的参数快照与状态"不符。这里钉住接线本身：端点把
+    `_record_launch_history` 交给 pm，且该回调真的落到 history_store。
+    """
+    import main as backend_main
+    from core import history_store
+    from fastapi.testclient import TestClient
+
+    recorded = []
+
+    def fake_record_launch(**kwargs):
+        recorded.append(kwargs)
+        return 4242
+
+    monkeypatch.setattr(history_store, "record_launch", fake_record_launch)
+    monkeypatch.setattr(
+        history_store,
+        "get_history_params",
+        lambda record_id: {"model": "D:/m.gguf", "port": 8080},
+    )
+
+    class FakeInst:
+        id = "gen-2"
+        preset_id = "p1"
+        preset_name = "P"
+        params = {"model": "D:/m.gguf", "port": 8080}
+        command_string = "llama-server -m D:/m.gguf"
+        port = 8080
+
+        def to_dict(self):
+            return {"id": self.id}
+
+    seen_params = []
+
+    class FakePM:
+        def restart_instance(self, instance_id, on_launched=None):
+            # 真实 pm 在 start_instance 内部回调，这里模拟同一时序
+            inst = FakeInst()
+            if on_launched is not None:
+                on_launched(inst)
+            return inst
+
+        def start_instance(self, **kwargs):
+            seen_params.append(dict(kwargs.get("params") or {}))
+            inst = FakeInst()
+            callback = kwargs.get("on_launched")
+            if callback is not None:
+                callback(inst)
+            return inst
+
+    monkeypatch.setattr(backend_main, "get_process_manager", lambda: FakePM())
+    monkeypatch.setattr(backend_main, "SESSION_TOKEN", "test-token")
+    monkeypatch.setattr(backend_main, "INSECURE_DEV_MODE", False)
+
+    client = TestClient(backend_main.app)
+    headers = {"X-LunarShroud-Token": "test-token"}
+
+    restarted = client.post("/api/instances/gen-1/restart", headers=headers)
+    assert restarted.status_code == 200
+    assert len(recorded) == 1, "restart 未写启动历史（审计 M1）"
+    assert recorded[0]["instance_id"] == "gen-2"
+    assert recorded[0]["status"] == "starting"
+
+    relaunched = client.post("/api/history/7/relaunch", headers=headers)
+    assert relaunched.status_code == 200
+    assert len(recorded) == 2, "relaunch 未写启动历史（审计 M1）"
+    # relaunch 语义 = "照这份记录再起一个"：不沿用记录里的端口（独立复核 N2），
+    # 否则对仍在运行的世代点重启会撞 400「端口被占用」。
+    assert seen_params and "port" not in seen_params[0], (
+        f"relaunch 重放了记录端口: {seen_params}"
+    )
+
+
+def test_bom_prefixed_config_is_read_not_reset(monkeypatch, tmp_path):
+    """UTF-8 BOM 的 config.json（记事本 / Set-Content utf8 产物）必须能读，
+    而不是被当损坏整体重建默认值（独立审计 L2）。"""
+    import config as backend_config
+
+    config_file = tmp_path / "config.json"
+    payload = backend_config.DEFAULT_CONFIG.copy()
+    payload["llama_server_path"] = "D:/tools/llama-server.exe"
+    config_file.write_bytes(b"\xef\xbb\xbf" + json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr(backend_config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(backend_config, "PRESETS_DIR", tmp_path / "presets")
+    monkeypatch.setattr(backend_config, "CONFIG_FILE", config_file)
+
+    loaded = backend_config._load_config_from_file()
+
+    assert loaded["llama_server_path"] == "D:/tools/llama-server.exe"
+    assert not (tmp_path / "config.json.corrupt").exists(), "BOM 配置被误判为损坏"
+
+
+def test_instance_log_files_rotate_and_die_with_the_instance(monkeypatch, tmp_path):
+    """实例日志必须有大小上限且随实例删除清理（独立审计 L1）。"""
+    import core.process_manager as pm
+    from core.process_manager import Instance, InstanceStatus, LogEntry
+
+    monkeypatch.setattr(pm._config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(pm, "INSTANCE_LOG_MAX_BYTES", 400, raising=False)
+    manager = pm.ProcessManager()
+
+    inst = Instance(
+        id="logcap", name="n", preset_id=None, preset_name=None,
+        params={}, argv=[], command_string="",
+    )
+    inst._log_persist_enabled = True
+
+    for i in range(40):
+        manager._persist_log_line(
+            inst, LogEntry(timestamp=1.0 + i, source="stdout", line="x" * 30)
+        )
+
+    log_dir = tmp_path / "logs" / "instances"
+    assert (log_dir / "logcap.log.1").exists(), "超限后没有轮转出 .1 备份"
+    assert (log_dir / "logcap.log").stat().st_size < 400 + 128
+
+    inst.status = InstanceStatus.STOPPED
+    with manager._lock:
+        manager._instances[inst.id] = inst
+    assert manager.remove_instance(inst.id) is True
+    assert not (log_dir / "logcap.log").exists(), "删除实例后日志文件仍在"
+    assert not (log_dir / "logcap.log.1").exists()
+
+
+def test_pruning_terminal_instances_cleans_their_log_files(monkeypatch, tmp_path):
+    """终态剪枝掉的历史实例，其落盘日志一并清理（独立审计 L1）。"""
+    import core.process_manager as pm
+    from core.process_manager import Instance, InstanceStatus
+
+    monkeypatch.setattr(pm._config, "DATA_DIR", tmp_path)
+    manager = pm.ProcessManager()
+    manager._terminal_retention = 2
+
+    log_dir = tmp_path / "logs" / "instances"
+    log_dir.mkdir(parents=True)
+    for index in range(4):
+        inst = Instance(
+            id=f"prune-{index}", name="n", preset_id=None, preset_name=None,
+            params={}, argv=[], command_string="",
+        )
+        inst.status = InstanceStatus.STOPPED
+        inst.stopped_at = float(index)
+        manager._instances[inst.id] = inst
+        (log_dir / f"prune-{index}.log").write_text("x", encoding="utf-8")
+
+    manager._prune_terminal_instances()
+
+    assert not (log_dir / "prune-0.log").exists()
+    assert not (log_dir / "prune-1.log").exists()
+    assert (log_dir / "prune-2.log").exists()
+    assert (log_dir / "prune-3.log").exists()
 
 
 def test_command_string_is_single_line_and_shell_portable():
@@ -1065,8 +1708,9 @@ def test_health_probe_uses_loopback_for_wildcard_host(monkeypatch):
     class Response:
         status_code = 200
 
-    def fake_get(url, timeout=None):
+    def fake_get(url, timeout=None, **kwargs):
         captured["url"] = url
+        captured.update(kwargs)
         return Response()
 
     monkeypatch.setattr(process_manager.httpx, "get", fake_get)
@@ -1085,6 +1729,7 @@ def test_health_probe_uses_loopback_for_wildcard_host(monkeypatch):
 
     assert ProcessManager()._probe_health(instance) is True
     assert captured["url"] == "http://127.0.0.1:1234/health"
+    assert captured["trust_env"] is False
 
 
 def test_error_responses_carry_cors_headers(monkeypatch):
@@ -1127,14 +1772,20 @@ def test_error_responses_carry_cors_headers(monkeypatch):
 
 
 def test_readiness_probe_needs_no_token_and_never_sees_one(monkeypatch):
-    """/api/system/ready 用 session_id 认证，令牌不出现在探测链路上。
+    """/api/system/ready 以 nonce 的 HMAC 应答证明身份，令牌不出现在探测链路上。
 
     外壳必须在确认"对面是谁"之前不发任何秘密。曾经它带着令牌去探受保护的
     /api/system/health，于是任何占住该端口的本地进程都能收到令牌 —— Windows 的
-    回环端口不按用户隔离，实测任意进程都能 bind 127.0.0.1:17520。session_id 与
-    令牌同为每次启动新生成的 256 位随机值、只经环境传给自己拉起的子进程，所以
-    "能答对"就等价于"对端是我们的后端"，而它本身不是凭证。
+    回环端口不按用户隔离，实测任意进程都能 bind 127.0.0.1:17520。
+
+    随后的一版用 session_id 做"反向证明"：外壳把它写进请求 URL，后端回显即通过。
+    这是循环论证，收到请求的进程原样回显就能冒充后端。现在后端只回答
+    ``HMAC-SHA256(token, "lunarshroud-ready-v1:" + nonce)``：nonce 是外壳每次
+    新选的公开挑战，令牌与任何可重放形式都不上线。
     """
+    import hashlib
+    import hmac as hmac_module
+
     from fastapi.testclient import TestClient
 
     backend_dir = Path(__file__).resolve().parents[1]
@@ -1148,10 +1799,27 @@ def test_readiness_probe_needs_no_token_and_never_sees_one(monkeypatch):
     client = TestClient(backend_main.app)
 
     # 不带令牌也能通过 —— 这正是外壳需要的性质
-    ok = client.get("/api/system/ready", params={"session": "test-session"})
+    ok = client.get(
+        "/api/system/ready",
+        params={"session": "test-session", "nonce": "nonce-1"},
+    )
     assert ok.status_code == 200
     assert ok.json()["session_id"] == "test-session"
     assert "test-token" not in ok.text          # 响应里绝不能带出令牌
+
+    expected = hmac_module.new(
+        b"test-token", b"lunarshroud-ready-v1:nonce-1", hashlib.sha256
+    ).hexdigest()
+    assert ok.json()["proof"] == expected
+    other = client.get(
+        "/api/system/ready",
+        params={"session": "test-session", "nonce": "nonce-2"},
+    ).json()["proof"]
+    assert other and other != expected, "nonce 必须真正参与摘要"
+
+    # 不带 nonce / 后端无令牌时不给 proof：外壳据此拒绝把对端认成自己的后端。
+    no_nonce = client.get("/api/system/ready", params={"session": "test-session"})
+    assert no_nonce.status_code == 200 and no_nonce.json()["proof"] == ""
 
     # 答错 / 不答一律 404，且不透露"这个端口上到底有没有 LunarShroud"
     for bad in ("", "test-sessio", "TEST-SESSION", "test-session "):
@@ -1164,11 +1832,21 @@ def test_readiness_probe_needs_no_token_and_never_sees_one(monkeypatch):
         "/api/system/ready", params={"session": "x" * 200}
     ).status_code == 422
 
+    # 非 ASCII 的会话号不能让 compare_digest 抛 TypeError 变成 500：
+    # 未认证请求是可伪造的，任何字节都只能得到 404。请求头由 HTTP 客户端限
+    # 制为 ASCII，所以令牌侧直接测比较函数（它接受任意 UTF-8 字符串）。
+    assert client.get(
+        "/api/system/ready", params={"session": "会话号"}
+    ).status_code == 404
+    assert backend_main.session_token_is_valid("test-token", "令牌") is False
+    assert backend_main.session_token_is_valid("test-token", "test-token") is True
+
     # health 仍然受令牌保护（前端与其它调用方依赖它，不能顺手放开）
     assert client.get("/api/system/health").status_code == 401
     assert client.get(
         "/api/system/health", headers={"X-LunarShroud-Token": "test-token"}
     ).status_code == 200
+
 
 
 def test_readiness_probe_is_closed_when_there_is_no_session(monkeypatch):
@@ -1237,7 +1915,7 @@ def test_restart_and_relaunch_report_port_exhaustion_as_conflict(monkeypatch):
     import main as backend_main
 
     class ExhaustedProcessManager:
-        def restart_instance(self, instance_id):
+        def restart_instance(self, instance_id, on_launched=None):
             raise RuntimeError("no available port in range 8080-8090")
 
         def start_instance(self, **kwargs):
@@ -1452,6 +2130,44 @@ def test_validate_param_values_skips_sentinels_and_inactive():
     validate_param_values(params)
 
 
+def test_validate_param_values_accepts_values_the_local_build_declares():
+    """select 的合法取值必须以**本机这份构建**为准，不能只认 schema 快照。
+
+    前端的 select 会把上游声明的取值并进选项（``mergeUpstreamOptions``），
+    而校验只查 ``meta.options`` —— 结果是用户能在界面里选到一个值，点启动
+    却被 400 拒掉。llama.cpp 确实会新增取值（``--spec-type`` 在 build 10960
+    多了 ``draft-dspark``），所以这不是假想场景。
+
+    放宽的方向是安全的：接受的只多了"本机构建自己声明的取值"，与
+    ``DefaultGate.supported()`` 同一个信任源；两边都没有的取值照旧拒绝。
+    """
+    from core.param_builder import validate_param_values
+    from core.param_schema import get_default_params
+    from core.server_probe import MIN_COMPLETE_OPTIONS, build_probe_from_text
+
+    lines = [
+        f"--filler-{i} N                          filler (default: 0)"
+        for i in range(MIN_COMPLETE_OPTIONS + 5)
+    ]
+    lines.append("--pooling {none,mean,cls,last,rank,weighted}     pooling type for embeddings")
+    probe = build_probe_from_text("fake", "\n".join(lines) + "\n")
+    assert probe.complete
+
+    params = get_default_params()
+    params["pooling"] = "weighted"
+
+    # 没有探测依据 → 退回 schema 快照，仍然拒绝（不许"猜着放行"）
+    with pytest.raises(ValueError, match="pooling"):
+        validate_param_values(params)
+
+    validate_param_values(params, probe=probe)
+
+    # 两边都没有的取值：照旧拒绝
+    params["pooling"] = "banana"
+    with pytest.raises(ValueError, match="pooling"):
+        validate_param_values(params, probe=probe)
+
+
 def test_build_argv_still_emits_after_validation():
     """校验是新增的闸门，不能改变合法值的既有输出。"""
     from core.param_builder import build_argv, validate_param_values
@@ -1506,6 +2222,66 @@ def test_probe_health_records_what_it_saw():
     assert inst._probe_attempts == 1
     manager._probe_health(inst)
     assert inst._probe_attempts == 2
+
+
+def test_test_suite_never_uses_the_repository_data_directory():
+    """套件不得把生命周期写入落到用户真实 data/（conftest 的隔离兜底）。
+
+    进入 lifespan 的测试会初始化 history.db、清洗密钥，并把遗留 running 记录
+    收口成 interrupted。这些写入只能落在临时目录；否则一次 `pytest` 就会改写
+    开发者/用户的启动历史（2026-10-17 实测发生过）。
+    """
+    import config
+    from core import history_store
+
+    repo_data = (Path(__file__).resolve().parents[2] / "data").resolve()
+    assert Path(config.DATA_DIR).resolve() != repo_data
+    assert Path(config.PRESETS_DIR).resolve() != repo_data / "presets"
+    assert Path(config.HISTORY_DB).resolve().parent != repo_data
+    assert Path(history_store.HISTORY_DB).resolve().parent != repo_data
+
+
+def test_health_probe_never_uses_an_environment_proxy(monkeypatch):
+    """回环健康探测不得走 HTTP_PROXY/系统代理。
+
+    实测复现：HTTP_PROXY 指向一个没人监听的端口时，
+    ``httpx.get("http://127.0.0.1:<port>/health")`` 会抛 ConnectTimeout ——
+    而 llama-server 就在本机跑着。于是每个实例都报 "startup timed out"。
+    用户开着 Clash/V2Ray 但代理尚未启动时，这是必现的。
+    """
+    import http.server
+    import threading
+
+    from core.process_manager import get_process_manager
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - http.server API
+            body = b'{"status":"ok"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        # 死代理：任何走代理的请求都会连接超时
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy"):
+            monkeypatch.setenv(name, "http://127.0.0.1:1")
+        for name in ("NO_PROXY", "no_proxy"):
+            monkeypatch.delenv(name, raising=False)
+
+        instance = _probe_instance(port=server.server_address[1])
+        assert get_process_manager()._probe_health(instance) is True
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_describe_probe_failure_points_at_the_right_suspect():
@@ -1700,6 +2476,219 @@ def test_terminate_process_tree_invokes_taskkill_by_absolute_path(monkeypatch):
     assert calls[0][4] == "4242"
 
 
+def test_taskkill_failure_falls_back_to_direct_termination(monkeypatch):
+    """taskkill 调用失败（OSError/超时）时必须降级为直接终止，且进程真的死掉。
+
+    审计 §7 点名"taskkill 失败兜底"零覆盖：Windows 路径先走 System32 的
+    taskkill /F /T，一旦该调用抛 OSError（ACL 拦截）或超时，代码落到
+    Popen 的 kill()/terminate() —— 这条兜底断掉的话，停止实例会把进程留在原地。
+    这里用真子进程验证兜底真的把进程杀死了，而不是只断言"调过某个函数"。
+    """
+    import subprocess as real_subprocess
+
+    import core.process_manager as pm
+
+    calls = []
+
+    def failing_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        raise OSError("taskkill unavailable")
+
+    monkeypatch.setattr(pm.subprocess, "run", failing_run)
+
+    for force in (False, True):
+        child = real_subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            creationflags=getattr(real_subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        try:
+            instance = pm.Instance(
+                id="i", name="n", preset_id=None, preset_name=None,
+                params={}, argv=[], command_string="",
+            )
+            instance.process = child
+            calls.clear()
+
+            pm.ProcessManager()._terminate_process_tree(instance, force=force)
+
+            assert calls, "应当先尝试 taskkill"
+            child.wait(timeout=15)
+            assert child.poll() is not None, f"force={force}: taskkill 失败后进程没死"
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
+
+
+def test_taskkill_nonzero_exit_falls_back_and_kills_the_whole_tree(monkeypatch):
+    """taskkill 返回非 0（权限不足 / 被 AV/组策略拦截）不能被当成"已杀掉"。
+
+    2026-10-17 在受限环境复现：taskkill 以 rc=1 + "Access denied" 退出，
+    旧实现忽略返回码直接 return，停止流程于是：
+      1. 以为进程树已死，继续 stop 的收尾；
+      2. 子进程仍活着、stdout 管道没有任何人关闭；
+      3. ``_finalize_process_resources`` 去 close 管道时，与阻塞在读线程
+         内部的 IO 锁互等 —— 停止请求和监控线程一起永久挂死。
+
+    这条用例同时钉住两半：返回码非 0 必须走 psutil 树杀，且孙进程也要死。
+    """
+    import subprocess as real_subprocess
+
+    import core.process_manager as pm
+    import psutil
+
+    script = (
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "time.sleep(60)\n"
+    )
+    child = real_subprocess.Popen(
+        [sys.executable, "-c", script],
+        creationflags=getattr(real_subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    calls = []
+    grandchildren = []
+
+    def denied_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return real_subprocess.CompletedProcess(cmd, 1)
+
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline and not grandchildren:
+            grandchildren = psutil.Process(child.pid).children(recursive=True)
+            time.sleep(0.1)
+        assert grandchildren, "测试前置条件不成立：没有拉起孙进程"
+
+        monkeypatch.setattr(pm.subprocess, "run", denied_run)
+        instance = pm.Instance(
+            id="i", name="n", preset_id=None, preset_name=None,
+            params={}, argv=[], command_string="",
+        )
+        instance.process = child
+
+        pm.ProcessManager()._terminate_process_tree(instance, force=False)
+
+        assert calls, "应当先尝试 taskkill"
+        child.wait(timeout=15)
+        assert child.poll() is not None, "taskkill 拒绝后父进程没死"
+        _, alive = psutil.wait_procs(grandchildren, timeout=10)
+        assert not alive, f"taskkill 拒绝后仍残留孙进程：{[p.pid for p in alive]}"
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+        for proc in grandchildren:
+            try:
+                if proc.is_running():
+                    proc.kill()
+            except psutil.Error:
+                pass
+
+
+def test_finalize_never_closes_a_pipe_owned_by_the_reader_thread():
+    """终结路径不得从别的线程关闭 stdout —— 那会和阻塞读线程互等。
+
+    旧实现的 ``_finalize_process_resources`` 会 ``stream.close()``。读线程正
+    在 ``for line in stream`` 里握着 TextIOWrapper 的 IO 锁阻塞，close 便永远
+    等锁（实测把停止请求与监控线程同时挂死）。管道只能由读线程自己关闭。
+    """
+    import subprocess as real_subprocess
+
+    import core.process_manager as pm
+
+    child = real_subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=real_subprocess.PIPE,
+        stderr=real_subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        text=True,
+        creationflags=getattr(real_subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    instance = pm.Instance(
+        id="i", name="n", preset_id=None, preset_name=None,
+        params={}, argv=[], command_string="",
+    )
+    instance.process = child
+    reader = threading.Thread(target=pm.ProcessManager()._read_stdout, args=(instance,), daemon=True)
+    instance._stdout_thread = reader  # 真实启动路径在 _launch_process 里同样登记
+    reader.start()
+    try:
+        time.sleep(0.3)  # 让读线程真正进入阻塞读
+        finalizer = threading.Thread(
+            target=pm.ProcessManager()._finalize_process_resources,
+            args=(instance,),
+            daemon=True,
+        )
+        finalizer.start()
+        finalizer.join(timeout=8)
+        assert not finalizer.is_alive(), "finalize 在关闭被读线程持有的管道时死锁"
+        # 进程还活着时**必须保留句柄**：否则调用方再也无法终止它。
+        assert instance.process is child, "live child 的句柄不得被 finalize 丢弃"
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+        reader.join(timeout=5)
+
+    # 确认死亡后再 finalize 才会释放句柄（管道与日志句柄随之关闭）。
+    pm.ProcessManager()._finalize_process_resources(instance)
+    assert instance.process is None
+
+
+def test_oversized_single_log_line_is_truncated():
+    """一行几十 MB 的日志不能原样进环形缓冲、WebSocket 和 DOM。
+
+    行数上限管不住单行大小：被替换的/恶意的 llama-server 可以只写一行超长
+    内容。这里直接走读线程的实现，断言落进缓冲的那一行有硬上界并留下标记。
+    """
+    from collections import deque
+
+    import core.process_manager as pm
+
+    huge = "x" * (pm.MAX_LOG_LINE_CHARS * 4)
+
+    class FakeStdout:
+        def __init__(self):
+            self._lines = iter([huge + "\n"])
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self._lines)
+
+        def close(self):
+            pass
+
+    class FakeProcess:
+        pid = 4242
+        stdout = FakeStdout()
+
+        def poll(self):
+            return None
+
+    instance = pm.Instance(
+        id="long-line",
+        name="long-line",
+        preset_id=None,
+        preset_name=None,
+        params={},
+        argv=[],
+        command_string="",
+        logs=deque(maxlen=10),
+    )
+    instance._log_persist_enabled = False
+    instance.process = FakeProcess()
+
+    pm.ProcessManager()._read_stdout(instance)
+
+    assert len(instance.logs) == 1
+    stored = instance.logs[0].line
+    assert len(stored) <= pm.MAX_LOG_LINE_CHARS + 64, len(stored)
+    assert "截断" in stored
+
+
 def test_llama_server_popen_pins_cwd_and_strips_the_session_env(monkeypatch):
     """llama-server 子进程：CWD 钉在 exe 自己目录，且不继承会话令牌。
 
@@ -1744,8 +2733,13 @@ def test_llama_server_popen_pins_cwd_and_strips_the_session_env(monkeypatch):
     assert "LUNARSHROUD_SESSION_ID" not in kwargs["env"]
 
 
-def test_nvidia_smi_is_resolved_to_an_absolute_path(monkeypatch):
-    """GPU 兜底路径同样不得用裸名调用 nvidia-smi。"""
+def test_nvidia_smi_is_resolved_to_an_absolute_path_or_disabled(monkeypatch):
+    """GPU 兜底路径同样不得用裸名调用 nvidia-smi。
+
+    裸名会走 CreateProcess 搜索序，而应用目录与 CWD 都排在 System32 之前；
+    后端 CWD 是用户可写的安装目录。System32 与 PATH 都没有时，正确行为是
+    **禁用 GPU 指标**（返回 None），而不是零交互执行一个用户可写的同名文件。
+    """
     import os as _os
 
     from core import gpu_monitor
@@ -1758,8 +2752,54 @@ def test_nvidia_smi_is_resolved_to_an_absolute_path(monkeypatch):
     monkeypatch.setattr(gpu_monitor.os.path, "isfile", lambda p: p == system)
     assert gpu_monitor._nvidia_smi() == system
 
-    # System32 里没有时退回 PATH 解析（which_on_path 不会把 CWD 当命中），
-    # 两条都没有才用裸名，以保持原有行为不回退。
+    # System32 没有时退回 PATH 解析（which_on_path 不会把 CWD 当命中）
+    absolute = r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
     monkeypatch.setattr(gpu_monitor.os.path, "isfile", lambda p: False)
+    monkeypatch.setattr(gpu_monitor, "which_on_path", lambda name: absolute)
+    assert gpu_monitor._nvidia_smi() == absolute
+
+    # 两条都没有：返回 None，绝不退回裸名
     monkeypatch.setattr(gpu_monitor, "which_on_path", lambda name: None)
-    assert gpu_monitor._nvidia_smi() == "nvidia-smi"
+    assert gpu_monitor._nvidia_smi() is None
+
+    # 调用方必须安静地跳过，而不是拿裸名去 spawn
+    def fail_run(*args, **kwargs):
+        raise AssertionError(f"must not execute nvidia-smi: {args!r}")
+
+    monkeypatch.setattr(gpu_monitor, "_nvml_query_gpus", lambda: None)
+    monkeypatch.setattr(gpu_monitor, "_nvml_gpu_processes", lambda pids: None)
+    monkeypatch.setattr(gpu_monitor.subprocess, "run", fail_run)
+    monitor = gpu_monitor.SystemMonitor()
+    assert monitor._query_gpus() == []
+    assert monitor.get_gpu_processes() == []
+
+
+def test_release_version_is_consistent_across_manifests():
+    """版本号必须在所有发布入口一致（审计 RR6 的 CI 交叉校验）。
+
+    三处声明（tauri.conf.json / Cargo.toml / Cargo.lock）任一处漏改，产物名、
+    安装包升级逻辑与文档就会各说各话；CHANGELOG 与 README 是用户看到的版本。
+    """
+    import json
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    tauri = json.loads(
+        (root / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8")
+    )["version"]
+    cargo = re.search(
+        r'^version\s*=\s*"([^"]+)"',
+        (root / "src-tauri" / "Cargo.toml").read_text(encoding="utf-8"),
+        re.MULTILINE,
+    ).group(1)
+    lock = re.search(
+        r'name = "lunarshroud"\nversion = "([^"]+)"',
+        (root / "src-tauri" / "Cargo.lock").read_text(encoding="utf-8"),
+    ).group(1)
+
+    assert tauri == cargo == lock, (tauri, cargo, lock)
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert f"## [{tauri}]" in changelog, f"CHANGELOG 缺少 {tauri} 小节"
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    assert f"`{tauri}`" in readme, f"README 未声明当前版本 {tauri}"

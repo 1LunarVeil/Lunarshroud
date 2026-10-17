@@ -44,14 +44,26 @@ async function _ensureBackendUrl() {
         window.__LLAMA_BACKEND_URL__ = _backendBase;
         return _backendBase;
       }
+      window.__LLAMA_BACKEND_URL_ERROR__ = 'backend not ready';
     } catch (e) {
       console.warn('获取后端 URL 失败:', e);
       window.__LLAMA_BACKEND_URL_ERROR__ = String(e && e.message ? e.message : e);
     }
+    // 打包态**绝不回落到硬编码端口**：外壳只在 HMAC 就绪校验通过后才交出
+    // URL 与令牌。校验未通过时（后端正在重启）那个端口上可能是任意本地
+    // 进程；带着令牌去连它，正是要防的令牌窃取。抛错让调用方重试。
+    throw new Error(t('api.backendNotReady'));
   }
 
-  // 降级：如果是 http/https 协议，使用 location.origin
-  if (window.location && window.location.protocol.startsWith('http')) {
+  // 降级：普通浏览器里 UI 由后端自服务，location.origin 就是后端。
+  // 但 Tauri webview 的地址也是 http(s)://tauri.localhost —— 那不是后端，
+  // 必须排除，否则下面的默认端口兜底永远不可达（审计 F24）。
+  const hostname = window.location ? window.location.hostname || '' : '';
+  if (
+    window.location &&
+    window.location.protocol.startsWith('http') &&
+    !hostname.endsWith('tauri.localhost')
+  ) {
     _backendBase = window.location.origin;
     console.log('[API] 降级后端 URL:', _backendBase);
     window.__LLAMA_BACKEND_URL__ = _backendBase;
@@ -71,7 +83,19 @@ async function _ensureBackendUrl() {
 const RETRY_AFTER_MS = 1500;
 
 async function _request(method, path, body, attempt = 0) {
-  const base = await _ensureBackendUrl();
+  let base;
+  try {
+    base = await _ensureBackendUrl();
+  } catch (e) {
+    // 后端重启中（外壳尚未确认新代身份）：等一个退避周期后重试一次，
+    // 期间不建立任何带令牌的请求。
+    if (attempt < 1 && window.__TAURI__) {
+      await new Promise((resolve) => setTimeout(resolve, RETRY_AFTER_MS));
+      _resetSessionCache();
+      return _request(method, path, body, attempt + 1);
+    }
+    throw e;
+  }
   const url = base ? `${base}${path}` : path;
   window.__LLAMA_LAST_REQUEST_URL__ = url;
   const opts = {
@@ -254,6 +278,7 @@ const Api = {
   // 参数 Schema
   getParamSchema: () => _get('/api/params/schema'),
   getParamDefaults: () => _get('/api/params/defaults'),
+  getParamRecipes: () => _get('/api/params/recipes'),
   buildCommand: (params) => _post('/api/params/build-command', { params }),
 
   // 预设管理
@@ -270,6 +295,10 @@ const Api = {
   // 能力探测（本机构建 + 指定模型）
   // 不带 modelPath 时只返回构建级能力；带上会额外探测该 GGUF 与同目录配套文件
   getCapabilities: (modelPath) => _get(`/api/system/capabilities${_qs({ model: modelPath })}`),
+
+  // 启动前检查（只读）：缺路径、模型不是 GGUF、嵌入模型未开嵌入端点、显存/端口风险…
+  // body 与 createInstance 相同（preset_id 或 params，可选 param_overrides）
+  diagnoseLaunch: (body) => _post('/api/diagnose', body),
 
   // 模型扫描
   // withCapabilities=true 会让每个条目附带能力摘要（原生 ctx、量化、MTP 形态…），
@@ -302,6 +331,8 @@ const Api = {
   createInstance: (body) => _post('/api/instances', body),
   getInstance: (id) => _get(`/api/instances/${encodeURIComponent(id)}`),
   getInstanceCommand: (id) => _get(`/api/instances/${encodeURIComponent(id)}/command`),
+  getInstanceDiagnosis: (id) =>
+    _get(`/api/instances/${encodeURIComponent(id)}/diagnosis`),
   stopInstance: (id, force = false) =>
     _post(`/api/instances/${encodeURIComponent(id)}/stop`, { force }),
   restartInstance: (id) =>

@@ -760,6 +760,7 @@ a:hover { text-decoration: underline; }
 .badge-stopped { background: var(--color-neutral-subtle); color: var(--color-neutral-strong); }
 .badge-failed { background: var(--color-danger-subtle); color: var(--color-danger-strong); }
 .badge-stopping { background: var(--color-warning-subtle); color: var(--color-warning-strong); }
+.badge-interrupted { background: var(--color-warning-subtle); color: var(--color-warning-strong); }
 .badge-success { background: var(--color-success-subtle); color: var(--color-success-strong); }
 
 /* 标签 */
@@ -1067,6 +1068,46 @@ table.table tr:hover td { background: var(--color-hover); }
   overflow-y: auto;
 }
 .pe-caps:empty { display: none; }
+/* 用途配方：一行胶囊按钮，把面板切到某个用途（对话/嵌入/重排/只读工具/Agent）。
+   hidden 属性会被 display:flex 盖掉，所以显式补一条。 */
+.pe-recipes {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 14px 0;
+}
+.pe-recipes[hidden] { display: none; }
+.pe-recipes-label {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  cursor: help;
+}
+.pe-recipes-list {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.pe-recipe {
+  border: 1px solid var(--color-border);
+  background: var(--color-card);
+  color: var(--color-text);
+  border-radius: 999px;
+  padding: 3px 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  cursor: pointer;
+}
+.pe-recipe:hover:not(:disabled) {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+  background: var(--color-primary-subtle);
+}
+.pe-recipe:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 .pe-main {
   flex: 1;
   min-height: 0;
@@ -1946,3 +1987,84 @@ table.table tr:hover td { background: var(--color-hover); }
 }
 
 
+
+/* ===== 新手指南 / 启动前检查 / 失败归因 ===== */
+.setup-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--color-warning-strong);
+  border-radius: 10px;
+  background: var(--color-warning-subtle);
+  color: var(--color-text);
+}
+.setup-banner-text strong { display: block; margin-bottom: 4px; }
+.setup-banner-actions { display: flex; gap: 8px; flex-shrink: 0; }
+
+.help-layout { display: flex; flex-direction: column; gap: 16px; max-width: 1100px; }
+.help-card { padding: 18px 20px; }
+.help-card h2 { font-size: 16px; margin: 0 0 12px; }
+.help-intro { color: var(--color-text-secondary); line-height: 1.7; margin: 0 0 14px; }
+.help-step { display: flex; gap: 12px; padding: 10px 0; border-top: 1px solid var(--color-border-faint); }
+.help-step:first-of-type { border-top: 0; }
+.help-step-num {
+  width: 26px; height: 26px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%; background: var(--color-primary-subtle);
+  color: var(--color-primary); font-size: 13px; font-weight: 600;
+}
+.help-step h3 { margin: 0 0 4px; font-size: 14px; }
+.help-step p { margin: 0; color: var(--color-text-secondary); line-height: 1.75; }
+.help-step code, .help-card code {
+  padding: 1px 5px; border-radius: 4px;
+  background: var(--color-neutral-subtle); font-size: 12px;
+}
+.help-table-wrap { max-height: none; }
+.help-table td { vertical-align: top; line-height: 1.6; }
+.help-mistakes { margin: 0; padding-left: 20px; color: var(--color-text-secondary); line-height: 1.8; }
+.help-security { border-color: var(--color-danger-strong); }
+.help-checks { display: flex; flex-direction: column; gap: 8px; }
+.help-check {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 10px 12px; border-radius: 8px;
+  background: var(--color-neutral-subtle);
+}
+.help-check-icon {
+  width: 20px; height: 20px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%; font-size: 12px; font-weight: 700;
+}
+.help-check-ok .help-check-icon { background: var(--color-success-subtle); color: var(--color-success-strong); }
+.help-check-warn .help-check-icon { background: var(--color-warning-subtle); color: var(--color-warning-strong); }
+.help-check-error .help-check-icon { background: var(--color-danger-subtle); color: var(--color-danger-strong); }
+.help-check-info .help-check-icon { background: var(--color-info-subtle); color: var(--color-info-strong); }
+.help-check-body { flex: 1; }
+.help-check-title { font-size: 13px; font-weight: 600; }
+.help-check-detail { margin-top: 2px; font-size: 12px; color: var(--color-text-secondary); word-break: break-all; }
+.help-check > button { flex-shrink: 0; }
+
+.diag-intro { color: var(--color-text-secondary); line-height: 1.7; margin-bottom: 12px; }
+.diag-list { display: flex; flex-direction: column; gap: 10px; max-height: 55vh; overflow: auto; }
+.diag-item {
+  padding: 10px 12px; border-radius: 8px;
+  border-left: 3px solid var(--color-neutral-strong);
+  background: var(--color-neutral-subtle);
+}
+.diag-item.diag-error { border-left-color: var(--color-danger-strong); }
+.diag-item.diag-warning { border-left-color: var(--color-warning-strong); }
+.diag-item.diag-info { border-left-color: var(--color-info-strong); }
+.diag-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.diag-severity {
+  font-size: 11px; font-weight: 700; text-transform: uppercase;
+  padding: 1px 6px; border-radius: 999px;
+  background: var(--color-neutral-subtle);
+}
+.diag-item.diag-error .diag-severity { background: var(--color-danger-subtle); color: var(--color-danger-strong); }
+.diag-item.diag-warning .diag-severity { background: var(--color-warning-subtle); color: var(--color-warning-strong); }
+.diag-item.diag-info .diag-severity { background: var(--color-info-subtle); color: var(--color-info-strong); }
+.diag-title { font-weight: 600; }
+.diag-detail { font-size: 12px; color: var(--color-text-secondary); line-height: 1.6; word-break: break-word; }
+.diag-fix { margin-top: 6px; font-size: 13px; line-height: 1.6; }

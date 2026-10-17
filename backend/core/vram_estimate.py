@@ -110,9 +110,13 @@ def compute_overhead_gib(ctx_size: int | None, block_count: int | None = None) -
     """
     def _as_number(value: Any) -> float:
         try:
-            return max(0.0, float(value or 0))
-        except (TypeError, ValueError):
+            number = float(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            # int 可以任意大（`?ctx_size=<401 位数字>`），float() 会抛
+            # OverflowError；这类请求属于非法输入，按 0 处理即可，
+            # 但绝不能让它变成接口的 500。
             return 0.0
+        return max(0.0, number)
 
     scaled = (
         _COMPUTE_BASE_GIB

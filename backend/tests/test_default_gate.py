@@ -495,25 +495,106 @@ def test_probe_run_uses_create_no_window(tmp_path, monkeypatch):
     打包态 backend.exe 是无控制台程序（backend.spec console=False），探测
     不带这个 flag 时，每次启动预热（--help / --version 各一次）都会给
     llama-server 弹一个可见控制台窗口 —— 用户看到的就是"闪命令行"。
+
+    接缝随 H1 修复后移到了 Popen（subprocess.run 的超时在 Windows 包装脚本
+    场景下不构成时间上界）；断言对象相应改为 Popen 的 kwargs。
     """
     import os
-    import types
 
     exe = tmp_path / "llama-server.exe"
     exe.write_bytes(b"fake")
     captured: list[dict] = []
 
-    def fake_run(*args, **kwargs):
-        captured.append(kwargs)
-        return types.SimpleNamespace(stdout=b"usage: llama-server\n", stderr=b"")
+    class FakePopen:
+        def __init__(self, *args, **kwargs):
+            captured.append(kwargs)
+            self.pid = 4242
+            self.returncode = 0
+            self.stdout = None
+            self.stderr = None
 
-    monkeypatch.setattr(server_probe.subprocess, "run", fake_run)
+        def communicate(self, timeout=None):
+            return b"usage: llama-server\n", b""
+
+        def poll(self):
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(server_probe.subprocess, "Popen", FakePopen)
     server_probe.probe_server(str(exe))
 
     assert len(captured) == 2  # --help 与 --version 各一次
     expected = getattr(server_probe.subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     for kwargs in captured:
         assert kwargs.get("creationflags") == expected
+        assert kwargs.get("cwd") == str(tmp_path)
+
+
+def test_agent_and_mcp_params_track_the_local_build():
+    """agent / MCP / rerank 参数必须跟随本机构建：有这个 flag 才支持、没有就丢弃。
+
+    llama.cpp 的 agent/MCP 能力是实验性且持续变动（b10709 才有 --agent/--tools），
+    静态照抄会制造"界面能勾、命令里没有"的漂移 —— 这里钉住三态判定。
+    """
+    from core.param_schema import PARAM_DEFINITIONS, param_is_supported
+
+    keys = {"agent", "tools", "tools_runtime", "ui_mcp_proxy", "mcp_servers_config", "mcp_servers_json", "rerank"}
+    by_key = {m.key: m for m in PARAM_DEFINITIONS}
+    assert keys <= set(by_key), f"缺参数定义: {keys - set(by_key)}"
+
+    modern = complete_probe(
+        "--agent, -ag, --no-agent               enable CORS proxy and all built-in tools",
+        "--tools TOOL1,TOOL2,...                experimental built-in tools",
+        "--tools-runtime OPTION                 runtime for tools",
+        "--ui-mcp-proxy, --no-ui-mcp-proxy      enable MCP CORS proxy",
+        "--mcp-servers-config PATH              path to JSON file with MCP server definitions",
+        "--mcp-servers-json JSON                inline JSON with MCP server definitions",
+        "--rerank, --reranking                  enable reranking endpoint",
+    )
+    for key in sorted(keys):
+        assert param_is_supported(by_key[key], modern) is True, key
+
+    legacy = complete_probe()  # 老构建：只有 filler 选项
+    for key in sorted(keys):
+        assert param_is_supported(by_key[key], legacy) is False, key
+
+
+def test_official_build_alignment_params_track_the_build():
+    """MoE / 规格解码 / 视频 / lazy-mode 参数族跟随本机构建。
+
+    对官方 llama.cpp build 11630 对齐新增（先前快照来自 prism-ml fork，两者
+    都带这些 flag）；老构建必须逐项判定为不支持。
+    """
+    from core.param_schema import PARAM_DEFINITIONS, param_is_supported
+
+    keys = {
+        "cpu_moe", "n_cpu_moe", "n_cpu_ffn", "moe_cache_mib",
+        "spec_draft_n_ubatch", "spec_draft_sampling",
+        "lazy_mode", "video_fps", "video_ffmpeg_dir", "video_timestamp_interval",
+    }
+    by_key = {m.key: m for m in PARAM_DEFINITIONS}
+    assert keys <= set(by_key), f"缺参数定义: {keys - set(by_key)}"
+
+    modern = complete_probe(
+        "-cmoe, --cpu-moe                       keep all Mixture of Experts (MoE) weights in the CPU",
+        "-ncmoe, --n-cpu-moe N                  keep the MoE expert weights of the first N layers in the CPU",
+        "-ncffn, --n-cpu-ffn N                  keep the dense FFN weights of the first N layers in the CPU",
+        "--moe-cache-mib N                      GPU cache size in MiB for the MoE experts kept in the CPU",
+        "--spec-draft-n-ubatch N                physical maximum batch size of the draft context",
+        "--spec-draft-sampling {greedy,probabilistic}   how the draft is sampled",
+        "-lzm,  --lazy-mode MODE                on-demand reading of certain tensors",
+        "--video-fps N                          target video frame rate",
+        "--video-ffmpeg-dir DIR                 path to the directory containing ffmpeg and ffprobe",
+        "--video-timestamp-interval N           interval in milliseconds between text timestamps",
+    )
+    for key in sorted(keys):
+        assert param_is_supported(by_key[key], modern) is True, key
+
+    legacy = complete_probe()
+    for key in sorted(keys):
+        assert param_is_supported(by_key[key], legacy) is False, key
 
 
 def test_gate_decides_for_every_marked_param():

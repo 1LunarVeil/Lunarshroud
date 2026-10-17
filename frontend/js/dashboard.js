@@ -4,6 +4,7 @@
 
 import { t, localizeBackendError } from './i18n.mjs';
 import { emptyStateHtml } from './panel_views.mjs';
+import { confirmLaunch, showDiagnosisModal } from './preflight.mjs';
 
 export const id = 'dashboard';
 export const title = '仪表盘';
@@ -12,6 +13,11 @@ let ctx = null;
 let root = null;
 let unsubscribe = null;
 let presetCache = [];
+let currentInstances = [];
+// 全新安装时 llama_server_path 是空的（默认值刻意留空，见 backend/config.py），
+// 此时"没有实例"并不是用户做错了什么 —— 空态必须说清楚下一步去哪。
+let serverConfigured = true;
+let modelDirConfigured = true;
 
 export function init(el, appCtx) {
   root = el;
@@ -26,19 +32,56 @@ export function init(el, appCtx) {
         <button class="btn btn-primary" id="btn-launch">${ctx.escapeHtml(t('dash.launch'))}</button>
       </div>
     </div>
+    <div id="setup-banner"></div>
     <div id="instance-grid" class="instance-grid"></div>
   `;
   root.querySelector('#btn-launch').addEventListener('click', openLaunchModal);
 }
 
 export async function onShow() {
-  await refreshPresets();
+  await Promise.all([refreshPresets(), refreshSetupState()]);
   unsubscribe = ctx.subscribeInstances(render);
 }
 
 export function onHide() {
   if (unsubscribe) unsubscribe();
   unsubscribe = null;
+}
+
+async function refreshSetupState() {
+  try {
+    const cfg = await ctx.Api.getSystemConfig();
+    serverConfigured = Boolean(cfg && String(cfg.llama_server_path || '').trim());
+    modelDirConfigured = Boolean(cfg && String(cfg.default_model_dir || '').trim());
+  } catch (e) {
+    // 读不到配置就不提示 —— 渲染层已有专门的诊断空态，别在这里叠一条假警告
+    serverConfigured = true;
+    modelDirConfigured = true;
+  }
+}
+
+function renderSetupBanner() {
+  const slot = root.querySelector('#setup-banner');
+  if (!slot) return;
+  if (serverConfigured && modelDirConfigured) {
+    slot.innerHTML = '';
+    return;
+  }
+  const key = serverConfigured ? 'setup.modelsTitle' : 'setup.title';
+  const bodyKey = serverConfigured ? 'setup.modelsBody' : 'setup.body';
+  slot.innerHTML = `
+    <div class="setup-banner">
+      <div class="setup-banner-text">
+        <strong>${ctx.escapeHtml(t(key))}</strong>
+        <div>${ctx.escapeHtml(t(bodyKey))}</div>
+      </div>
+      <div class="setup-banner-actions">
+        <button class="btn btn-secondary btn-sm" data-setup="guide">${ctx.escapeHtml(t('setup.openGuide'))}</button>
+        <button class="btn btn-primary btn-sm" data-setup="settings">${ctx.escapeHtml(t('setup.openSettings'))}</button>
+      </div>
+    </div>`;
+  slot.querySelector('[data-setup="guide"]').addEventListener('click', () => ctx.navigate('help'));
+  slot.querySelector('[data-setup="settings"]').addEventListener('click', () => ctx.navigate('settings'));
 }
 
 async function refreshPresets() {
@@ -51,6 +94,8 @@ async function refreshPresets() {
 
 function render(instances) {
   const grid = root.querySelector('#instance-grid');
+  currentInstances = Array.isArray(instances) ? instances : [];
+  renderSetupBanner();
   // 防御性检查：确保 instances 是数组
   if (!Array.isArray(instances)) {
     console.error('[dashboard] instances is not an array:', instances);
@@ -78,7 +123,11 @@ function render(instances) {
   if (!instances || instances.length === 0) {
     grid.innerHTML = `
       <div style="grid-column: 1 / -1;">
-        ${emptyStateHtml(ctx, { icon: 'cpu', title: t('dash.empty') })}
+        ${emptyStateHtml(ctx, {
+          icon: 'cpu',
+          title: t('dash.empty'),
+          sub: serverConfigured ? '' : t('dash.emptyNoServer'),
+        })}
       </div>
     `;
     return;
@@ -101,6 +150,9 @@ function cardHtml(i) {
   }
   actions.push(`<button class="btn btn-sm btn-secondary" data-action="logs" data-id="${i.id}">${ctx.escapeHtml(t('dash.logs'))}</button>`);
   actions.push(`<button class="btn btn-sm btn-secondary" data-action="command" data-id="${i.id}">${ctx.escapeHtml(t('dash.command'))}</button>`);
+  if (i.status === 'failed') {
+    actions.push(`<button class="btn btn-sm btn-warning" data-action="diagnose" data-id="${i.id}">${ctx.escapeHtml(t('diag.whyFailed'))}</button>`);
+  }
   if (i.status === 'stopped' || i.status === 'failed') {
     actions.push(`<button class="btn btn-sm btn-ghost" data-action="remove" data-id="${i.id}">${ctx.escapeHtml(t('dash.remove'))}</button>`);
   }
@@ -148,6 +200,11 @@ async function handleAction(action, id) {
     case 'command':
       showCommandModal(id);
       break;
+    case 'diagnose': {
+      const instance = currentInstances.find((item) => item.id === id);
+      if (instance) await showDiagnosisModal(ctx, instance, instance.diagnosis);
+      break;
+    }
     case 'remove':
       if (!(await ctx.showConfirm(t('dash.confirmRemove')))) return;
       try {
@@ -253,6 +310,8 @@ async function doLaunch(bodyEl) {
     }
   }
   if (name) body.name = name;
+
+  if (!(await confirmLaunch(ctx, body))) return;
 
   try {
     const inst = await ctx.Api.createInstance(body);

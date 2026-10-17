@@ -269,7 +269,7 @@ async function doSave(bodyEl, existing) {
   try {
     params = JSON.parse(paramsStr);
   } catch (e) {
-    ctx.showToast(`${t('presets.jsonInvalid')}: ${ctx.escapeHtml(e.message)}`, 'error');
+    ctx.showToast(`${t('presets.jsonInvalid')}: ${e.message}`, 'error');
     return;
   }
   const tags = tagsStr ? tagsStr.split(/[,，]/).map((s) => s.trim()).filter(Boolean) : [];
@@ -338,7 +338,7 @@ async function doImport(bodyEl) {
   try {
     data = JSON.parse(jsonStr);
   } catch (e) {
-    ctx.showToast(`${t('presets.jsonInvalid')}: ${ctx.escapeHtml(e.message)}`, 'error');
+    ctx.showToast(`${t('presets.jsonInvalid')}: ${e.message}`, 'error');
     return;
   }
   try {

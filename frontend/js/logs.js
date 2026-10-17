@@ -101,11 +101,15 @@ export function onHide() {
 
 function updateInstances(list) {
   instanceList = Array.isArray(list) ? list : [];
-  // 若当前选中实例不在列表里，清空选择
+  // 若当前选中实例不在列表里，清空选择与日志缓冲
   if (currentInstanceId && !instanceList.some((i) => i.id === currentInstanceId)) {
-    // 实例被移除，关闭 WS
+    // 实例被移除：关 WS 之外必须清缓冲并重渲 —— 否则面板与"下载日志"
+    // 仍在展示/导出上一个实例的内容（审计 R6）。
     closeWs();
     currentInstanceId = null;
+    logLines = [];
+    logKeys = new Set();
+    renderLogs();
   }
   // WS 会持续推送实例状态，签名没变就不重绘 ——
   // 否则每次推送都会重建面板 DOM，把用户滚到一半的面板位置顶回顶部

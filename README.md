@@ -2,11 +2,13 @@
 
 LunarShroud 是一个面向 Windows 的 llama.cpp 桌面启动器，使用 Tauri、FastAPI 和原生 JavaScript 构建。它提供参数编辑、预设、多实例、实时日志、资源监控、启动历史和 llama-server 内置 Chat UI。
 
-> 当前版本：`0.9.0-beta.1`。已经完成进程生命周期与本地接口安全加固，但在标记 1.0 前仍需要多种 GPU、模型和 4–8 小时长稳测试。
+> 当前版本：`0.9.0-beta.2`。已经完成进程生命周期与本地接口安全加固，但在标记 1.0 前仍需要多种 GPU、模型和 4–8 小时长稳测试。
 
 ## 主要能力
 
-- 64 项 llama-server 参数可视化编辑（按本机构建自适应显隐）
+- llama-server 参数可视化编辑：面板收录常用项，按**本机构建**自适应显隐（`--help` 探测是权威，不是硬编码清单），长尾参数走「附加命令行参数」
+- 「用途」一键配方：对话生成 / 嵌入服务 / 重排序 / 只读工具 / Agent 全功能（只写意图，不写调优数字）
+- RAG 组件齐备：`/v1/embeddings`、`/rerank`、提示词缓存、内置工具与 MCP，详见 [docs/RAG.md](docs/RAG.md)
 - 多实例启动、停止、重启、端口分配和状态监控
 - 有界实时日志、搜索、过滤和下载
 - CPU、内存和 NVIDIA GPU 监控
@@ -28,6 +30,34 @@ LunarShroud 是一个面向 Windows 的 llama.cpp 桌面启动器，使用 Tauri
 ## 环境要求
 
 运行预编译版本：Windows 10/11、WebView2 Runtime、用户自行准备的 `llama-server.exe` 和 GGUF 模型。NVIDIA GPU 仅在需要 GPU 指标时使用。
+
+
+### 第一次启动：获取 llama-server
+
+> 完整的新手步骤、常见错误操作和启动失败排查表见
+> [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)；应用内「新手指南」页会读取
+> 当前配置并给出动态检查清单。
+
+本项目**不打包** `llama-server.exe`（它是独立的 llama.cpp 产物，且要按显卡分变体），
+所以装好启动器后还需要一步：
+
+1. 打开 llama.cpp 的发布页 <https://github.com/ggml-org/llama.cpp/releases>，下载最新的
+   Windows 包，按你的显卡选：
+
+   | 你的显卡 | 选文件名里含 |
+   |---|---|
+   | NVIDIA（RTX 30/40/50 等） | `bin-win-cuda12.x-x64`（推荐，另见第 3 步） |
+   | AMD / Intel 显卡 | `bin-win-vulkan-x64` |
+   | 只有 CPU | `bin-win-cpu-x64` |
+
+2. 解压到一个**固定位置**（例如 `D:\llama`），解压后里面就有 `llama-server.exe`。
+3. 用 NVIDIA 时需要 CUDA 运行库：装 NVIDIA 官网的 CUDA Toolkit 运行组件，或把发布包
+   附带的 `cudart64_*.dll` / `cublas64_*.dll` 一并放进 `llama-server.exe` 所在目录。
+4. 启动 LunarShroud → 设置 → 「llama-server 路径」→ 选中刚解压的那个 exe。
+
+> 启动器**故意不给这个路径设默认值**。设了默认值，就等于每次启动都自动执行
+> "某个安装目录里恰好叫这个名字的文件" —— 而那个目录通常用户可写，见
+> docs/SECURITY_MODEL.md。代价就是上面这一步要你来做一次。
 
 源码构建还需要：Python 3.11+、Node.js 22、Rust `1.97.1` MSVC、Tauri CLI `2.11.4`，以及 Visual Studio C++ Build Tools 的“Desktop development with C++”工作负载。详细步骤见 [docs/BUILDING.md](docs/BUILDING.md)。
 
@@ -56,11 +86,14 @@ Get-ChildItem frontend\js -File | Where-Object Extension -in '.js', '.mjs' | For
 cargo test --manifest-path src-tauri\Cargo.toml --locked
 ```
 
-当前源码基线（2026-09-23）：343 个 Python 测试、17 个前端测试、15 个 JavaScript 文件语法检查、7 个 Rust 测试；产品代码覆盖率 85.30%。测试数量随回归测试增长，门禁始终是 **0 失败 + 覆盖率 ≥75%**，以实际运行为准。测试不替代真实模型和长时间压力测试。当前验证状态和未完成风险见 [docs/STATUS.md](docs/STATUS.md)。
+当前源码基线（2026-10-18）：508 个 Python 测试、20 个前端测试、17 个 JavaScript 文件语法检查、14 个 Rust 测试；产品代码覆盖率 88.41%。测试数量随回归测试增长，门禁始终是 **0 失败 + 覆盖率 ≥75%**，以实际运行为准。测试不替代真实模型和长时间压力测试。当前验证状态见 [docs/STATUS.md](docs/STATUS.md)，未完成风险、证据与 beta/1.0 判断见 [docs/RISK_ASSESSMENT.md](docs/RISK_ASSESSMENT.md)。
 
 ## 构建安装包
 
 ```powershell
+# 固定构建元数据：否则连续两次 PyInstaller 构建的哈希会不同
+$env:SOURCE_DATE_EPOCH = '1790000000'
+$env:PYTHONHASHSEED = '0'
 Set-Location backend
 ..\.venv\Scripts\python.exe -m PyInstaller backend.spec --clean -y
 Set-Location ..\src-tauri
@@ -97,6 +130,11 @@ docs/           架构、构建、发布与安全说明
 - 当前安装包未代码签名，Windows SmartScreen 可能提示未知发布者。
 - GPU 监控优先使用 NVML（`nvidia-ml-py`），库或驱动不可用时回退 `nvidia-smi`。
 - 不同 llama.cpp 版本的参数可能变化，升级后应检查生成命令。
+- llama.cpp 默认 `--cache-ram 8192` 会启用宿主侧提示词缓存。实测 4B 模型运行 10 分钟后 llama-server 内存从 5.2 GB 升至 11.4 GB 并平台化；这不是启动器泄漏。内存较小的机器请把 `--cache-ram` 调低或设为 0（代价是重复提示词不再复用）。
+- 实例端口默认不设 API 密钥。Windows 回环端口不按用户隔离，共享机器上的其他本地进程可以直接调用模型；共享环境请在参数中设置 `api_key`。
+- Windows 上总路径超过 260 个字符的模型/草稿/mmproj 无法被 llama.cpp 打开；启动前检查会报 `path_too_long`，请把文件移到更短的目录。
+- llama.cpp v0.7.0：嵌入模型在**单槽位且未开启嵌入端点**时会触发上游断言而崩溃（`GGML_ASSERT(n_outputs_max ...)`）。勾选「启用嵌入端点」或把并行槽位设为 2 以上即可规避；启动器会把这条断言翻译成可行动的提示。
+- Chat 页把 llama-server Web UI 嵌在沙箱 iframe 里（脚本、表单、同源），沙箱不含下载权限，因此 v0.7.0 模型管理器的下载功能请点工具栏的「在浏览器中打开」。
 - 尚未完成多硬件矩阵和 4–8 小时真实模型 soak test，因此版本仍为 beta。
 
 ## 参与和许可

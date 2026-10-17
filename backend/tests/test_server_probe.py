@@ -1,7 +1,7 @@
 """llama-server 能力探测测试。
 
 夹具用的是**从真实 ``--help`` 摘录的排版**（含列 0 = 新选项、多字符短选项、
-六种 default 变体），而不是我理想中的格式 —— 解析器的难点全在这些坑里。
+各种 default 变体），而不是我理想中的格式 —— 解析器的难点全在这些坑里。
 """
 from __future__ import annotations
 
@@ -105,7 +105,7 @@ def test_split_flags_stops_at_argument_placeholder():
     assert rest.startswith("[on|off|auto]")
 
 
-# ========== 默认值解析的六种排版 ==========
+# ========== 默认值解析的各种排版 ==========
 
 
 def test_option_defaults_parse_all_real_layouts():
@@ -158,6 +158,23 @@ def test_allowed_values_are_parsed():
     options = parse_help(HELP_SAMPLE)
     assert options["-ctk"].allowed_values == ("f32", "f16", "bf16", "q8_0", "q4_0")
     assert options["-t"].allowed_values == ()
+
+
+def test_allowed_values_are_parsed_from_the_argument_position():
+    """上游还有两种把取值写在**参数位**的排版：``{a,b,c}`` 与 ``[a|b|c]``。
+
+    只认 ``allowed values:`` 文本时这两类的取值拿不到，前端就只能吃 schema 的
+    静态快照 —— 而 schema 是快照、上游会新增取值（``--spec-type`` 已经发生过
+    一次）。实测 v0.7.0：``--pooling`` / ``--rope-scaling`` 用花括号，
+    ``--flash-attn`` / ``--reasoning`` / ``--fit`` / ``--log-colors`` 用方括号。
+    """
+    options = parse_help(HELP_SAMPLE)
+    assert options["--pooling"].allowed_values == ("none", "mean", "cls", "last", "rank")
+    assert options["-fa"].allowed_values == ("on", "off", "auto")
+    assert options["--flash-attn"].allowed_values == ("on", "off", "auto")
+    # 普通占位符（N / TYPE / PATH）不是取值声明，别把它们当成取值
+    assert options["-t"].allowed_values == ()
+    assert options["-ctk"].allowed_values == ("f32", "f16", "bf16", "q8_0", "q4_0")
 
 
 def test_deprecated_is_flagged():
@@ -289,3 +306,343 @@ def test_probe_server_on_a_file_that_is_not_an_executable(tmp_path):
     result = probe_server(fake, timeout=5.0)
     assert result.probed is False
     assert result.error
+
+
+# ========== 探测缓存语义（审计 R2 / F10）==========
+
+
+def _probe_exe(tmp_path):
+    exe = tmp_path / "llama-server.exe"
+    exe.write_bytes(b"fake")
+    return exe
+
+
+def test_failed_probe_is_cached_for_a_short_ttl(tmp_path, monkeypatch):
+    """失败探测结果必须进缓存（短 TTL），否则每个请求都放大两次子进程。
+
+    审计 R2：失败不缓存时，"路径写错/未配置/卡死超时"这类常态失败会把
+    to_thread 线程池占满。TTL 到期后才允许重新探测（用户可能刚修好路径）。
+    """
+    from core import server_probe as sp
+
+    exe = _probe_exe(tmp_path)
+    calls = []
+
+    def failing_probe(path, **options):
+        calls.append(path)
+        return ServerProbe(path=str(path), probed=False, error="boom")
+
+    monkeypatch.setattr(sp, "probe_server", failing_probe)
+    sp.clear_server_cache()
+
+    first = sp.probe_server_cached(exe)
+    second = sp.probe_server_cached(exe)
+
+    assert first.probed is False and first.error == "boom"
+    assert second.probed is False and second.error == "boom"
+    assert len(calls) == 1, f"失败结果没有被缓存：探测了 {len(calls)} 次"
+
+    # TTL 到期 → 允许重新探测
+    monkeypatch.setattr(sp, "_FAILED_TTL_SECONDS", -1.0)
+    sp.probe_server_cached(exe)
+    assert len(calls) == 2, "TTL 到期后应重新探测"
+
+    sp.clear_server_cache()
+
+
+def test_failed_cache_never_leaks_into_the_preview_path(tmp_path, monkeypatch):
+    """`probe_server_cached_only` 仍只认成功结果：失败缓存不得改变预览路径语义。
+
+    预览路径（build_argv）的契约是"绝不起子进程、没有就降级"；让它的返回值
+    随失败缓存变化会悄悄改变调用方的判断。
+    """
+    from core import server_probe as sp
+
+    exe = _probe_exe(tmp_path)
+    monkeypatch.setattr(
+        sp,
+        "probe_server",
+        lambda path, **options: ServerProbe(path=str(path), probed=False, error="boom"),
+    )
+    sp.clear_server_cache()
+
+    sp.probe_server_cached(exe)          # 失败结果入短 TTL 缓存
+    assert sp.probe_server_cached_only(exe) is None
+
+    sp.clear_server_cache()
+
+
+def _scan_h1_pids(marker: str) -> list[int]:
+    import psutil
+
+    out = []
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        cmd = " ".join(proc.info["cmdline"] or [])
+        if marker in cmd and "h1_holder.py" in cmd:
+            out.append(proc.info["pid"])
+    return out
+
+
+def _kill_h1_marked(marker: str) -> None:
+    import time as _time
+
+    import psutil
+
+    for pid in _scan_h1_pids(marker):
+        try:
+            proc = psutil.Process(pid)
+            for child in proc.children(recursive=True):
+                try:
+                    child.kill()
+                except psutil.Error:
+                    pass
+            proc.kill()
+        except psutil.Error:
+            pass
+    _time.sleep(0.5)
+
+
+def test_probe_child_process_never_inherits_the_session_token(tmp_path, monkeypatch):
+    """能力探测也是"把第三方构建跑起来"：同样不得继承 LUNARSHROUD_*。
+
+    外壳把管理令牌经环境注入后端；探测用用户配置的任意路径起 ``--help``。
+    旧实现 Popen 不传 ``env=``，令牌原样进入被测进程 —— 拿到它就能
+    ``PUT /api/system/config`` 改写 llama_server_path，把一次执行升级成跨启动
+    持久化（AGENTS §2.4）。process_manager 的启动路径早有过滤，探测路径没有。
+    """
+    import os
+
+    from core import server_probe as sp
+
+    exe = _probe_exe(tmp_path)
+    monkeypatch.setenv("LUNARSHROUD_SESSION_TOKEN", "t" * 64)
+    monkeypatch.setenv("LUNARSHROUD_SESSION_ID", "sess")
+    seen = {}
+
+    class FakeProcess:
+        def communicate(self, timeout=None):
+            return b"--help ok", b""
+
+    def fake_popen(argv, **kwargs):
+        seen["argv"] = argv
+        seen["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(sp.subprocess, "Popen", fake_popen)
+    sp._run(str(exe), ["--help"], 5.0)
+
+    assert "env" in seen["kwargs"], "探测子进程必须显式传过滤后的 env"
+    env = seen["kwargs"]["env"]
+    assert not [k for k in env if k.upper().startswith("LUNARSHROUD_")], env
+    # 其余环境必须保留：包装脚本/构建要用 PATH 找运行时 DLL
+    assert env["PATH"] == os.environ["PATH"]
+
+
+def test_probe_timeout_survives_a_pipe_holding_wrapper(tmp_path):
+    """包装脚本卡死时，探测必须在超时上界附近返回并回收进程树（独立审计 H1）。
+
+    `subprocess.run(timeout=)` 只杀直接子进程；孙进程握着继承的管道会让
+    communicate() 无限等（实测挂起 585s）。测试跑在守护线程里，超界判"挂起"。
+    """
+    import os
+    import threading
+    import time as _time
+
+    import pytest
+
+    if os.name != "nt":
+        pytest.skip("Windows 包装脚本场景")
+
+    marker = tmp_path.name
+    holder = tmp_path / "h1_holder.py"
+    holder.write_text(
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+        "time.sleep(120)\n",
+        encoding="utf-8",
+    )
+    bat = tmp_path / "llama-server.bat"
+    bat.write_text(f'@"{sys.executable}" "{holder}"\n', encoding="utf-8")
+
+    box = {}
+
+    def run_probe():
+        t0 = _time.monotonic()
+        box["result"] = probe_server(bat, timeout=3.0)
+        box["elapsed"] = _time.monotonic() - t0
+
+    try:
+        worker = threading.Thread(target=run_probe, daemon=True)
+        worker.start()
+        worker.join(timeout=3.0 + 12.0)
+        assert not worker.is_alive(), "探测在超时后仍挂起：孙进程持管道（审计 H1）"
+        assert box["result"].probed is False
+        assert box["elapsed"] < 3.0 + 10, box["elapsed"]
+        _time.sleep(0.5)
+        leftovers = _scan_h1_pids(marker)
+        assert leftovers == [], f"探测进程树未回收: {leftovers}"
+    finally:
+        _kill_h1_marked(marker)
+
+
+def test_follower_returns_after_its_deadline_when_the_leader_hangs(tmp_path, monkeypatch):
+    """领先者卡死时，跟随者必须在总截止内返回（独立审计 H1 的线程泄漏面）。
+
+    没有截止的 `while True: wait(1.0)` 会让每个 to_thread 请求泄漏一个永不
+    返回的工作线程，最终饿死实例管理 API。以 1s 名义超时驱动：
+    跟随预算 = 2×1+5 = 7s。
+    """
+    import threading
+    import time as _time
+
+    from core import server_probe as sp
+
+    exe = _probe_exe(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    def hanging_probe(path, **options):
+        started.set()
+        release.wait(timeout=30)
+        return ServerProbe(path=str(path), probed=False, error="late")
+
+    monkeypatch.setattr(sp, "probe_server", hanging_probe)
+    sp.clear_server_cache()
+
+    leader_thread = threading.Thread(
+        target=lambda: sp.probe_server_cached(exe, timeout=1.0), daemon=True
+    )
+    leader_thread.start()
+    assert started.wait(timeout=5)
+
+    result_box = []
+    t0 = _time.monotonic()
+    follower = threading.Thread(
+        target=lambda: result_box.append(sp.probe_server_cached(exe, timeout=1.0)),
+        daemon=True,
+    )
+    follower.start()
+    follower.join(timeout=7.0 + 4.0)
+    elapsed = _time.monotonic() - t0
+    try:
+        assert not follower.is_alive(), "跟随者未按截止返回（审计 H1：线程泄漏）"
+        assert result_box and result_box[0].probed is False
+        assert elapsed < 7.0 + 2.0, elapsed
+    finally:
+        release.set()
+        leader_thread.join(timeout=5)
+        sp.clear_server_cache()
+
+
+def test_excess_followers_fail_fast_instead_of_stacking_workers(tmp_path, monkeypatch):
+    """同一目标并发等待者超过上限时快速失败，不再堆占 to_thread 工作线程（复核 N1）。
+
+    冷探测窗口内（领先者挂起、跟随者最长等 2×timeout+5s），无上限的等待会把
+    默认线程池（约 32）逐一占满、令实例管理端点排队；这里钉住"超出上限立即
+    返回带明确文案的失败"，限额内的等待语义保持原样（仍拿到领先者的真实结果）。
+    """
+    import threading
+    import time as _time
+
+    from core import server_probe as sp
+
+    exe = _probe_exe(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    def hanging_probe(path, **options):
+        started.set()
+        release.wait(timeout=30)
+        return ServerProbe(path=str(path), probed=False, error="late")
+
+    monkeypatch.setattr(sp, "probe_server", hanging_probe)
+    monkeypatch.setattr(sp, "_MAX_FOLLOWERS_PER_KEY", 2, raising=False)
+    sp.clear_server_cache()
+
+    leader_thread = threading.Thread(
+        target=lambda: sp.probe_server_cached(exe, timeout=1.0), daemon=True
+    )
+    leader_thread.start()
+    assert started.wait(timeout=5)
+
+    results = []
+    lock = threading.Lock()
+
+    def caller(tag):
+        r = sp.probe_server_cached(exe, timeout=1.0)
+        with lock:
+            results.append((tag, r.probed, r.error or ""))
+
+    waiters = [threading.Thread(target=caller, args=(f"w{i}",), daemon=True) for i in range(2)]
+    overs = [threading.Thread(target=caller, args=(f"o{i}",), daemon=True) for i in range(3)]
+    try:
+        for t in waiters:
+            t.start()
+        _time.sleep(0.3)  # 让限额内的两个先入座
+        t0 = _time.monotonic()
+        for t in overs:
+            t.start()
+        for t in overs:
+            t.join(timeout=3)
+        assert all(not t.is_alive() for t in overs), "超额跟随者没有快速返回（复核 N1）"
+        assert _time.monotonic() - t0 < 3.0
+
+        over_results = [r for r in results if r[0].startswith("o")]
+        assert len(over_results) == 3
+        for _, probed, err in over_results:
+            assert probed is False and "等待队列已满" in err, over_results
+    finally:
+        release.set()
+        for t in waiters:
+            t.join(timeout=8)
+        leader_thread.join(timeout=5)
+
+    waiter_results = [r for r in results if r[0].startswith("w")]
+    assert len(waiter_results) == 2, waiter_results
+    for _, probed, err in waiter_results:
+        assert probed is False and err == "late", waiter_results
+
+    sp.clear_server_cache()
+
+
+def test_concurrent_cold_probes_share_a_single_execution(tmp_path, monkeypatch):
+    """并发冷探测必须共享一次执行（单飞），而不是每线程各起两个子进程（F10b/R2）。"""
+    import threading
+    import time as _time
+
+    from core import server_probe as sp
+
+    exe = _probe_exe(tmp_path)
+    calls = []
+
+    def slow_probe(path, **options):
+        calls.append(path)
+        _time.sleep(0.4)
+        return ServerProbe(path=str(path), probed=True, options={})
+
+    monkeypatch.setattr(sp, "probe_server", slow_probe)
+    sp.clear_server_cache()
+
+    results = []
+    failures = []
+    barrier = threading.Barrier(4)
+
+    def worker():
+        try:
+            barrier.wait(timeout=5)
+            results.append(sp.probe_server_cached(exe))
+        except BaseException as exc:  # pragma: no cover - 失败时用于报错
+            failures.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+
+    assert not failures, failures
+    assert len(results) == 4
+    assert all(r.probed for r in results)
+    assert len(calls) == 1, f"并发探测没有单飞：executed {len(calls)} 次"
+
+    sp.clear_server_cache()

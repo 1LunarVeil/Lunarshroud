@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import logging
 import os
@@ -18,6 +19,7 @@ from pathlib import Path
 from config import DATA_DIR, DEFAULT_CONFIG, FRONTEND_DIR, get_config, is_frozen, update_config
 from core import history_store
 from core.capabilities import build_capabilities, model_summary
+from core.diagnostics import diagnose_instance, preflight
 from core.gpu_monitor import get_monitor
 from core.model_scanner import list_directory, scan_models
 from core.param_builder import (
@@ -27,6 +29,7 @@ from core.param_builder import (
     suppressed_params,
     validate_param_values,
 )
+from core.param_recipes import recipes_for_frontend
 from core.param_schema import get_default_params, get_schema_for_frontend
 from core.preset_store import (
     clone_preset,
@@ -38,7 +41,7 @@ from core.preset_store import (
     save_preset,
 )
 from core.process_manager import InstanceStatus, get_process_manager
-from core.server_probe import probe_server_cached, resolve_server_path
+from core.server_probe import probe_server_cached, probe_server_cached_only, resolve_server_path
 from core.vram_estimate import estimate_for_model, fit_verdict
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,15 +57,74 @@ INSECURE_DEV_MODE = (
 )
 LOGGER = logging.getLogger("lunarshroud.backend")
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
-TRUSTED_WEBVIEW_ORIGINS = frozenset({
-    "http://tauri.localhost",
-    "https://tauri.localhost",
-    "tauri://localhost",
-    "http://127.0.0.1:17520",
-    "http://localhost:17520",
-})
+def _configured_launcher_port() -> int:
+    """生效的启动器端口；任何异常值一律回落到默认值。
 
-# 就绪探测端点：**不要求令牌**，但要求请求方出示本次启动的 session_id。
+    不能直接 ``int(raw)``：那会把 ``3.5`` 截断成 ``3`` 并通过范围检查，
+    于是可信来源表指向一个我们根本不在听的端口 —— 而默认端口 17520 消失，
+    首启的实时推送就静默 403 了。
+    """
+    default = int(DEFAULT_CONFIG["launcher_port"])
+    raw = get_config().get("launcher_port", default)
+    if isinstance(raw, bool):
+        return default
+    if isinstance(raw, int):
+        port = raw
+    else:
+        try:
+            port = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return default
+    return port if 1 <= port <= 65535 else default
+
+
+def trusted_origins(port: int) -> frozenset[str]:
+    """Origins trusted for CORS **and** for the WebSocket handshake.
+
+    `launcher_port` 是用户可改的，而且 Tauri 外壳就是按它探测并连接的
+    （`configured_backend_port`）。所以同源浏览器的来源必须**由它派生**：
+    把默认端口写死进这张表，会让任何改过端口的人在源码运行通道里
+    每个 WebSocket 都被 403 拒掉，前端无限重连（实测 2 分钟 14 次），
+    而 HTTP 请求因为同源不受影响 —— 于是界面看着是好的，只有实时推送死了。
+    """
+    return frozenset({
+        "http://tauri.localhost",
+        "https://tauri.localhost",
+        "tauri://localhost",
+        f"http://127.0.0.1:{port}",
+        f"http://localhost:{port}",
+    })
+
+
+# 绑定端口在启动后不会变，所以这张表在导入时算一次即可；改端口需要重启，
+# 重启后监听端口与来源表会一起移动。
+#
+# LISTENING_PORT 是"本进程实际在听的端口"（导入期求值，环境变量覆盖已生效）。
+# 用户保存新的 launcher_port 后，配置立即变化而监听要等重启 —— 这期间页面
+# 仍从旧端口加载，来源表若只按新配置算，WebSocket 会全部 403（HTTP 同源不受
+# 影响，界面看着正常，只有实时推送死掉，与 R9 的症状相同）。
+LISTENING_PORT = _configured_launcher_port()
+TRUSTED_WEBVIEW_ORIGINS = trusted_origins(LISTENING_PORT)
+
+
+def current_trusted_origins() -> frozenset[str]:
+    """握手时**现算**的可信来源。
+
+    刻意不直接读上面那个常量：常量是导入期的快照，测试里改配置端口它不会动，
+    于是"把端口写死"这种错法能骗过所有断言（第一版测试就是这么空转的）。
+    走这个函数，测试就能真的证伪。
+
+    配置端口与实际监听端口可能不同（刚保存新端口、尚未重启）：两者都信任，
+    直到重启把监听移过去。多信任一个"本进程自己曾决定监听"的端口不扩大暴露面
+    —— 它本来就是启动时从同一份配置/环境变量推导出来的。
+    """
+    configured = _configured_launcher_port()
+    origins = trusted_origins(configured)
+    if configured != LISTENING_PORT:
+        origins = origins | trusted_origins(LISTENING_PORT)
+    return origins
+
+# 就绪探测端点：**不要求令牌**，用一次性 nonce 的 HMAC 摘要证明身份。
 #
 # 为什么不能沿用 /api/system/health：那个端点受令牌保护，于是外壳为了探测就绪
 # 必须在**尚未确认对端是谁**的时候就把令牌发出去（lib.rs 的 wait_backend_ready）。
@@ -70,11 +132,48 @@ TRUSTED_WEBVIEW_ORIGINS = frozenset({
 # 任意进程都能 bind 127.0.0.1:17520。拿到令牌即可调整套管理 API，进而把
 # llama_server_path 指向任意可执行文件。
 #
-# session_id 与令牌同为每次启动新生成的 256 位随机值，且只经环境传给我们自己
-# 拉起的子进程，所以"能答对 session_id"就等价于"对端是我拉起的那个后端"。
-# 它本身不是凭证：答对了也拿不到任何业务数据，只是让外壳确认身份，此后的请求
-# 才由前端带上令牌。
+# 早期用 session_id 做"反向证明"：外壳在请求里带上 session_id，后端回显即认为
+# 对端是自己拉起的后端。这是循环论证 —— session_id 是外壳自己写进 URL 发出去
+# 的，占了端口的进程只要把收到的值原样回显就能通过。现在改成挑战-应答：
+#   外壳 → 后端:  session=<session_id>&nonce=<32 字节随机十六进制>
+#   后端 → 外壳:  proof=HMAC-SHA256(token, "lunarshroud-ready-v1:"+nonce)
+# 令牌和它的任何可重放形式都不上线；会话号仍保留，只用于"这次启动"的关联与
+# 404 语义（答错会话号与"端口上没有我们的服务"不可区分）。
 READY_PATH = "/api/system/ready"
+
+# 就绪证明的域分隔前缀。把 HMAC 的用途钉死在这一个协议上：同一个令牌将来若
+# 还用于别的挑战（例如升级握手），两边的摘要不会互相通用。
+READY_PROOF_CONTEXT = b"lunarshroud-ready-v1:"
+
+
+def _constant_time_str_eq(expected: str, provided: str | None) -> bool:
+    """常量时间比较两个字符串；非 ASCII 输入不得让 compare_digest 抛异常。
+
+    ``hmac.compare_digest`` 对 str 只接受 ASCII：请求头里塞一个非 ASCII 字节
+    就能让旧实现抛 TypeError → 500。比较交给它之前先编码成 bytes。
+    """
+    if provided is None:
+        return False
+    return hmac.compare_digest(expected.encode("utf-8"), provided.encode("utf-8"))
+
+
+def readiness_proof(nonce: str, *, token: str | None = None) -> str:
+    """计算 ``HMAC-SHA256(token, "lunarshroud-ready-v1:" + nonce)``（小写十六进制）。
+
+    这是"对端确实是外壳拉起的那个后端"的真正证明：令牌从不出现在探测请求或
+    响应里，外壳只公开一个自己随机选的 nonce；只有持有令牌的后端能算出对应
+    摘要。占住端口的本地进程看到 nonce 也算不出来 —— 它看到的是**问题**，
+    不是**答案**。（旧设计让后端回答 session_id，而 session_id 是外壳自己写在
+    请求 URL 里发过去的，任何收到请求的进程都能原样回显，因此不能证明身份。）
+    """
+    active_token = SESSION_TOKEN if token is None else token
+    if not active_token or not nonce:
+        return ""
+    return hmac.new(
+        active_token.encode("utf-8"),
+        READY_PROOF_CONTEXT + nonce.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def configure_file_logging(log_dir: Path) -> logging.Logger:
@@ -104,7 +203,7 @@ def session_token_is_valid(expected: str, provided: str | None) -> bool:
     """Packaged sessions require a token; open development is explicit."""
     if not expected:
         return INSECURE_DEV_MODE
-    return provided is not None and hmac.compare_digest(expected, provided)
+    return _constant_time_str_eq(expected, provided)
 
 
 def resolve_frontend_file(path: str) -> Path | None:
@@ -122,7 +221,7 @@ def resolve_frontend_file(path: str) -> Path | None:
 def websocket_session_is_valid(ws: WebSocket) -> tuple[bool, bool]:
     """Validate browser origin and the private token carried as a subprotocol."""
     origin = ws.headers.get("origin")
-    if origin and origin not in TRUSTED_WEBVIEW_ORIGINS:
+    if origin and origin not in current_trusted_origins():
         return False, False
     protocols = [
         item.strip()
@@ -190,11 +289,28 @@ def _warm_server_probe() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期：启动时初始化"""
-    configure_file_logging(DATA_DIR / "logs")
+    # 日志文件不是启动的必要条件：数据目录只读/被杀软锁住时，写不了文件
+    # 也必须让服务起来（否则 uvicorn 以 exit 3 退出，启动器只能看到"后端
+    # 启动失败"）。真正的补救是 config._frozen_data_dir 的可写目录探测。
+    try:
+        configure_file_logging(DATA_DIR / "logs")
+    except OSError:
+        LOGGER.exception("file logging unavailable; continuing without it")
     history_store.init_db()
+    # 外壳关闭窗口时通过 Job Object 直接终止后端，lifespan 的清理钩子不会执行；
+    # 上一进程遗留的 starting/running/stopping 记录必须在这里收口，否则历史页
+    # 会永远显示一个早已不存在的实例"运行中"（实测库里有数周前的记录）。
+    interrupted = history_store.mark_unfinished_as_interrupted()
+    if interrupted:
+        LOGGER.warning(
+            "marked %d unfinished launch history row(s) as interrupted", interrupted
+        )
     # 旧版本可能把 api_key 明文写进历史库；全表清洗只在启动时做一次
     history_store.scrub_legacy_secrets()
-    LOGGER.info("backend started pid=%s session=%s", os.getpid(), SESSION_ID or "development")
+    # session_id is a per-launch shared identifier for the readiness probe; it
+    # is not the management token, but support logs are often pasted publicly,
+    # so there is no reason to write it out (R10).
+    LOGGER.info("backend started pid=%s", os.getpid())
     print("[启动器] 历史数据库已初始化")
     _warm_server_probe()
     yield
@@ -312,13 +428,7 @@ async def no_cache_middleware(request: Request, call_next):
 # TypeError，前端 api.js 的 401 会话恢复分支永远读不到状态码。
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://tauri.localhost",
-        "https://tauri.localhost",
-        "tauri://localhost",
-        "http://127.0.0.1:17520",
-        "http://localhost:17520",
-    ],
+    allow_origins=sorted(TRUSTED_WEBVIEW_ORIGINS),
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["Content-Type", "X-LunarShroud-Token"],
@@ -350,15 +460,27 @@ async def api_system_health():
 
 
 @app.get(READY_PATH)
-async def api_system_ready(session: str = Query("", max_length=128)):
-    """外壳的就绪探测：以 session_id 证明"我就是你拉起的那个后端"。
+async def api_system_ready(
+    session: str = Query("", max_length=128),
+    nonce: str = Query("", max_length=128),
+):
+    """外壳的就绪探测：以 nonce 的 HMAC 证明"我就是你拉起的那个后端"。
 
-    不带任何令牌，因此外壳无需在确认对端身份之前泄露秘密。答错一律 404 ——
-    不给"这个端口上确实有个 LunarShroud"这种确认信息。
+    不带任何令牌，因此外壳无需在确认对端身份之前泄露秘密。答错会话号一律
+    404 —— 不给"这个端口上确实有个 LunarShroud"这种确认信息。
+
+    响应里的 ``proof`` 是 ``HMAC-SHA256(token, context+nonce)``。没有 nonce
+    （或后端跑在不安全开发模式、根本没有令牌）时不返回 proof：外壳据此拒绝
+    把对端认成自己的后端。占端口的进程看得到 nonce，但没有令牌算不出 proof。
     """
-    if not SESSION_ID or not hmac.compare_digest(SESSION_ID, session):
+    if not SESSION_ID or not _constant_time_str_eq(SESSION_ID, session):
         raise HTTPException(404, "no such session")
-    return {"status": "ready", "session_id": SESSION_ID, "pid": os.getpid()}
+    return {
+        "status": "ready",
+        "session_id": SESSION_ID,
+        "pid": os.getpid(),
+        "proof": readiness_proof(nonce),
+    }
 
 @app.get("/api/system/config")
 async def api_get_config():
@@ -516,6 +638,21 @@ async def api_param_defaults():
     return get_default_params()
 
 
+@app.get("/api/params/recipes")
+async def api_param_recipes():
+    """用途配方：一键把参数面板切到某个用途（对话 / 嵌入 / 重排 / 只读工具 / Agent）。
+
+    与 schema 同一口径：**只读探测缓存**（这是页面加载就要拉的接口，不许为它跑
+    ``--help``），并逐键标出本机构建不支持的项，前端据此置灰。配方只写意图
+    （"这是个嵌入服务"），不写调优数字、不写模型路径 —— 那些会随 llama.cpp
+    版本漂移，见 ``core/param_recipes.py`` 的模块文档。
+    """
+    configured = get_config().get("llama_server_path", "")
+    exe = resolve_server_path(configured) or configured
+    probe = probe_server_cached_only(exe) if exe else None
+    return {"recipes": recipes_for_frontend(probe)}
+
+
 @app.post("/api/params/build-command")
 async def api_build_command(body: dict):
     """根据参数构建命令行字符串（前端实时预览用）"""
@@ -527,7 +664,8 @@ async def api_build_command(body: dict):
     # schema 声明的 min/max/options 在预览路径同样生效：不合法取值让预览变成
     # 错误行（走全局 ValueError 处理器 → 400），而不是给出一条跑不起来的命令。
     # 与启动路径 _validate_start 用的是同一份校验、同一类错误返回。
-    validate_param_values(params)
+    # cached_only：预览是高频路径，绝不为了校验起子进程跑 --help。
+    validate_param_values(params, probe=probe_server_cached_only(llama_server_path))
     argv = build_argv(params, llama_server_path)
     return {
         "argv": redact_argv(argv),
@@ -640,11 +778,11 @@ async def api_diff_presets(body: dict):
 @app.get("/api/models/vram-estimate")
 async def api_vram_estimate(
     model: str,
-    ctx_size: int = 8192,
+    ctx_size: int = Query(8192, ge=512, le=1_048_576),
     n_gpu_layers: str = "99",
     cache_type_k: str = "f16",
     cache_type_v: str = "f16",
-    parallel: int = 1,
+    parallel: int = Query(1, ge=1, le=256),
     mmproj: str | None = None,
 ):
     """按**当前参数值**估算显存占用（GiB），并对照真实显卡容量给出风险等级。
@@ -732,21 +870,32 @@ async def api_list_instances():
     return [inst.to_dict() for inst in pm.list_instances()]
 
 
-@app.post("/api/instances")
-async def api_create_instance(body: dict):
-    """启动新实例
+def _record_launch_history(inst) -> None:
+    """启动历史回调：在监控线程启动前写入一条 starting 记录。
 
-    请求体：
-    - preset_id: 使用已有预设启动（优先）
-    - params: 直接传参数启动（与 preset_id 二选一）
-    - name: 实例名（可选）
+    字段直接取自实例对象（preset/params/command 与本次启动完全一致），
+    因此**直接启动、重启、历史重启三条路径共用同一份实现**，
+    重启世代在历史页不再消失（独立审计 M1）。
     """
-    pm = get_process_manager()
-    preset_id = body.get("preset_id")
-    name = body.get("name")
-    if name is not None and (not isinstance(name, str) or len(name) > 100):
-        raise HTTPException(400, "instance name must be a string of at most 100 characters")
+    inst.history_record_id = history_store.record_launch(
+        instance_id=inst.id,
+        preset_id=inst.preset_id,
+        preset_name=inst.preset_name,
+        model_path=str(inst.params.get("model", "")),
+        port=inst.port,
+        params=inst.params,
+        command_text=inst.command_string,
+        status="starting",
+    )
 
+
+def _launch_params_from_body(body: dict) -> tuple[str | None, str | None, dict]:
+    """从启动请求体解析出 (preset_id, preset_name, params)。
+
+    启动与"启动前检查"必须读**同一份**参数：如果诊断走另一套解析，用户看到的
+    检查结果就可能与实际命令行不一致（多一个覆盖、少一个预设值）。
+    """
+    preset_id = body.get("preset_id")
     if preset_id:
         p = get_preset(preset_id)
         if p is None:
@@ -759,26 +908,42 @@ async def api_create_instance(body: dict):
             raise HTTPException(400, "either preset_id or params is required")
         preset_name = None
 
-    # 覆盖参数（用户在启动前临时修改的）
     overrides = body.get("param_overrides") or {}
     if not isinstance(overrides, dict):
         raise HTTPException(400, "param_overrides must be an object")
     params.update(overrides)
+    return preset_id, preset_name, params
+
+
+@app.post("/api/diagnose")
+async def api_diagnose(body: dict):
+    """启动前检查：把可预见的失败（路径/模型/嵌入端点/显存/端口…）列出来。
+
+    只读、无副作用；不会创建实例或占用端口。`server_path` 从当前配置读取。
+    """
+    _, _, params = _launch_params_from_body(body)
+    return await asyncio.to_thread(preflight, params)
+
+
+@app.post("/api/instances")
+async def api_create_instance(body: dict):
+    """启动新实例
+
+    请求体：
+    - preset_id: 使用已有预设启动（优先）
+    - params: 直接传参数启动（与 preset_id 二选一）
+    - name: 实例名（可选）
+    """
+    pm = get_process_manager()
+    name = body.get("name")
+    if name is not None and (not isinstance(name, str) or len(name) > 100):
+        raise HTTPException(400, "instance name must be a string of at most 100 characters")
+
+    preset_id, preset_name, params = _launch_params_from_body(body)
 
     # 记录启动历史：作为 on_launched 回调传入，在监控线程启动前写入，
-    # 避免快速退出的实例在记录就绪前触发状态同步而丢失 FAILED/退出码
-    def _record_launch_history(inst) -> None:
-        inst.history_record_id = history_store.record_launch(
-            instance_id=inst.id,
-            preset_id=preset_id,
-            preset_name=preset_name,
-            model_path=params.get("model", ""),
-            port=inst.port,
-            params=params,
-            command_text=inst.command_string,
-            status="starting",
-        )
-
+    # 避免快速退出的实例在记录就绪前触发状态同步而丢失 FAILED/退出码。
+    # 实现见模块级 _record_launch_history（与重启/历史重启共用，审计 M1）。
     try:
         inst = await asyncio.to_thread(
             pm.start_instance,
@@ -790,6 +955,11 @@ async def api_create_instance(body: dict):
         )
     except (ValueError, FileNotFoundError) as e:
         raise HTTPException(400, str(e)) from e
+    except OSError as e:
+        # Popen 失败（路径不是可执行文件、权限不足、被杀软拦截…）此前会变成
+        # 裸 500：异常在启动路径上已经翻译成可读消息，但接口没接住。前端因此
+        # 只能显示 "Internal Server Error"，用户看不到真正原因。
+        raise HTTPException(400, f"launch failed: {e}") from e
     except RuntimeError as e:
         raise HTTPException(409, str(e)) from e
 
@@ -804,6 +974,24 @@ async def api_get_instance(instance_id: str):
     if inst is None:
         raise HTTPException(404, f"instance not found: {instance_id}")
     return inst.to_dict(include_logs=True, log_limit=500)
+
+
+@app.get("/api/instances/{instance_id}/diagnosis")
+async def api_instance_diagnosis(instance_id: str):
+    """失败归因：从退出码与日志尾部解释"为什么没起来"。
+
+    只对 FAILED 实例计算；运行中/已停止返回空列表（它们没有"失败"可解释）。
+    """
+    pm = get_process_manager()
+    inst = pm.get_instance(instance_id)
+    if inst is None:
+        raise HTTPException(404, f"instance not found: {instance_id}")
+    diagnosis = (
+        await asyncio.to_thread(diagnose_instance, inst)
+        if inst.status == InstanceStatus.FAILED
+        else []
+    )
+    return {"instance_id": instance_id, "status": inst.status.value, "diagnosis": diagnosis}
 
 
 @app.get("/api/instances/{instance_id}/command")
@@ -836,10 +1024,16 @@ async def api_restart_instance(instance_id: str):
     """重启实例"""
     pm = get_process_manager()
     try:
-        inst = await asyncio.to_thread(pm.restart_instance, instance_id)
+        # 重启世代也写启动历史（独立审计 M1）：与直接启动共用同一份回调
+        inst = await asyncio.to_thread(
+            pm.restart_instance, instance_id, on_launched=_record_launch_history
+        )
         return inst.to_dict()
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
+    except OSError as e:
+        # 与 api_create_instance 同口径：Popen 失败要给可读的 400，不是裸 500。
+        raise HTTPException(400, f"restart failed: {e}") from e
     except RuntimeError as e:
         # 端口范围耗尽等可预期冲突，与 api_create_instance 同口径返回 409
         raise HTTPException(409, str(e)) from e
@@ -954,6 +1148,12 @@ async def api_relaunch_history(record_id: int):
     if params is None:
         raise HTTPException(404, f"history record not found: {record_id}")
 
+    # relaunch 语义 = "照这份记录再起一个"，不沿用记录里的端口、走自动分配：
+    # 否则对仍在运行的世代（或其端口已被占用）点重启会撞 400「端口被占用」
+    # （第二轮独立复核 N2 实测的边界）。直接启动路径的显式端口不受影响。
+    params = dict(params)
+    params.pop("port", None)
+
     pm = get_process_manager()
     try:
         inst = await asyncio.to_thread(
@@ -961,9 +1161,12 @@ async def api_relaunch_history(record_id: int):
             params=params,
             preset_id=None,
             preset_name="历史重启",
+            on_launched=_record_launch_history,
         )
     except (ValueError, FileNotFoundError) as e:
         raise HTTPException(400, str(e)) from e
+    except OSError as e:
+        raise HTTPException(400, f"launch failed: {e}") from e
     except RuntimeError as e:
         # 与 api_create_instance 同口径：端口耗尽等资源冲突返回 409 而非 500
         raise HTTPException(409, str(e)) from e

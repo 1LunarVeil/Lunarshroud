@@ -1,8 +1,31 @@
 # Maintenance tools
 
-The only routine deployment tool here is `Publish-PortableRuntime.ps1`. It
-copies and hash-verifies the launcher and backend sidecar, then updates the
-Desktop shortcut.
+The routine deployment tool is `Publish-PortableRuntime.ps1`. It copies and
+hash-verifies the launcher and backend sidecar, then updates the Desktop
+shortcut. Relative `-Destination` / `-BackupDirectory` values are resolved
+against PowerShell's current location, not .NET's current directory — the two
+can differ after `Set-Location`, and `-Destination .` once deployed into
+`src-tauri\` by mistake.
+
+### User-data backup and restore
+
+Close LunarShroud first. Both scripts run under Windows PowerShell 5.1:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\Backup-UserData.ps1
+# => .\LunarShroud-backup-<timestamp>\ with SHA256SUMS.txt
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\Restore-UserData.ps1 `
+    -BackupDirectory .\LunarShroud-backup-20261017-203000
+```
+
+Backup copies `config.json`, `history.db` (plus WAL/SHM sidecars) and
+`presets\`; logs are optional via `-IncludeLogs`. Restore verifies the manifest
+before touching anything, renames the current data directory to
+`LunarShroud.pre-restore-<timestamp>`, then copies and re-verifies. Do not use
+`Get-FileHash` in these scripts: PowerShell 5.1 launched from a PowerShell 7
+environment can inherit a `PSModulePath` where the Utility module fails to
+auto-load; the tools use .NET SHA-256 instead.
 
 ### Release mirror gate (`check_release_mirror.py`)
 

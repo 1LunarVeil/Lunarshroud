@@ -16,6 +16,7 @@ import * as presets from './presets.js?v=1';
 import * as logs from './logs.js?v=1';
 import * as monitor from './monitor.js?v=1';
 import * as history from './history.js?v=1';
+import * as help from './help.js?v=1';
 import * as settings from './settings.js?v=1';
 
 // 页面注册表（顺序 = 侧边栏顺序）
@@ -28,6 +29,7 @@ const PAGES = [
   logs,
   monitor,
   history,
+  help,
   settings,
 ];
 
@@ -63,8 +65,14 @@ export function showToast(message, type = 'info', duration = 3000) {
 
 // ========== 全局 Modal ==========
 
-export function showModal(title, contentHtml, actions = []) {
+// 关闭回调：某些调用方（启动前检查）需要知道用户是"点了按钮"还是"按了 X /
+// 点了遮罩"关闭的，否则 Promise 永远不 resolve。showModal 的第四个参数是可选的，
+// 既有三参数调用完全不受影响。
+let _modalCloseHook = null;
+
+export function showModal(title, contentHtml, actions = [], options = {}) {
   closeModal();
+  _modalCloseHook = typeof options.onClose === 'function' ? options.onClose : null;
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
   overlay.id = 'app-modal-overlay';
@@ -126,8 +134,20 @@ function modalSizeClass(actions) {
 }
 
 export function closeModal() {
+  const hook = _modalCloseHook;
+  _modalCloseHook = null;
+  if (hook) {
+    try {
+      hook();
+    } catch (e) {
+      console.error('[modal onClose]', e);
+    }
+  }
   const existing = document.getElementById('app-modal-overlay');
   if (existing) existing.remove();
+  // 浮层整体销毁后，模块作用域上的防抖计时器必须有机会自清 ——
+  // 否则关窗后仍会触发一次请求（审计 R6 的 param_editor 条目）。
+  document.dispatchEvent(new CustomEvent('modal-closed'));
 }
 
 // ========== Confirm（基于 Modal） ==========
@@ -208,6 +228,9 @@ const STATUS_KEYS = {
   stopping: 'badge.stopping',
   idle: 'badge.idle',
   success: 'badge.success',
+  // 上一进程遗留的未终止记录（窗口关闭时后端被 Job Object 直接终止）：
+  // 它既不是"运行中"也不是"失败"，必须有自己的状态，见 history_store 的启动收口。
+  interrupted: 'badge.interrupted',
 };
 
 export function statusBadge(status) {
@@ -247,13 +270,22 @@ export async function copyToClipboard(text) {
 // ========== 主题切换 ==========
 
 export function getTheme() {
-  return localStorage.getItem('lunarshroud_theme') || 'dark';
+  try {
+    return localStorage.getItem('lunarshroud_theme') || 'dark';
+  } catch {
+    // 存储不可用（隐私模式/策略限制）时退回默认，不能因此白屏（审计 R6）
+    return 'dark';
+  }
 }
 
 export function setTheme(theme) {
   document.body.classList.remove('theme-dark', 'theme-light');
   document.body.classList.add(theme === 'dark' ? 'theme-dark' : 'theme-light');
-  localStorage.setItem('lunarshroud_theme', theme);
+  try {
+    localStorage.setItem('lunarshroud_theme', theme);
+  } catch {
+    // 持久化失败只影响下次启动的初始主题，本次会话照常生效
+  }
   // 通知 monitor 等需要重绘的页面
   document.dispatchEvent(new CustomEvent('theme-changed', { detail: { theme } }));
 }
@@ -464,6 +496,7 @@ function renderSidebar() {
     logs: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/></svg>',
     monitor: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>',
     history: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
+    help: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
     settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>',
   };
   const sidebar = document.getElementById('sidebar');

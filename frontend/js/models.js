@@ -9,6 +9,7 @@
 // 列表若去付详情的代价，一个几百模型的目录会卡几十秒。
 
 import { t, localizeBackendError } from './i18n.mjs';
+import { confirmLaunch } from './preflight.mjs';
 import { renderList, emptyStateHtml } from './panel_views.mjs';
 
 export const id = 'models';
@@ -202,10 +203,20 @@ function badgeHtml(caps) {
   if (caps.is_assistant_model) {
     return `<span class="tag tag-default">${ctx.escapeHtml(t('models.badgeAssistant'))}</span>`;
   }
-  if (caps.provides_builtin_mtp) {
-    return `<span class="tag">${ctx.escapeHtml(t('models.badgeBuiltinMtp'))}</span>`;
+  const tags = [];
+  if (caps.truncated) {
+    tags.push(`<span class="tag tag-warn">${ctx.escapeHtml(t('models.badgeTruncated'))}</span>`);
   }
-  return '';
+  if (caps.provides_builtin_mtp) {
+    tags.push(`<span class="tag">${ctx.escapeHtml(t('models.badgeBuiltinMtp'))}</span>`);
+  }
+  if (caps.is_embedding_model) {
+    tags.push(`<span class="tag tag-default">${ctx.escapeHtml(t('models.badgeEmbedding'))}</span>`);
+  }
+  if (caps.is_reranker_model) {
+    tags.push(`<span class="tag tag-default">${ctx.escapeHtml(t('models.badgeReranker'))}</span>`);
+  }
+  return tags.join(' ');
 }
 
 // ========== 正文：选中模型的能力详情 ==========
@@ -248,7 +259,11 @@ async function renderDetail() {
       try {
         const payload = await ctx.Api.getCapabilities(model.path);
         precise = (payload && payload.model) || null;
-        if (precise) detailCache.set(model.path, precise);
+        if (precise) {
+          // 上限防止长会话无界增长（审计 R7）
+          if (detailCache.size >= 64) detailCache.clear();
+          detailCache.set(model.path, precise);
+        }
       } catch (e) {
         precise = null;
         ctx.showToast(`${t('models.capabilityFailed')}: ${localizeBackendError(e.message)}`, 'warning');
@@ -263,7 +278,9 @@ async function renderDetail() {
   if (selectedPath !== model.path) return;
   const body = el.querySelector('#model-caps-body');
   if (!body) return;
-  body.innerHTML = precise ? capabilitiesHtml(precise) : unparsableHtml(caps);
+  // probed=false（探测失败）与 null 都走"不可解析"分支：把未探测结果当能力卡
+  // 渲染会显示误导性的空能力（审计 R6）。
+  body.innerHTML = precise && precise.probed ? capabilitiesHtml(precise) : unparsableHtml(caps);
 }
 
 function headerCard(model, caps) {
@@ -319,7 +336,10 @@ function capabilitiesHtml(caps) {
   ].filter(([, value]) => value !== null && value !== undefined && value !== '');
 
   const badges = [];
+  if (caps.truncated) badges.push([t('models.badgeTruncated'), 'tag tag-warn']);
   if (caps.provides_builtin_mtp) badges.push([t('models.badgeBuiltinMtp'), 'tag']);
+  if (caps.is_embedding_model) badges.push([t('models.badgeEmbedding'), 'tag tag-default']);
+  if (caps.is_reranker_model) badges.push([t('models.badgeReranker'), 'tag tag-default']);
   if (caps.has_vision_encoder) badges.push([t('models.badgeVision'), 'tag']);
   if (caps.is_assistant_model) badges.push([t('models.badgeAssistant'), 'tag tag-default']);
   if (caps.is_mmproj) badges.push([t('models.badgeMmproj'), 'tag tag-default']);
@@ -467,15 +487,22 @@ async function launch(model, caps, button) {
   if (suggestedDraft) overrides.model_draft = suggestedDraft;
   // 原生上下文是硬上限，用它作为初始 ctx 比默认值更贴近模型真实能力
   if (caps && caps.context_length) overrides.ctx_size = caps.context_length;
+  // 直接启动嵌入/重排模型时补上它需要的端点开关。这不是"猜参数"：
+  // is_embedding_model 来自 GGUF 的 causal/pooling 元数据，而缺 --embeddings
+  // 的单槽位组合在部分 llama.cpp 版本上会触发上游断言。
+  if (caps && caps.is_embedding_model) overrides.embeddings = true;
+  if (caps && caps.is_reranker_model) overrides.rerank = true;
 
   button.disabled = true;
   try {
     const defaults = await ctx.Api.getParamDefaults();
-    const instance = await ctx.Api.createInstance({
+    const body = {
       params: defaults,
       param_overrides: overrides,
       name: model.filename,
-    });
+    };
+    if (!(await confirmLaunch(ctx, body))) return;
+    const instance = await ctx.Api.createInstance(body);
     ctx.showToast(t('models.launched', { name: instance.name, port: instance.port }), 'success');
   } catch (e) {
     ctx.showToast(`${t('models.launchFailed')}: ${localizeBackendError(e.message)}`, 'error');
