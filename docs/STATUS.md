@@ -102,6 +102,13 @@ broken TEMP   launcher + backend reach ready with TEMP/TMP pointing at a
 single inst.  second launch exits 0; exactly one launcher/backend remain
 fallback      all normal user-data env vars unusable: backend uses
               <app>\backend\data; edited launcher_port=17531 is honored
+real model    deployed launcher + Qwen3.5-4B Q4_K_M: RUNNING, raw
+              /completion text, /v1/chat/completions content "OK", stop,
+              port release, history stopped, no residue; isolated APPDATA
+              and the real user data byte-identical before/after
+soak          partial 15-minute real-model run: 402/402 requests, 0 failures,
+              min/avg/max 0.203/0.242/0.281 s, llama-server RSS ~3.18 GB
+              flat for the whole run; the full 4–8 h soak remains open
 ```
 
 A follow-up independent verification (R8, 2026-10-18) reproduced the deployed
