@@ -243,6 +243,14 @@ lifespan 的 `init_db()` 抛 `DatabaseError`，进程以 exit 3 退出，用户�
 部署脚本还必须**拒绝**缺少 `_internal/` 的构建，并在换入/校验失败时恢复旧的
 launcher/backend/runtime 三段（不能留下"新 exe + 旧运行时"的混合对）。
 
+安装器的 `NSIS_HOOK_PREUNINSTALL`（`src-tauri/nsis/hooks.nsh`）必须清理应用在
+安装目录创建的 `webview2-data/`、`runtime-temp/`、`logs/`、`launcher-boot.log`、
+`debug.log`、`backend/backend-child.log`；**绝不能**删除 `backend/data`
+（受限运行的回退用户数据）或 `%APPDATA%`/`%LOCALAPPDATA%` 里的用户配置。
+没有这个钩子时，跑过一次应用的安装目录在卸载后会残留整份 WebView2 缓存。
+钉它的证据：2026-10-18 静默安装 → 安装版启动 → 静默卸载，卸载后安装目录被
+移除，真实用户数据哈希前后一致。
+
 *为什么*：onefile 每次启动要解压 ~20 MB 到 `%TEMP%`，在用户的临时目录被
 重定向/只读/安全软件拦截时，PyInstaller 只弹 "Could not create temporary
 directory!" 然后挂住，启动器拿不到可读原因；强杀还会在 Temp 里留下解压目录

@@ -44,6 +44,7 @@ Notable changes follow the Keep a Changelog structure. The project is currently 
 - Non-idempotent API calls are no longer automatically retried on network errors (which could create duplicate instances/presets); missing static assets return 404 (an explicit favicon link keeps the console clean); an unreadable config is never overwritten with defaults; GPU sampling for VRAM estimates runs off the event loop.
 - The release mirror gate fails closed when `github/` is missing, checks privacy/forbidden rules before `--apply` writes, and excludes runtime directories created beside the exe.
 - The portable deployer rejects an incomplete onedir build and swaps launcher/backend/runtime together with rollback.
+- The NSIS uninstaller now removes the WebView2 profile, runtime temp, logs and diagnostic files the app creates beside the exe; user data in `%APPDATA%`/`%LOCALAPPDATA%` is untouched. Silent install → installed-app start → silent uninstall was re-run against the built pair.
 
 ### Changed
 

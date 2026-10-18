@@ -20,7 +20,7 @@ coverage   --cov=backend --cov-fail-under=75        88.01% (gate 75)
 frontend   node --test frontend/tests/*.mjs          21 passed
 syntax     node --check (17 files)                   clean
 lint       python -m ruff check backend tools        clean
-mirror     tools/check_release_mirror.py             CLEAN, 154 files
+mirror     tools/check_release_mirror.py             CLEAN, 155 files
 rust       cargo fmt/clippy/test                     clean, 22 passed
 build      PyInstaller onedir, pinned env            backend.exe A1BAACAA…
 ```
@@ -94,7 +94,7 @@ Verification for this revision:
 pytest        533 passed, coverage 88.01%
 frontend      21 passed, 17 JS files syntax-clean
 rust          fmt/clippy clean, 22 tests
-mirror        CLEAN, 154 files
+mirror        CLEAN, 155 files
 packaged      tmp/release_smoke.py: 22/22 (isolated APPDATA, dead proxy,
               HMAC readiness, token rotation, Job reaping, clean-shutdown log)
 broken TEMP   launcher + backend reach ready with TEMP/TMP pointing at a
@@ -248,9 +248,9 @@ Built in this workspace with `SOURCE_DATE_EPOCH=1790000000`,
 `tools/Publish-PortableRuntime.ps1 -Destination . -SkipDesktopShortcut`:
 
 ```text
-launcher  2003E4A6C983E4544C006F7704B3D97E6408FB39497F2EA19BD9258DBC48B9F8
+launcher  0E778DD0C7AFDB1C0DAA17A7D24FFEC3498DB1BE0E61B75AD9FA820627DA3DD8
 backend   A1BAACAA21FD6CDC49CBF8E7DA79556AA21D44056630627E87BF1A59ABD93B5E
-installer 7FE43CDA8026F271F684EA3B4AE4AE402CC18A741E1BABA9F00142EB51B080C0
+installer 4C43948374E8F6F14BE2ECB323D0BA4181E2ACE390576A6C4DF9774649AC0657
           (src-tauri/target/release/bundle/nsis/LunarShroud_0.9.0-beta.2_x64-setup.exe)
 ```
 
@@ -258,6 +258,25 @@ The earlier `854F95A7` build was run twice and produced the same `backend.exe`
 hash both times. The 2026-10-18 hardening rebuild (`A1BAACAA…`) was built once;
 byte-reproducibility of this round's launcher is not claimed. The NSIS installer
 is still not byte-reproducible (makensis metadata).
+
+**NSIS install/uninstall re-verified (2026-10-18, authorized).** Silent install
+into a temporary directory exited 0; the installed pair contained the matching
+backend (`A1BAACAA…`), 757 `_internal` entries and an installer-patched launcher.
+The installed app reached `backend ready`, answered 401/404 and the HMAC
+readiness proof, accepted the token, closed via WM_CLOSE, and left no
+backend/port. Silent uninstall exited 0; the new `NSIS_HOOK_PREUNINSTALL`
+(`src-tauri/nsis/hooks.nsh`) removed the app-created `webview2-data/`,
+`runtime-temp/`, `logs/`, `launcher-boot.log`, `debug.log` and
+`backend/backend-child.log`, so the install directory was removed. User data in
+`%APPDATA%`/`%LOCALAPPDATA%` was byte-identical before/after, and the
+desktop/Start Menu shortcuts were restored.
+
+The Add/Remove Programs registry entry could **not** be observed in this
+session: a minimal NSIS installer also fails to write `HKCU` here while a Python
+probe in the same task succeeds, so this is an environment restriction rather
+than a confirmed product defect. The 2026-10-17 round observed the entry on a
+normal desktop; verify it once more in a normal interactive session before
+release.
 
 **The sidecar is now PyInstaller `onedir` (2026-10-18).** The first beta.2
 deployment still failed on the user's machine with PyInstaller's
