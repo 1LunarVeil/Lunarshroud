@@ -7,6 +7,9 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <title>LunarShroud</title>
+  <!-- 显式声明图标：否则浏览器会请求 /favicon.ico，在 SPA 静态资源 404
+       规则下表现为一条 console 错误。 -->
+  <link rel="icon" href="/assets/logo.png?v=2" />
   <link rel="stylesheet" href="/css/tokens.css?v=1" />
   <link rel="stylesheet" href="/css/style.css?v=1" />
 </head>

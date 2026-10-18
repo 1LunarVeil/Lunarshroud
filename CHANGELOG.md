@@ -41,7 +41,7 @@ Notable changes follow the Keep a Changelog structure. The project is currently 
 - Capability results from an incomplete `--help` no longer report supported flags as unsupported.
 - In restricted environments the launcher and backend now choose the same writable data directory, so a saved `launcher_port` is honored instead of being overridden by the old `%APPDATA%` value.
 - Single-instance mutex failures no longer show "already running"; crash-loop restarts back off to 30 s; WebView2 falls back to `%LOCALAPPDATA%` when the exe directory is read-only; the readiness probe caps the response body and refuses redirects; a normal close always logs the backend exit.
-- Non-idempotent API calls are no longer automatically retried on network errors (which could create duplicate instances/presets); missing static assets return 404; an unreadable config is never overwritten with defaults; GPU sampling for VRAM estimates runs off the event loop.
+- Non-idempotent API calls are no longer automatically retried on network errors (which could create duplicate instances/presets); missing static assets return 404 (an explicit favicon link keeps the console clean); an unreadable config is never overwritten with defaults; GPU sampling for VRAM estimates runs off the event loop.
 - The release mirror gate fails closed when `github/` is missing, checks privacy/forbidden rules before `--apply` writes, and excludes runtime directories created beside the exe.
 - The portable deployer rejects an incomplete onedir build and swaps launcher/backend/runtime together with rollback.
 

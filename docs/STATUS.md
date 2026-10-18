@@ -75,8 +75,9 @@ tested red-green and rebuilt into the deployed pair:
   stdout lines cannot reopen a finalized instance log; an unreadable config is
   never overwritten with defaults; `/api/models/vram-estimate` samples GPUs
   off the event loop; missing static assets return 404 instead of
-  `index.html`; deleting an unknown instance returns 404; NVML's
-  `NVML_VALUE_NOT_AVAILABLE` sentinel is reported as unknown.
+  `index.html` (with an explicit favicon link, so the browser no longer
+  requests a missing `/favicon.ico`); deleting an unknown instance returns
+  404; NVML's `NVML_VALUE_NOT_AVAILABLE` sentinel is reported as unknown.
 - **Release mirror gate.** Missing `github/` now fails closed (opt-in
   `--allow-missing-mirror` for the public mirror itself); `--apply` runs the
   privacy/forbidden checks *before* writing anything; runtime directories
