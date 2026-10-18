@@ -116,7 +116,7 @@ def _nvml_gpu_processes(managed_pids: list[int] | None) -> list[dict[str, Any]] 
             for item in running:
                 pid = int(item.pid)
                 memory = getattr(item, "usedGpuMemory", 0) or 0
-                memory_mb = round(memory / 1024 / 1024) if memory else None
+                memory_mb = _nvml_memory_mb(memory)
                 name = None
                 try:
                     name = _nvml_str(pynvml.nvmlSystemGetProcessName(pid))
@@ -157,9 +157,20 @@ def _nvidia_smi() -> str | None:
     if os.name != "nt":
         return "nvidia-smi"
     system = system_tool("nvidia-smi.exe")
-    if os.path.isfile(system):
+    if system is not None and os.path.isfile(system):
         return system
     return which_on_path("nvidia-smi.exe")
+
+
+# NVML 在 Windows WDDM 下用这个哨兵表示"显存不可得"（2^64-1）。
+# 不识别它会把 17,592,186,044,416 MB 显示给用户。
+_NVML_VALUE_NOT_AVAILABLE = 0xFFFFFFFFFFFFFFFF
+
+
+def _nvml_memory_mb(memory: int | None) -> int | None:
+    if not memory or memory <= 0 or memory >= _NVML_VALUE_NOT_AVAILABLE:
+        return None
+    return round(memory / 1024 / 1024)
 
 
 def _parse_int(value: str) -> int | None:

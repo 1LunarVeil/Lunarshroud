@@ -274,7 +274,14 @@ def _warm_server_probe() -> None:
                 # 并执行，而解析的第一站是用户可写的应用目录（见 config.DEFAULT_CONFIG）。
                 LOGGER.info("llama-server 未配置，跳过能力探测预热")
                 return
-            exe = resolve_server_path(configured) or configured
+            # 解析失败时**绝不退回原始裸名**：那会让 probe 相对 CWD 命中一个
+            # 用户可写的同名文件并在启动时零交互执行（AGENTS §2.1）。
+            exe = resolve_server_path(configured)
+            if not exe:
+                LOGGER.warning(
+                    "llama-server 路径无法解析，跳过能力探测预热: %r", configured
+                )
+                return
             probe = probe_server_cached(exe)
             LOGGER.info(
                 "llama-server 能力探测预热完成 probed=%s options=%d",
@@ -514,8 +521,9 @@ async def api_system_capabilities(model: str | None = None):
     启动器只监听 127.0.0.1（backend/config.py 强制），与既有设计一致。
     """
     configured = get_config().get("llama_server_path", "")
-    # 解析成实际路径，否则配置里写相对名（默认值就是 llama-server.exe）时
-    # 会得到"路径不存在"这种误导性的探测结果
+    # probe_server 内部会按应用目录/PATH 解析相对名，解析失败直接返回
+    # "路径不存在"而不会相对 CWD 执行（AGENTS §2.1）。这里保留配置原值，
+    # 好让失败结果里的 path/error 指向用户实际填写的内容。
     exe = resolve_server_path(configured) or configured
     return await asyncio.to_thread(build_capabilities, model_path=model, exe_path=exe)
 
@@ -628,7 +636,7 @@ async def api_param_schema():
     自由指定，构建代次不可控，schema 必须跟着当前构建走。
     """
     configured = get_config().get("llama_server_path", "")
-    exe = resolve_server_path(configured) or configured
+    exe = resolve_server_path(configured) if str(configured).strip() else None
     return get_schema_for_frontend(exe)
 
 
@@ -648,7 +656,7 @@ async def api_param_recipes():
     版本漂移，见 ``core/param_recipes.py`` 的模块文档。
     """
     configured = get_config().get("llama_server_path", "")
-    exe = resolve_server_path(configured) or configured
+    exe = resolve_server_path(configured) if str(configured).strip() else None
     probe = probe_server_cached_only(exe) if exe else None
     return {"recipes": recipes_for_frontend(probe)}
 
@@ -660,19 +668,24 @@ async def api_build_command(body: dict):
     if not isinstance(params, dict):
         raise HTTPException(400, "params must be an object")
     cfg = get_config()
-    llama_server_path = cfg["llama_server_path"]
+    configured = cfg["llama_server_path"]
+    # 预览路径同样不执行任何东西；但探测缓存必须按**解析后的**可执行文件取，
+    # 否则裸名会相对 CWD 命中一个用户可写的同名文件（AGENTS §2.1）。
+    resolved = resolve_server_path(configured) if str(configured).strip() else None
     # schema 声明的 min/max/options 在预览路径同样生效：不合法取值让预览变成
     # 错误行（走全局 ValueError 处理器 → 400），而不是给出一条跑不起来的命令。
     # 与启动路径 _validate_start 用的是同一份校验、同一类错误返回。
     # cached_only：预览是高频路径，绝不为了校验起子进程跑 --help。
-    validate_param_values(params, probe=probe_server_cached_only(llama_server_path))
-    argv = build_argv(params, llama_server_path)
+    probe = probe_server_cached_only(resolved) if resolved else None
+    validate_param_values(params, probe=probe)
+    # 预览仍显示用户配置的写法；真正启动时 _validate_start 会解析成绝对路径。
+    argv = build_argv(params, configured)
     return {
         "argv": redact_argv(argv),
         "command": build_command_string(argv),
         # 本机构建不支持、因而被丢弃的参数。命令行里没有、也不报错是最糟的
         # 结果（用户以为自己勾的开关生效了），所以必须由前端显式提示。
-        "suppressed": suppressed_params(params, llama_server_path),
+        "suppressed": suppressed_params(params, resolved) if resolved else [],
     }
 
 
@@ -808,8 +821,12 @@ async def api_vram_estimate(
         mmproj_path=mmproj,
     )
     try:
-        devices = get_monitor().snapshot_cached().gpus
+        # snapshot_cached 在缓存过期时会跑 NVML/nvidia-smi；必须离开事件循环，
+        # 否则一次 3s 的 GPU 查询会卡住所有 REST/WebSocket 请求。
+        monitor = get_monitor()
+        devices = (await asyncio.to_thread(monitor.snapshot_cached)).gpus
     except Exception:
+        LOGGER.warning("GPU snapshot unavailable for VRAM estimate", exc_info=True)
         devices = []          # 显卡数据拿不到就退回纯估算，不影响主流程
     estimate["fit"] = fit_verdict(estimate.get("gpu_gib"), devices)
     return estimate
@@ -1045,7 +1062,10 @@ async def api_remove_instance(instance_id: str):
     pm = get_process_manager()
     try:
         ok = pm.remove_instance(instance_id)
-        return {"removed": ok}
+        if not ok:
+            # 实例已被并发剪枝/删除：返回 404，而不是让前端把"没删掉"显示成成功。
+            raise HTTPException(404, f"instance not found: {instance_id}")
+        return {"removed": True}
     except RuntimeError as e:
         raise HTTPException(400, str(e)) from e
     except ValueError as e:
@@ -1089,12 +1109,26 @@ async def ws_instance_logs(ws: WebSocket, instance_id: str):
                 "source": entry.source,
                 "line": entry.line,
             })
-        # 持续推新日志
+        # 持续推新日志。队列满时 ThreadsafeLogBridge 会丢行；必须把丢弃数量
+        # 告诉客户端，否则日志页会把"少了关键死因"当成正常输出。
+        delivered_dropped = 0
         while True:
             try:
                 msg = await asyncio.wait_for(bridge.queue.get(), timeout=30)
+                if bridge.dropped > delivered_dropped:
+                    await ws.send_json({
+                        "type": "logs_dropped",
+                        "count": bridge.dropped - delivered_dropped,
+                    })
+                    delivered_dropped = bridge.dropped
                 await ws.send_json(msg)
             except TimeoutError:
+                if bridge.dropped > delivered_dropped:
+                    await ws.send_json({
+                        "type": "logs_dropped",
+                        "count": bridge.dropped - delivered_dropped,
+                    })
+                    delivered_dropped = bridge.dropped
                 # 心跳
                 await ws.send_json({"type": "ping", "timestamp": time.time()})
     except WebSocketDisconnect:
@@ -1217,6 +1251,10 @@ if FRONTEND_DIR.exists():
         full_path = resolve_frontend_file(path)
         if full_path is not None:
             return FileResponse(str(full_path))
+        # 缺失的 JS/CSS/资源必须是真的 404：回退 index.html 会让浏览器报
+        # MIME/语法错误，把"文件根本没发布"伪装成前端代码问题。
+        if path.startswith(("js/", "css/", "assets/")) or Path(path).suffix:
+            raise HTTPException(404, f"asset not found: /{path}")
         return FileResponse(str(FRONTEND_DIR / "index.html"))
 
 

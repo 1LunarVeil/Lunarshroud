@@ -194,3 +194,40 @@ test('tauri.localhost never hijacks the backend-URL fallback (F24)', async () =>
     delete globalThis.fetch;
   }
 });
+
+test('a failed non-idempotent request is not retried automatically', async () => {
+  // POST/PUT/DELETE 可能已经在后端执行过；网络错误后自动重试会创建重复
+  // 实例/预设。只允许 GET/HEAD 自动重试。
+  const calls = [];
+  globalThis.window = {
+    location: {
+      protocol: 'http:',
+      hostname: 'tauri.localhost',
+      origin: 'http://tauri.localhost',
+    },
+    __TAURI__: {
+      core: {
+        invoke: async () => ({ url: 'http://127.0.0.1:23456', token: 'test-token' }),
+      },
+    },
+  };
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url: String(url), method: options && options.method });
+    throw new Error('connection reset after send');
+  };
+  try {
+    const { pathToFileURL } = await import('node:url');
+    const { join } = await import('node:path');
+    const jsDir = join(import.meta.dirname, '..', 'js');
+    const api = (
+      await import(pathToFileURL(join(jsDir, 'api.js')).href + '?no-idempotent-retry')
+    ).default;
+
+    await assert.rejects(() => api.createInstance({ params: { model: 'm.gguf' } }));
+    assert.equal(calls.length, 1, `POST 被自动重试了: ${JSON.stringify(calls)}`);
+    assert.equal(calls[0].method, 'POST');
+  } finally {
+    delete globalThis.window;
+    delete globalThis.fetch;
+  }
+});

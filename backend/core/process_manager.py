@@ -304,12 +304,17 @@ class Instance:
     _monitor_thread: threading.Thread | None = None
     _stdout_thread: threading.Thread | None = None
     _stderr_thread: threading.Thread | None = None
+    # 读线程在 process 被并发置空后仍需要这个句柄；finalize 只有在读线程
+    # 已退出时才关闭/清空它。
+    _stdout_stream: TextIO | None = field(default=None, repr=False)
     _stop_event: threading.Event = field(default_factory=threading.Event)
     _operation_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _log_file: TextIO | None = field(default=None, repr=False)
     _log_file_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _log_persist_enabled: bool = field(default=True, repr=False)
     _log_persist_failed: bool = field(default=False, repr=False)
+    # finalize/删除后永久停止落盘：迟到的 stdout 行不得重新打开日志文件。
+    _log_persist_closed: bool = field(default=False, repr=False)
     # 就绪探测的留痕。曾经有一次启动超时：服务器 8 秒就打印了 listening，
     # 探测却失败约 100 次，而**一条记录都没留下** —— 事后连"是超时、被拒绝、
     # 还是返回了非 200"都无从判断，只能靠猜。这两个字段就是为了下次不用猜。
@@ -351,6 +356,9 @@ class Instance:
                 try:
                     self._diagnosis = diagnose_instance(self)
                 except Exception:  # noqa: BLE001 - 归因失败不能把状态接口打成 500
+                    LOGGER.warning(
+                        "diagnosis failed for instance %s", self.id, exc_info=True
+                    )
                     self._diagnosis = []
             d["diagnosis"] = self._diagnosis
         if include_logs:
@@ -489,7 +497,19 @@ class ProcessManager:
             with instance._operation_lock:
                 self._launch_process(instance)
         except Exception as e:
-            self._release_port(instance)
+            # Popen 成功后 _launch_process 仍可能抛（最典型：stdout 读取线程
+            # 启动失败）。此时子进程是活的：必须先终止，否则会留下一个
+            # 没有监控线程的孤儿 llama-server，端口预留也不能释放。
+            process = instance.process
+            if process is not None and process.poll() is None:
+                self._terminate_process_tree(instance, force=True)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            if process is None or process.poll() is not None:
+                self._release_port(instance)
+                self._finalize_process_resources(instance)
             instance.status = InstanceStatus.FAILED
             instance.error_message = f"launch failed: {e}"
             self._append_log(instance, "system", f"launch failed: {e}")
@@ -515,7 +535,17 @@ class ProcessManager:
         instance._monitor_thread = threading.Thread(
             target=self._monitor_instance, args=(instance,), daemon=True
         )
-        instance._monitor_thread.start()
+        try:
+            instance._monitor_thread.start()
+        except Exception:
+            # 线程启动失败时实例永远不会被推进到终态；先把活着的子进程停掉，
+            # 再把异常交给调用方（API 会返回 500，但不会留下孤儿）。
+            LOGGER.exception("failed to start monitor thread for instance %s", instance_id)
+            try:
+                self.stop_instance(instance.id, force=True)
+            except Exception:
+                LOGGER.exception("cleanup after monitor-thread failure also failed: %s", instance_id)
+            raise
 
         return instance
 
@@ -623,13 +653,22 @@ class ProcessManager:
             if isinstance(value, str) and value.strip() and not os.path.isabs(value):
                 params[key] = os.path.abspath(value)
 
-        # 端口范围（port=0 表示自动分配，交给 start_instance 处理）
+        # 端口范围（port=0 表示自动分配，交给 start_instance 处理）。
+        # bool 是 int 的子类；float 端口会在 build_argv 里输出 "8080.9"，
+        # 与实例记录/健康探测使用的 8080 分叉。这里统一拒绝/归一化并写回。
+        raw_port = params.get("port", 0) or 0
+        if isinstance(raw_port, bool):
+            raise ValueError("port must be an integer")
+        if isinstance(raw_port, float) and not raw_port.is_integer():
+            raise ValueError(f"port must be an integer: {raw_port}")
         try:
-            port = int(params.get("port", 0) or 0)
+            port = int(raw_port)
         except (ValueError, TypeError) as exc:
-            raise ValueError(f"port must be an integer: {params.get('port')}") from exc
+            raise ValueError(f"port must be an integer: {raw_port}") from exc
         if port < 0 or port > 65535:
             raise ValueError(f"port out of range: {port}")
+        if "port" in params:
+            params["port"] = port
 
         # schema 声明的 min/max/options 必须真正生效，否则约束只存在于前端 HTML
         # 属性上，直连 API 或导入外部预设即可绕过（-c 1e12 / -fa banana 之类）。
@@ -702,7 +741,10 @@ class ProcessManager:
         self._append_log(instance, "system", f"command: {instance.command_string}")
         self._notify_status(instance)
 
-        # 启动 stdout 读取线程
+        # 启动 stdout 读取线程。句柄先存到实例上：读线程可能还没被调度，
+        # 进程就退出了，finalize 会把 instance.process 置空；此时读线程
+        # 仍需要这个流来完成 EOF 读取与关闭。
+        instance._stdout_stream = instance.process.stdout
         instance._stdout_thread = threading.Thread(
             target=self._read_stdout, args=(instance,), daemon=True
         )
@@ -718,11 +760,14 @@ class ProcessManager:
         监控线程一起挂死，直到子进程被外部杀掉才解冻。EOF（进程退出）或
         停止事件（读到的下一行之后）都会让本线程走到 finally，由它自己收尾。
         """
-        # 快照句柄：停止路径可能并发地把 instance.process 置为 None
+        # 快照句柄：停止路径可能并发地把 instance.process 置为 None。
+        # 此时退回到实例上保存的流，保证读线程仍会关闭它。
         process = instance.process
-        if process is None or process.stdout is None:
+        stream = getattr(instance, "_stdout_stream", None)
+        if stream is None and process is not None:
+            stream = process.stdout
+        if stream is None:
             return
-        stream = process.stdout
 
         try:
             for line in stream:
@@ -744,6 +789,8 @@ class ProcessManager:
                 stream.close()
             except (OSError, ValueError):
                 pass
+            if getattr(instance, "_stdout_stream", None) is stream:
+                instance._stdout_stream = None
 
     def _monitor_instance(self, instance: Instance) -> None:
         """监控线程：就绪探测 + 进程退出检测"""
@@ -758,6 +805,10 @@ class ProcessManager:
             # 检查进程是否已退出（快照句柄，避免停止路径并发置 None 后的竞态）
             process = instance.process
             if process is None or process.poll() is not None:
+                if instance._stop_event.is_set():
+                    # 用户 stop 已经赢得竞争：状态/端口/句柄由 stop 路径负责，
+                    # 这里不能把 STOPPING/STOPPED 改写成"启动期间退出"的 FAILED。
+                    return
                 # 进程已退出
                 instance.exit_code = process.returncode if process else -1
                 instance.status = InstanceStatus.FAILED
@@ -810,6 +861,14 @@ class ProcessManager:
             self._terminate_process_tree(instance, force=False)
             instance._stop_event.set()
             self._wait_for_process(instance, timeout=5, force_timeout=3)
+            process = instance.process
+            if process is not None and process.poll() is None:
+                # 终止失败：进程仍在占用端口/显存。保留句柄与端口预留，
+                # 让用户还能通过 stop 再次尝试（AGENTS §2.14.3）。
+                instance.error_message += "；进程终止失败，仍占用端口"
+                self._append_log(instance, "system", instance.error_message)
+                self._notify_status(instance)
+                return
             instance.stopped_at = time.time()
             self._release_port(instance)
             self._notify_status(instance)
@@ -837,6 +896,14 @@ class ProcessManager:
         # 被置位而跳出循环，此时进程虽已被终止但 returncode 尚未固化，
         # 直接写入 None 会把停止路径后续读到的真实退出码覆盖掉。
         process = instance.process
+        if process is not None and process.poll() is None:
+            # stop_event 已置位但进程还没死透（终止较慢或失败）。状态与端口
+            # 由 stop 路径负责：这里伪造 STOPPED 或释放端口会让下一个实例
+            # 被分配到同一个仍被占用的端口。
+            LOGGER.info(
+                "instance %s monitor exiting while process still alive", instance.id
+            )
+            return
         if process is not None and process.poll() is not None:
             instance.exit_code = process.returncode
         if instance.status != InstanceStatus.FAILED:
@@ -1046,7 +1113,14 @@ class ProcessManager:
                 parent.kill()
             except psutil.Error:
                 pass
-            psutil.wait_procs(children + [parent], timeout=3)
+            _gone, alive = psutil.wait_procs(children + [parent], timeout=3)
+            if alive:
+                LOGGER.warning(
+                    "psutil tree kill left %d process(es) alive for pid %s",
+                    len(alive),
+                    process.pid,
+                )
+                return False
             return process.poll() is not None
         except Exception:  # noqa: BLE001 - 兜底失败要退回调用方的最后一级
             LOGGER.warning("psutil tree kill failed for pid %s", process.pid, exc_info=True)
@@ -1084,15 +1158,20 @@ class ProcessManager:
             # 读里握着该文件的 IO 锁，任何其他线程调 close() 都会与它互等
             # （见 _read_stdout 的说明）。有读线程时，由它自己在 EOF/停止后关闭。
             reader = instance._stdout_thread
-            stream = getattr(process, "stdout", None)
+            stream = getattr(process, "stdout", None) or getattr(
+                instance, "_stdout_stream", None
+            )
             if stream is not None and (reader is None or not reader.is_alive()):
                 try:
                     stream.close()
                 except (OSError, ValueError):
                     pass
+                if getattr(instance, "_stdout_stream", None) is stream:
+                    instance._stdout_stream = None
             instance.process = None
-        # 关闭该实例的落盘日志文件（若开启）
+        # 关闭该实例的落盘日志文件（若开启），并永久停止后续落盘。
         with instance._log_file_lock:
+            instance._log_persist_closed = True
             stream = instance._log_file
             instance._log_file = None
             if stream is not None:
@@ -1123,8 +1202,9 @@ class ProcessManager:
             dropped = terminal[:excess]
             for item in dropped:
                 self._instances.pop(item.id, None)
-                self._reserved_ports.discard((item.host, item.port))
         for item in dropped:
+            # _release_port 自己取 self._lock；在上面持锁时调用会死锁。
+            self._release_port(item)
             self._delete_instance_log_files(item)
 
     def _terminate(self, instance: Instance) -> None:
@@ -1154,8 +1234,28 @@ class ProcessManager:
                 pass
 
     def _release_port(self, instance: Instance) -> None:
+        """释放端口预留，但只在确认没有其他存活实例拥有同一端口时。
+
+        重启会复用 ``(host, port)``：旧一代的监控线程在 stop_event 置位后
+        可能晚一步醒来，若无条件 discard，会把**新一代**刚建立的预留删掉，
+        随后自动分配把同一端口给第三个实例，两个服务同时 bind。
+        进程还活着时同样不得释放（AGENTS §2.14.3）。
+        """
+        process = instance.process
+        if process is not None and process.poll() is None:
+            return
+        key = (instance.host, instance.port)
         with self._lock:
-            self._reserved_ports.discard((instance.host, instance.port))
+            for other in self._instances.values():
+                if other is instance or (other.host, other.port) != key:
+                    continue
+                if other.status in (
+                    InstanceStatus.STARTING,
+                    InstanceStatus.RUNNING,
+                    InstanceStatus.STOPPING,
+                ) or (other.process is not None and other.process.poll() is None):
+                    return
+            self._reserved_ports.discard(key)
 
     def _restart_chain(self, instance_id: str) -> list[Instance]:
         """从被点名的 ID 出发，沿 ``replaced_by`` 走到当前代次，返回途经的每一代。
@@ -1271,8 +1371,11 @@ class ProcessManager:
             # 无法通过 API 处理这个仍占端口/显存的进程。
             raise RuntimeError(f"instance {instance_id} still has a live process; stop it before removing")
         with self._lock:
-            del self._instances[instance_id]
-            self._reserved_ports.discard((instance.host, instance.port))
+            removed = self._instances.pop(instance_id, None)
+        if removed is None:
+            # 状态检查与删除之间被 _prune_terminal_instances 抢先移除。
+            return False
+        self._release_port(instance)
         # 落盘日志随实例一并清理（独立审计 L1）
         self._delete_instance_log_files(instance)
         return True
@@ -1284,6 +1387,7 @@ class ProcessManager:
         但手工构造/异常路径下漏关时，Windows 会拒绝删除仍被占用的文件。
         """
         with instance._log_file_lock:
+            instance._log_persist_closed = True
             stream = instance._log_file
             instance._log_file = None
             if stream is not None:
@@ -1309,7 +1413,10 @@ class ProcessManager:
             try:
                 sub(entry)
             except Exception:
-                pass
+                # 订阅者异常不能让日志写入路径静默失效；至少留下实例与异常。
+                LOGGER.warning(
+                    "log subscriber failed for instance %s", instance.id, exc_info=True
+                )
 
     def _persist_log_line(self, instance: Instance, entry: LogEntry) -> None:
         """可选地把实例日志追加到 data/logs/instances/<id>.log。
@@ -1322,6 +1429,8 @@ class ProcessManager:
             return
         try:
             with instance._log_file_lock:
+                if instance._log_persist_closed:
+                    return
                 stream = instance._log_file
                 if stream is None:
                     # 经 config 模块动态解析，测试中可被重定向到临时目录
@@ -1414,7 +1523,9 @@ class ProcessManager:
             try:
                 sub(instance)
             except Exception:
-                pass
+                LOGGER.warning(
+                    "status subscriber failed for instance %s", instance.id, exc_info=True
+                )
         # 管理器级广播：任意实例状态变化都通知 /ws/instances 订阅者
         with self._lock:
             listeners = list(self._instance_change_listeners)
@@ -1469,10 +1580,15 @@ class ProcessManager:
 
 # 全局单例
 _process_manager: ProcessManager | None = None
+_process_manager_lock = threading.Lock()
 
 
 def get_process_manager() -> ProcessManager:
     global _process_manager
     if _process_manager is None:
-        _process_manager = ProcessManager()
+        # 事件循环线程与 to_thread 工作线程可能同时首次调用；无锁会各自
+        # 构造一个 manager，后者的实例/端口预留对前者不可见。
+        with _process_manager_lock:
+            if _process_manager is None:
+                _process_manager = ProcessManager()
     return _process_manager

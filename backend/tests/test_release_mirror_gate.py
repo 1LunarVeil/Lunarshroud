@@ -53,6 +53,22 @@ SHELL_ARTIFACTS = [
     "sub/dir/App.lnk",
 ]
 
+# 便携版从源码树根启动时，启动器会在 exe 同目录创建这些运行时目录；
+# 外部 AI 工具还会在根目录留下会话导出。它们都含本机路径/缓存，必须在
+# 规则表层面同时"不参与镜像"且"出现在镜像里就算违规"。
+APP_RUNTIME_ARTIFACTS = [
+    "webview2-data/EBWebView/Default/Cache/Cache_Data/data_0",
+    "logs/state.json",
+    "runtime-temp/leftover.txt",
+    "appdata/LunarShroud/config.json",
+    "dsh-session-session-abc123/media/shot.png",
+    "CLAUDE.md",
+    # 嵌套形式：规则必须按目录名/前缀在任意层级生效，而不是只认仓库根。
+    "backend/dsh-session-session-abc123/session.v4.jsonl",
+    "backend/webview2-data/EBWebView/Cache/data_0",
+    "sub/CLAUDE.md",
+]
+
 MUST_STILL_MIRROR = [
     "backend/main.py",
     "backend/core/param_builder.py",
@@ -88,6 +104,20 @@ def test_internal_docs_are_excluded_and_forbidden(rel):
 @pytest.mark.parametrize("rel", SHELL_ARTIFACTS)
 def test_shortcuts_are_excluded_and_forbidden(rel):
     assert gate.is_excluded(rel)[0], f"{rel} 会被 --apply 复制进公开镜像"
+    assert gate.is_forbidden(rel), f"{rel} 出现在镜像里必须被判违规"
+
+
+@pytest.mark.parametrize("rel", APP_RUNTIME_ARTIFACTS)
+def test_app_runtime_artifacts_are_excluded_and_forbidden(rel):
+    """从源码树根运行便携版/导入 AI 会话不得把门禁弄红。
+
+    实测：部署对在仓库根启动一次后，`webview2-data/`（287 个文件）、
+    `dsh-session-*`（11 个）和 `CLAUDE.md` 让门禁报 299 项缺失 —— 而这些
+    文件都不该发布。规则表必须同时覆盖"工作树侧不参与镜像"与"镜像侧禁止出现"。
+    """
+    excluded, reason = gate.is_excluded(rel)
+    assert excluded, f"{rel} 会被 --apply 复制进公开镜像"
+    assert reason
     assert gate.is_forbidden(rel), f"{rel} 出现在镜像里必须被判违规"
 
 
@@ -271,3 +301,37 @@ def test_apply_never_publishes_runtime_data(tmp_path):
     published = {p.relative_to(mirror).as_posix() for p in mirror.rglob("*") if p.is_file()}
     assert published == {"backend/main.py"}, published
     assert gate._problem_count(gate.inspect(root, mirror)) == 0
+
+def test_missing_mirror_fails_closed(tmp_path, capsys):
+    """镜像目录丢失/路径写错时不能返回 0（CLAUDE.md 明确要求退出错误）。"""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "AGENTS.md").write_text("x", encoding="utf-8")
+    missing = tmp_path / "no-such-mirror"
+
+    code = gate.main(["--root", str(root), "--mirror", str(missing)])
+    captured = capsys.readouterr()
+    assert code == 2, "缺镜像时必须 fail closed"
+    assert "未找到发布镜像目录" in captured.err
+
+    # 显式 opt-in 才允许跳过（公开镜像自身运行时的语义）。
+    assert gate.main(
+        ["--root", str(root), "--mirror", str(missing), "--allow-missing-mirror"]
+    ) == 0
+
+
+def test_apply_aborts_before_copying_private_content(tmp_path):
+    """--apply 是发布动作：发现本机痕迹时必须先中止，不能先复制再报错。"""
+    root, mirror = tmp_path / "root", tmp_path / "mirror"
+    (root / "backend").mkdir(parents=True)
+    mirror.mkdir()
+    (root / "backend" / "main.py").write_text(
+        "MODEL_DIR = 'D:/" + _WORKDIR + "/models'", encoding="utf-8"
+    )
+    (mirror / "keep.txt").write_text("keep", encoding="utf-8")
+
+    code = gate.apply(root, mirror, stream=io.StringIO())
+
+    assert code == 2
+    assert not (mirror / "backend" / "main.py").exists(), "私有内容在检查前被复制进镜像"
+    assert (mirror / "keep.txt").exists()

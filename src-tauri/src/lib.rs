@@ -26,14 +26,26 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const BACKEND_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+/// 就绪响应的读取上限。正常响应只有几百字节；上限只用于挡住占端口的本地
+/// 进程用超大响应体拖垮外壳。
+const MAX_READINESS_BODY_BYTES: u64 = 8 * 1024;
 
 /// 单实例互斥锁。返回的句柄必须活到进程结束（调用方 mem::forget）。
 ///
 /// 没有它时，重复双击会再起一套外壳 + 后端：第二个后端抢不到 17520，uvicorn
 /// 以 exit 3 退出，用户看到"后端进程启动失败"——而第一个实例（窗口可能被其他
 /// 窗口挡住/最小化）其实一直好好的。实测用户就是这么连续点出来的错误。
+/// 单实例检查的三种结果。`Unavailable` 与 `AlreadyRunning` 必须分开：
+/// 前者（CreateMutexW 失败）如果被当成"已在运行"，应用会带着一个错误的
+/// 诊断永久无法启动；注释里承诺的"宁可放行"也就没有兑现。
+enum SingleInstance {
+    Acquired(usize),
+    AlreadyRunning,
+    Unavailable,
+}
+
 #[cfg(windows)]
-fn acquire_single_instance() -> Option<usize> {
+fn acquire_single_instance() -> SingleInstance {
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, SetLastError, ERROR_ALREADY_EXISTS,
     };
@@ -50,15 +62,15 @@ fn acquire_single_instance() -> Option<usize> {
     let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
     if handle.is_null() {
         // 拿不到锁句柄时宁可放行，不要把应用永久锁死在启动失败上。
-        return None;
+        return SingleInstance::Unavailable;
     }
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         unsafe {
             CloseHandle(handle);
         }
-        return None;
+        return SingleInstance::AlreadyRunning;
     }
-    Some(handle as usize)
+    SingleInstance::Acquired(handle as usize)
 }
 
 /// 二次启动时把已有窗口拉到前台；找不到窗口才弹提示。
@@ -85,8 +97,8 @@ fn focus_existing_window() -> bool {
 }
 
 #[cfg(not(windows))]
-fn acquire_single_instance() -> Option<usize> {
-    Some(1)
+fn acquire_single_instance() -> SingleInstance {
+    SingleInstance::Acquired(1)
 }
 
 /// Windows 原生错误弹窗（支持中文，无乱码）
@@ -208,8 +220,14 @@ impl BackendSupervisor {
     }
 
     /// 记录一代**已通过 HMAC 就绪校验**的后端会话（只保留令牌）。
-    fn set_session(&self, token: String) {
-        *self.session.lock().unwrap() = Some(ActiveSession { token });
+    /// 返回 false 表示关闭请求已经赢得竞争，令牌不得再发布给前端。
+    fn set_session(&self, token: String) -> bool {
+        let mut guard = self.session.lock().unwrap();
+        if self.is_shutdown() {
+            return false;
+        }
+        *guard = Some(ActiveSession { token });
+        true
     }
 
     /// 当前代退出/重启开始时调用：立刻让前端拿不到旧令牌。
@@ -260,12 +278,53 @@ impl BackendSupervisor {
         };
         if let Some(handle) = job {
             close_job_handle(handle);
+            // 关闭 Job Object 会发起终止，但 CloseHandle 本身不等待进程退出。
+            // 主窗口关闭后 Tauri 很快结束进程，监管线程可能来不及写
+            // "backend exited during shutdown"；这里做一次有界等待并自行记录，
+            // 保证关闭证据一定落盘（同时也确保退出前端口已释放）。
+            let exited = pid.is_some_and(|pid| wait_for_process_exit(pid, Duration::from_secs(2)));
+            append_launcher_log(&format!(
+                "backend exited during shutdown: job closed exited={exited}"
+            ));
         } else if let Some(pid) = pid {
             // Job Object 附加失败时的兜底路径
             kill_process_tree(pid);
+            let exited = wait_for_process_exit(pid, Duration::from_secs(2));
+            append_launcher_log(&format!(
+                "backend exited during shutdown: tree kill exited={exited}"
+            ));
+        } else {
+            append_launcher_log("backend exited during shutdown: no live generation");
         }
         append_launcher_log("launcher shutdown requested");
     }
+}
+
+/// 等待某个 pid 退出，最多 ``timeout``；返回是否在超时前观察到退出。
+#[cfg(windows)]
+fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+
+    /// `SYNCHRONIZE` 是 `PROCESS_ACCESS_RIGHTS` 的位，windows-sys 0.59 把它
+    /// 放在 FileSystem 模块下；这里直接写值，避免为一个常量引入额外 feature。
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+
+    let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let millis = timeout.as_millis().min(u32::MAX as u128) as u32;
+    let result = unsafe { WaitForSingleObject(handle, millis) };
+    unsafe {
+        CloseHandle(handle);
+    }
+    result == WAIT_OBJECT_0
+}
+
+#[cfg(not(windows))]
+fn wait_for_process_exit(_pid: u32, _timeout: Duration) -> bool {
+    false
 }
 
 /// 外部链接只允许这两个协议；`file:` / `ms-settings:` 等一律拒绝。
@@ -325,8 +384,8 @@ pub fn run() {
         }
     }
     let _instance_guard = match acquire_single_instance() {
-        Some(handle) => handle,
-        None => {
+        SingleInstance::Acquired(handle) => handle,
+        SingleInstance::AlreadyRunning => {
             if !focus_existing_window() {
                 show_error_box(
                     "LunarShroud 已在运行",
@@ -336,6 +395,13 @@ pub fn run() {
                 );
             }
             std::process::exit(0);
+        }
+        SingleInstance::Unavailable => {
+            // 与注释承诺一致：mutex API 本身失败时放行，但留下证据。
+            append_launcher_log(
+                "warning: single-instance mutex unavailable; continuing without the guard",
+            );
+            0
         }
     };
     // 独立于 APPDATA 的引导记录已在最前面写；这里不再重复。
@@ -398,7 +464,8 @@ pub fn run() {
                 "后端进程启动失败（{status}），在就绪校验前退出。\n\n\
                  常见原因：临时目录不可写、被杀毒软件拦截，或 backend.exe 被替换/损坏。\n\
                  诊断日志：%APPDATA%\\LunarShroud\\logs\\launcher.log\n\
-                 受限环境另有：应用目录下的 launcher-boot.log 与 backend\\backend-child.log"
+                 受限环境另有：应用目录下的 launcher-boot.log、backend\\backend-child.log\n\
+                 或 runtime-temp\\backend-child.log"
             ),
             None => format!(
                 "后端启动超时（{}秒内未就绪）\n\n请检查端口 {} 是否被占用。",
@@ -477,8 +544,8 @@ pub fn run() {
             // 返回 os error 5，窗口建不出来（用户看到的就是"没反应"）。把
             // WebView2 数据目录放到 exe 同目录（启动器已确认可写），窗口就能
             // 正常创建；缓存/本地存储在应用目录，不影响用户配置。
-            let window_builder = match &window_log_dir {
-                Some(dir) => window_builder.data_directory(dir.join("webview2-data")),
+            let window_builder = match webview2_data_dir(window_log_dir.as_deref()) {
+                Some(dir) => window_builder.data_directory(dir),
                 None => window_builder,
             };
             let main_window = match window_builder.build() {
@@ -493,12 +560,17 @@ pub fn run() {
                             &format!("setup: window creation failed: {error}"),
                         );
                     }
+                    // 窗口建不出来时进程很快退出；Job Object 通常能回收后端，
+                    // 但 Job 附加失败时没有别的路径会停它。显式走一次关闭流程。
+                    if let Some(supervisor) = app.try_state::<Arc<BackendSupervisor>>() {
+                        supervisor.request_shutdown();
+                    }
                     show_error_box(
                         "LunarShroud 启动错误",
                         &format!(
                             "主窗口创建失败：{error}\n\n\
-                             常见原因：WebView2 Runtime 未安装/损坏，或 \
-                             %LOCALAPPDATA% 不可写。\n\
+                             常见原因：WebView2 Runtime 未安装/损坏，或可写的数据目录 \
+                             无法创建。\n\
                              诊断日志：应用目录下的 launcher-boot.log"
                         ),
                     );
@@ -560,22 +632,36 @@ pub fn run() {
 /// 后端崩溃时其 llama-server 子进程可能仍在运行（Job 句柄未关），
 /// 每代结束后关闭该代 Job Object 将它们一并回收。
 fn supervise_loop(supervisor: Arc<BackendSupervisor>, mut child: std::process::Child) {
+    let mut consecutive_failures: u32 = 0;
+    let mut generation_started = Instant::now();
     loop {
         let exit = child.wait();
-        supervisor.take_and_close_job();
         // 这一代已经死了：先让前端拿不到这一代的令牌，再决定是否重启。
         // 前端在重连窗口里只会拿到 None，因此不会把旧令牌发给抢先占端口的进程；
         // 即使它仍缓存着旧令牌，重启也会换发新的，旧值不可用于新一代后端。
         supervisor.clear_session();
+        supervisor.take_and_close_job();
         if supervisor.is_shutdown() {
             append_launcher_log(&format!("backend exited during shutdown: {exit:?}"));
             return;
         }
+        // 重启风暴闸门：后端"就绪后很快又退出"（schema/驱动/重连客户端触发
+        // 的崩溃）不能让监管线程无延迟地无限重生。只有稳定运行超过 60s 才把
+        // 失败计数归零；否则逐次退避到 30s 封顶。
+        let uptime = generation_started.elapsed();
+        consecutive_failures = next_generation_failures(consecutive_failures, uptime);
         append_launcher_log(&format!(
-            "backend exited unexpectedly: {exit:?}; restarting"
+            "backend exited unexpectedly: {exit:?}; uptime={}s failures={consecutive_failures}; restarting",
+            uptime.as_secs()
         ));
+        if consecutive_failures > 0 {
+            std::thread::sleep(supervision_backoff(consecutive_failures));
+        }
         match spawn_ready_generation(&supervisor) {
-            Some(next_child) => child = next_child,
+            Some(next_child) => {
+                child = next_child;
+                generation_started = Instant::now();
+            }
             None => return,
         }
     }
@@ -666,6 +752,17 @@ fn spawn_ready_generation(supervisor: &BackendSupervisor) -> Option<std::process
 fn supervision_backoff(failures: u32) -> Duration {
     let seconds = 1u64.checked_shl(failures).unwrap_or(u32::MAX as u64);
     Duration::from_secs(seconds.min(30))
+}
+
+/// 一代后端退出后更新"连续快速失败"计数。
+/// 只有稳定运行超过 60s 才归零，避免"就绪后立刻崩溃"的进程被无延迟地
+/// 无限重生（每次都会占用 CPU/磁盘并把 UI 刷成不停闪烁的会话）。
+fn next_generation_failures(previous: u32, uptime: Duration) -> u32 {
+    if uptime < Duration::from_secs(60) {
+        previous.saturating_add(1)
+    } else {
+        0
+    }
 }
 
 /// 就绪证明的域分隔前缀，与 backend/main.py 的 `READY_PROOF_CONTEXT` 逐字节一致。
@@ -772,8 +869,14 @@ fn wait_backend_ready(
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(2))
         .no_proxy()
-        .build()
-        .expect("failed to create backend health client");
+        // 占住端口的本地进程可以回 302 把探测引向任意 URL；探测只需要看
+        // 本端口的应答，不跟随重定向。
+        .redirect(reqwest::redirect::Policy::none())
+        .build();
+    let Ok(client) = client else {
+        append_launcher_log("failed to create backend readiness client");
+        return false;
+    };
 
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -784,11 +887,17 @@ fn wait_backend_ready(
         }
         if let Ok(resp) = client.get(&url).send() {
             if resp.status().is_success() {
-                if let Ok(body) = resp.text() {
-                    if backend_readiness_is_authentic(&body, session_id, expected_proof.as_deref())
-                    {
-                        return true;
-                    }
+                // 只读有界长度：端口上的任意本地进程都可以流式返回一个超大
+                // 响应体，无界 resp.text() 会让外壳在窗口创建前 OOM。
+                use std::io::Read as _;
+                let mut body = String::new();
+                if resp
+                    .take(MAX_READINESS_BODY_BYTES)
+                    .read_to_string(&mut body)
+                    .is_ok()
+                    && backend_readiness_is_authentic(&body, session_id, expected_proof.as_deref())
+                {
+                    return true;
                 }
             }
         }
@@ -800,23 +909,104 @@ fn wait_backend_ready(
 /// 从 JSON 配置内容解析启动器端口。
 /// 单独抽出纯函数，便于覆盖合法、缺失和非法配置值。
 fn parse_backend_port(contents: &str) -> Option<u16> {
+    // 后端用 utf-8-sig 读配置（记事本保存的文件带 BOM）。外壳若不剥 BOM，
+    // 同一个文件后端能读、外壳读不到，端口就会分叉。
+    let contents = contents.trim_start_matches('\u{feff}');
     let value: serde_json::Value = serde_json::from_str(contents).ok()?;
     let port = value.get("launcher_port")?.as_u64()?;
     (1..=65535).contains(&port).then_some(port as u16)
 }
 
-/// 读取 %APPDATA%/LunarShroud/config.json 中的启动器端口。
-/// 首次运行或配置损坏时回退到后端默认端口。
-fn configured_backend_port() -> u16 {
-    const DEFAULT_PORT: u16 = 17520;
-    let appdata = match std::env::var_os("APPDATA") {
-        Some(value) => PathBuf::from(value),
-        None => return DEFAULT_PORT,
-    };
-    let config_path = appdata.join("LunarShroud").join("config.json");
-    std::fs::read_to_string(config_path)
+/// 能否在目录中创建/写入探针文件（与 backend/config.py 的选择口径一致）。
+fn dir_is_writable(path: &Path) -> bool {
+    if std::fs::create_dir_all(path).is_err() {
+        return false;
+    }
+    let probe = path.join(format!(".write-probe-{}", std::process::id()));
+    match std::fs::write(&probe, b"probe") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// 后端 `_frozen_data_dir()` 的候选顺序；两侧必须一致，否则端口/配置分叉。
+fn data_dir_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        candidates.push(PathBuf::from(appdata).join("LunarShroud"));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(PathBuf::from(local).join("LunarShroud"));
+    }
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        candidates.push(PathBuf::from(home).join("LunarShroud"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            // 后端的 exe 在 <launcher_dir>\backend\backend.exe，它的
+            // `sys.executable.parent/data` 是 <launcher_dir>\backend\data，
+            // 不是 <launcher_dir>\data。候选目录必须逐字对齐，否则受限环境里
+            // 两侧仍会选到不同的数据目录。
+            candidates.push(dir.join("backend").join("data"));
+        }
+    }
+    candidates.push(std::env::temp_dir().join("LunarShroud"));
+    candidates
+}
+
+fn read_port_from(dir: &Path) -> Option<u16> {
+    std::fs::read_to_string(dir.join("config.json"))
         .ok()
         .and_then(|contents| parse_backend_port(&contents))
+}
+
+/// 读取与后端**同一份**生效配置里的启动器端口。
+///
+/// 旧实现只读 `%APPDATA%\LunarShroud\config.json`，而后端在受限环境里会
+/// 回退到 `%LOCALAPPDATA%`/`%USERPROFILE%`/`exe\data` 并把配置写在那里。
+/// 外壳随后用 `LUNARSHROUD_LAUNCHER_PORT` 覆盖后端读到的端口，于是用户在
+/// 回退目录里改的 `launcher_port` 永远不会生效。这里复刻同一套"可写才用"
+/// 的候选顺序，并保留 debug 构建从源码树 `data/config.json` 读取的开发语义。
+fn configured_backend_port() -> u16 {
+    const DEFAULT_PORT: u16 = 17520;
+
+    #[cfg(debug_assertions)]
+    {
+        // 开发模式：后端是 `python backend/main.py`，DATA_DIR = <repo>/data。
+        if let Ok(exe) = std::env::current_exe() {
+            let mut current = exe.parent().map(Path::to_path_buf);
+            while let Some(dir) = current {
+                if dir.join("backend").join("main.py").is_file() {
+                    return read_port_from(&dir.join("data")).unwrap_or(DEFAULT_PORT);
+                }
+                current = dir.parent().map(Path::to_path_buf);
+            }
+        }
+    }
+
+    let preferred =
+        std::env::var_os("APPDATA").map(|value| PathBuf::from(value).join("LunarShroud"));
+    for dir in data_dir_candidates() {
+        if dir_is_writable(&dir) {
+            if let Some(port) = read_port_from(&dir) {
+                return port;
+            }
+            // 后端会在这个目录创建/播种配置；若首选 APPDATA 配置存在，
+            // 播种内容里的端口就是后端将要使用的端口。
+            if let Some(preferred) = &preferred {
+                if let Some(port) = read_port_from(preferred) {
+                    return port;
+                }
+            }
+            return DEFAULT_PORT;
+        }
+    }
+    preferred
+        .as_deref()
+        .and_then(read_port_from)
         .unwrap_or(DEFAULT_PORT)
 }
 
@@ -869,12 +1059,14 @@ fn attach_kill_on_close_job(pid: u32) -> Result<usize, String> {
             return Err(format!("OpenProcess failed: {}", error));
         }
         let assigned = AssignProcessToJobObject(job, process);
-        CloseHandle(process);
         if assigned == 0 {
+            // 必须在 CloseHandle 之前取 LastError：CloseHandle 会覆盖它。
             let error = std::io::Error::last_os_error();
+            CloseHandle(process);
             CloseHandle(job);
             return Err(format!("AssignProcessToJobObject failed: {}", error));
         }
+        CloseHandle(process);
         Ok(job as usize)
     }
 }
@@ -977,6 +1169,26 @@ fn prepare_backend_runtime_temp() -> Result<PathBuf, String> {
     Err(format!("no writable backend temp directory ({last_error})"))
 }
 
+/// WebView2 用户数据目录：优先 exe 同目录（受限令牌下通常只有这里可写），
+/// 不可写时退回 `%LOCALAPPDATA%\LunarShroud\webview2-data`。
+///
+/// 旧实现无条件使用 exe 同目录：只读安装位置（Program Files/只读 U 盘）下
+/// 窗口永远建不出来，而默认剖面本来是可用的。探测失败时最后返回 None，
+/// 让 Tauri 使用它自己的默认目录。
+fn webview2_data_dir(exe_dir: Option<&Path>) -> Option<PathBuf> {
+    if let Some(dir) = exe_dir {
+        let candidate = dir.join("webview2-data");
+        if dir_is_writable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    let local = std::env::var_os("LOCALAPPDATA")?;
+    let candidate = PathBuf::from(local)
+        .join("LunarShroud")
+        .join("webview2-data");
+    dir_is_writable(&candidate).then_some(candidate)
+}
+
 fn open_backend_child_log(dir: &Path) -> Option<std::fs::File> {
     let path = dir.join("backend-child.log");
     if std::fs::metadata(&path)
@@ -1031,10 +1243,19 @@ fn start_backend(
             // 必须留下。文件按 1 MB 轮转。
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(match open_backend_child_log(&backend_dir) {
-                Some(file) => Stdio::from(file),
-                None => Stdio::null(),
-            });
+            .stderr(
+                match open_backend_child_log(&backend_dir)
+                    .or_else(|| open_backend_child_log(&runtime_temp))
+                {
+                    Some(file) => Stdio::from(file),
+                    None => {
+                        append_launcher_log(
+                            "warning: backend child log unavailable; stderr will be discarded",
+                        );
+                        Stdio::null()
+                    }
+                },
+            );
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
         let child = cmd
@@ -1050,7 +1271,11 @@ fn start_backend(
     {
         // ── 策略 B：降级到 python main.py（开发模式） ──
         let backend_dir = find_backend_dir();
-        let python_exe = find_python();
+        let Some(python_exe) = find_python() else {
+            return Err(
+                "找不到 Python 解释器（where.exe 不可用或 PATH 中没有 python）".to_string(),
+            );
+        };
 
         let main_py = backend_dir.join("main.py");
         if !main_py.exists() {
@@ -1131,10 +1356,12 @@ fn find_backend_dir() -> std::path::PathBuf {
 
 /// 查找系统中的 Python 可执行文件（开发模式降级用）
 #[cfg(debug_assertions)]
-fn find_python() -> String {
-    // 优先级：python > python3 > py
+fn find_python() -> Option<String> {
+    // 优先级：python > python3 > py。绝不在找不到时返回裸名 "python" ——
+    // 那会让 CreateProcess 按应用目录/CWD 搜索，重新打开可写目录劫持。
+    let where_exe = system_tool("where.exe")?;
     for name in &["python", "python3", "py"] {
-        let mut cmd = Command::new("where");
+        let mut cmd = Command::new(&where_exe);
         cmd.arg(name);
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
@@ -1142,41 +1369,75 @@ fn find_python() -> String {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if let Some(first_line) = stdout.lines().next() {
-                    return first_line.trim().to_string();
+                    let candidate = first_line.trim();
+                    if !candidate.is_empty() {
+                        return Some(candidate.to_string());
+                    }
                 }
             }
         }
     }
-    "python".to_string()
+    None
 }
 
-/// System32 里某个工具的绝对路径；拿不到 SystemRoot 时退回裸名。
+/// System32 里某个工具的绝对路径；拿不到系统目录或工具不存在时返回 `None`。
 ///
 /// 系统工具**必须**用绝对路径调用。裸名会走 CreateProcess 的搜索序，而
 /// "应用程序所在目录"与"当前目录"都排在 System32 之前 —— 外壳的 CWD 来自快捷
 /// 方式的 WorkingDirectory（Publish-PortableRuntime.ps1:88 把它设成用户可写的
 /// `<Dest>`），实测在那里植入 taskkill.exe 后，跑的是植入副本。
-fn system_tool(name: &str) -> PathBuf {
+///
+/// 目录由 `GetSystemDirectoryW` 给出，**不读 `SystemRoot`/`windir` 环境变量**：
+/// 环境可以被调用方/计划任务污染，指向一个攻击者控制的 "System32"。
+/// 拿不到目录时返回 `None`，调用方必须禁用该工具（Job Object 仍是主路径；
+/// psutil 兜底在后端）。退回裸名等于把可写目录劫持重新引进来，AGENTS §2.1
+/// 明确禁止。
+fn system_tool(name: &str) -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        let root = std::env::var_os("SystemRoot").or_else(|| std::env::var_os("windir"));
-        if let Some(root) = root {
-            return PathBuf::from(root).join("System32").join(name);
+        use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+        let mut buffer = [0u16; 260];
+        let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+        if length == 0 || length as usize >= buffer.len() {
+            return None;
         }
+        let system32 = PathBuf::from(String::from_utf16_lossy(&buffer[..length as usize]));
+        let candidate = system32.join(name);
+        candidate.is_file().then_some(candidate)
     }
-    PathBuf::from(name)
+    #[cfg(not(windows))]
+    {
+        let _ = name;
+        None
+    }
 }
 
 /// 杀掉进程树（包括所有子进程）
 fn kill_process_tree(pid: u32) {
-    // Windows: taskkill /F /T /PID（绝对路径，见 system_tool）
-    let mut cmd = Command::new(system_tool("taskkill.exe"));
+    // Windows: taskkill /F /T /PID（绝对路径，见 system_tool）。
+    // 解析不到时绝不退回裸名：Job Object 是主路径，这里只是兜底。
+    let Some(tool) = system_tool("taskkill.exe") else {
+        append_launcher_log(&format!(
+            "warning: taskkill.exe unavailable (SystemRoot missing); cannot terminate process tree pid={pid}"
+        ));
+        return;
+    };
+    let mut cmd = Command::new(tool);
     cmd.args(["/F", "/T", "/PID", &pid.to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
-    let _ = cmd.status();
+    match cmd.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => append_launcher_log(&format!(
+            "warning: taskkill exited with {status} for pid={pid}"
+        )),
+        Err(error) => append_launcher_log(&format!(
+            "warning: taskkill could not run for pid={pid}: {error}"
+        )),
+    }
 }
 
 /// 启动器日志的候选路径。首选 %APPDATA%，失败时退到 exe 同目录的 logs/
@@ -1214,7 +1475,14 @@ fn now_secs() -> u64 {
 
 const LAUNCHER_LOG_MAX_BYTES: u64 = 1024 * 1024;
 
+/// 串行化日志写入/轮转：监管线程与 setup 线程会并发写同一个文件，轮转时
+/// 的 rename 与 append 必须互斥，否则可能丢行或把新行写进已改名的文件。
+static LAUNCHER_LOG_LOCK: Mutex<()> = Mutex::new(());
+
 fn append_launcher_log_at(path: &Path, timestamp_secs: u64, message: &str) -> std::io::Result<()> {
+    let _guard = LAUNCHER_LOG_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1317,9 +1585,9 @@ async fn open_directory_dialog(app: tauri::AppHandle) -> Option<String> {
 mod tests {
     use super::{
         append_launcher_log_at, backend_readiness_is_authentic, backend_runtime_temp,
-        external_url_is_allowed, parse_backend_port, random_session_secret, readiness_proof,
-        ready_probe_url, supervision_backoff, system_tool, BackendSupervisor,
-        LAUNCHER_LOG_MAX_BYTES,
+        dir_is_writable, external_url_is_allowed, next_generation_failures, parse_backend_port,
+        random_session_secret, readiness_proof, ready_probe_url, supervision_backoff, system_tool,
+        webview2_data_dir, BackendSupervisor, LAUNCHER_LOG_MAX_BYTES,
     };
     use std::time::Duration;
 
@@ -1337,6 +1605,41 @@ mod tests {
         assert_eq!(parse_backend_port(r#"{"launcher_port":0}"#), None);
         assert_eq!(parse_backend_port(r#"{"launcher_port":70000}"#), None);
         assert_eq!(parse_backend_port("not-json"), None);
+    }
+
+    #[test]
+    fn parses_a_config_file_saved_with_a_utf8_bom() {
+        // 记事本"UTF-8"默认带 BOM；后端用 utf-8-sig 能读，外壳也必须能读。
+        assert_eq!(
+            parse_backend_port("\u{feff}{\"launcher_port\":17620}"),
+            Some(17620)
+        );
+    }
+
+    #[test]
+    fn webview2_data_dir_prefers_the_application_directory() {
+        let dir = std::env::temp_dir().join(format!("lunarshroud-webview2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let chosen = webview2_data_dir(Some(&dir)).expect("writable exe dir");
+        assert_eq!(chosen, dir.join("webview2-data"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writable_probe_matches_the_backend_contract() {
+        let dir =
+            std::env::temp_dir().join(format!("lunarshroud-writable-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(dir_is_writable(&dir));
+        // 用一个文件冒充目录：mkdir 必然失败。
+        let blocked = dir.join("blocked");
+        let _ = std::fs::remove_dir_all(&blocked);
+        let _ = std::fs::remove_file(&blocked);
+        std::fs::write(&blocked, b"not a dir").unwrap();
+        assert!(!dir_is_writable(&blocked));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&blocked);
     }
 
     #[test]
@@ -1426,6 +1729,25 @@ mod tests {
         assert_eq!(first.len(), 64);
         assert!(first.chars().all(|value| value.is_ascii_hexdigit()));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn fast_restarts_grow_the_failure_count_and_a_stable_generation_resets_it() {
+        assert_eq!(next_generation_failures(0, Duration::from_secs(1)), 1);
+        assert_eq!(next_generation_failures(3, Duration::from_secs(59)), 4);
+        assert_eq!(next_generation_failures(4, Duration::from_secs(60)), 0);
+        assert_eq!(
+            next_generation_failures(u32::MAX, Duration::from_secs(1)),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn session_is_not_published_after_shutdown() {
+        let supervisor = BackendSupervisor::new(17520);
+        supervisor.request_shutdown();
+        assert!(!supervisor.set_session("token".into()));
+        assert!(supervisor.current_session().is_none());
     }
 
     #[test]
@@ -1525,17 +1847,25 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn system_tools_are_resolved_inside_system32() {
-        let tool = system_tool("taskkill.exe");
+        let tool = system_tool("taskkill.exe").expect("taskkill.exe must resolve on Windows");
         assert!(tool.is_absolute(), "{tool:?}");
-        assert!(tool.ends_with("System32\\taskkill.exe"), "{tool:?}");
+        // GetSystemDirectoryW 返回的路径大小写随系统（实测 "system32"），
+        // 这里按 Windows 的路径语义做大小写无关比较。
+        let rendered = tool.to_string_lossy().to_ascii_lowercase();
+        assert!(rendered.ends_with("system32\\taskkill.exe"), "{tool:?}");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn missing_system_tools_are_disabled_instead_of_falling_back_to_a_bare_name() {
+        // 裸名会优先命中应用目录/CWD（用户可写）。找不到绝对路径时必须返回
+        // None，让调用方禁用该功能，而不是执行一个同名的植入件。
+        assert!(system_tool("lunarshroud-no-such-tool.exe").is_none());
     }
 
     #[test]
     #[cfg(not(windows))]
-    fn system_tools_fall_back_to_the_bare_name() {
-        assert_eq!(
-            system_tool("taskkill.exe").to_string_lossy(),
-            "taskkill.exe"
-        );
+    fn system_tools_are_disabled_without_systemroot() {
+        assert!(system_tool("taskkill.exe").is_none());
     }
 }

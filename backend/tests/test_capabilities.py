@@ -165,9 +165,10 @@ def test_unknown_cases_report_none_not_false():
     assert compare_param_default(meta(cli="--y"), no_default)["agrees"] is None
     assert "上游未声明默认值" in compare_param_default(meta(cli="--y"), no_default)["note"]
 
+    # 这份 probe 只有一两个选项（不完整）：不能据此断言"构建不支持"。
     missing = compare_param_default(meta(cli="--not-in-build"), probe)
     assert missing["agrees"] is None
-    assert "不支持该选项" in missing["note"]
+    assert "不完整" in missing["note"]
 
     assert compare_param_default(meta(cli="-x"), None)["agrees"] is None
     assert compare_param_default(meta(cli="-x"), ServerProbe(path="p", probed=False))["agrees"] is None
@@ -192,6 +193,20 @@ def test_comparison_runs_over_every_real_param_definition():
 
 
 # ========== 构建级聚合 ==========
+
+
+def test_missing_flag_is_unsupported_only_when_the_probe_is_complete():
+    from core.server_probe import MIN_COMPLETE_OPTIONS
+
+    text = "".join(
+        f"--opt{i} N    option {i} (default: 1)\n" for i in range(MIN_COMPLETE_OPTIONS)
+    )
+    complete = probe_with(text)
+    assert complete.complete is True
+
+    result = compare_param_default(meta(cli="--not-in-build"), complete)
+    assert result["agrees"] is None
+    assert "不支持该选项" in result["note"]
 
 
 def test_server_capabilities_without_probe():

@@ -365,18 +365,22 @@ def build_probe_from_text(path: str, help_text: str, version_text: str = "") -> 
 
 # ========== IO 与缓存 ==========
 
-def system_tool(name: str) -> str:
-    """System32 里某个工具的绝对路径；拿不到 SystemRoot 时退回裸名。
+def system_tool(name: str) -> str | None:
+    """System32 里某个工具的绝对路径；拿不到 SystemRoot 时返回 ``None``。
 
     系统工具**必须**用绝对路径调用。裸名会走 CreateProcess 的搜索序，而
     "应用程序所在目录"与"当前目录"都排在 System32 之前 —— 后端的 CWD 由外壳
     设定为 ``<安装目录>\\backend``（lib.rs:539），在便携安装与 NSIS 的
     CurrentUser 模式下都是用户可写的。实测：在该目录植入 taskkill.exe 后，
     ``subprocess.run(["taskkill", ...])`` 执行的是植入副本，不是 System32 的那份。
+
+    拿不到 SystemRoot 时**没有安全的绝对路径可退**：返回 ``None``，调用方必须
+    禁用该工具（taskkill 走 psutil 树杀，nvidia-smi 跳过 GPU 指标）。退回裸名
+    等于把"可写目录劫持"重新引进来，AGENTS §2.1 明确禁止。
     """
     root = os.environ.get("SystemRoot") or os.environ.get("windir")
     if not root:
-        return name
+        return None
     return os.path.join(root, "System32", name)
 
 
@@ -411,6 +415,8 @@ def which_on_path(name: str) -> str | None:
     for directory in os.environ.get("PATH", "").split(os.pathsep):
         if not directory.strip():
             continue  # 空项在 Windows 上等于 CWD —— 跳过
+        if not os.path.isabs(directory):
+            continue  # 相对 PATH 项同样相对 CWD —— 跳过，绝不让它变成命中
         for ext in ("", *pathext):
             candidate = os.path.join(directory, name + ext)
             if os.path.isfile(candidate):
@@ -466,10 +472,26 @@ _MAX_FOLLOWERS_PER_KEY = 8
 _WAITER_COUNT: dict[_CacheKey, int] = {}
 
 
+def _resolved_probe_path(exe_path: str | Path | None) -> Path | None:
+    """把探测目标解析成绝对路径；**绝不把相对名留给 CWD**。
+
+    相对名只按应用目录 / PATH 解析（见 ``resolve_server_path``）。解析失败
+    返回 None，调用方据此返回"未探测"而不是让 ``Path(...).is_file()`` /
+    ``Popen`` 相对当前工作目录命中一个用户可写的同名文件。
+    """
+    if not exe_path:
+        return None
+    path = Path(exe_path)
+    if path.is_absolute():
+        return path
+    resolved = resolve_server_path(str(exe_path))
+    return Path(resolved) if resolved else None
+
+
 def _cache_key(exe_path: str | Path | None) -> _CacheKey | None:
-    """缓存键 = (路径, mtime_ns, 文件大小)；拿不到就返回 None（不可缓存）。"""
-    path = Path(exe_path) if exe_path else None
-    if not path:
+    """缓存键 = (绝对路径, mtime_ns, 文件大小)；解析不到就返回 None。"""
+    path = _resolved_probe_path(exe_path)
+    if path is None:
         return None
     try:
         stat = path.stat()
@@ -580,8 +602,8 @@ def probe_server(exe_path: str | Path, *, timeout: float = DEFAULT_TIMEOUT) -> S
     路径不存在、执行超时、输出为空 —— 一律返回 ``probed=False`` 并带上原因，
     调用方据此降级（例如退回 schema 里的静态取值），而不是让接口 500。
     """
-    path = Path(exe_path) if exe_path else None
-    if not path or not path.is_file():
+    path = _resolved_probe_path(exe_path)
+    if path is None or not path.is_file():
         return ServerProbe(
             path=str(exe_path or ""),
             probed=False,

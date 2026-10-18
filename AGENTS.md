@@ -44,6 +44,16 @@ python tools/check_release_mirror.py       # 发布镜像门禁（见 §3）
 *钉它的测试*：`test_regressions.py` 里的 CWD 植入件拒绝、空默认值行为、
 `Popen` 确实收到 `cwd=` 与过滤后的 `env=`。
 
+补充（2026-10-18）：`system_tool()` 取不到系统目录时返回 `None`，调用方必须
+**禁用**该工具；Rust 外壳用 `GetSystemDirectoryW` 而不是 `SystemRoot` 环境变量。
+`which_on_path()` 跳过相对 `PATH` 项；`probe_server()` 只按应用目录/PATH 解析
+相对名，解析失败返回"未探测"，绝不相对 CWD 执行。
+钉它的测试：`test_system_tools_are_disabled_without_systemroot`、
+`test_which_on_path_ignores_relative_path_entries`、
+`test_probe_server_never_executes_a_relative_name_from_cwd`，以及 Rust 的
+`system_tools_are_resolved_inside_system32` /
+`missing_system_tools_are_disabled_instead_of_falling_back_to_a_bare_name`。
+
 ### 2.2 会话令牌不得发给"尚未确认是谁"的对端
 
 就绪探测走 `/api/system/ready?session=<session_id>&nonce=<nonce>`：它**不要
@@ -208,6 +218,12 @@ lifespan 的 `init_db()` 抛 `DatabaseError`，进程以 exit 3 退出，用户�
 3. **终止失败必须保留进程句柄与端口预留**，并允许再次 stop。把 `process`
    置 `None` 等于丢掉唯一能杀它的句柄；提前 `_release_port` 会让端口被分配给
    下一个实例。`remove_instance` 在仍有活进程时必须拒绝。
+4. **端口预留按所有者释放**。重启会复用同一个 `(host, port)`；旧一代的监控
+   线程/终态剪枝不得删除新一代的预留。只有确认没有其他
+   `starting`/`running`/`stopping` 实例拥有该键、且本进程已死亡时才
+   `discard`；监控线程在 stop 期间被唤醒但进程未死时，不得伪造 `STOPPED` 或
+   释放端口。钉它的测试：`test_port_reservation_survives_the_old_generations_stale_release`、
+   `test_release_port_keeps_reservation_while_the_process_is_alive`。
 
 *为什么*：以上三条任一被破坏，表现都不是报错而是"停止按钮没反应 / 历史里
 一直是 FAILED / 端口占着却没人能停"，而且只在 taskkill 被拦或进程受保护时
@@ -222,6 +238,8 @@ lifespan 的 `init_db()` 抛 `DatabaseError`，进程以 exit 3 退出，用户�
 运行时。`src-tauri/build.rs`、`tauri.conf.json` 的 bundle resources、
 `Publish-PortableRuntime.ps1` 都必须整棵复制并逐文件校验；只复制 exe 会得到
 一个启动即失败的 sidecar（找不到 Python 运行时），而用户只会看到"后端启动失败"。
+部署脚本还必须**拒绝**缺少 `_internal/` 的构建，并在换入/校验失败时恢复旧的
+launcher/backend/runtime 三段（不能留下"新 exe + 旧运行时"的混合对）。
 
 *为什么*：onefile 每次启动要解压 ~20 MB 到 `%TEMP%`，在用户的临时目录被
 重定向/只读/安全软件拦截时，PyInstaller 只弹 "Could not create temporary
@@ -288,6 +306,10 @@ python tools/check_release_mirror.py           # 复查，必须 CLEAN
 不要为了通过而放宽规则，要为了通过而**修内容**。隐私扫描覆盖
 UTF-8 / UTF-16LE / UTF-16BE / latin-1 以及 gzip/zlib 容器——所以"把路径写进
 二进制或压缩文件"也不是出路。
+
+镜像目录本身缺失时必须非 0 退出（只有在公开镜像自身里运行时才用
+`--allow-missing-mirror` 显式跳过）；`--apply` 必须先做隐私/禁用规则预检，
+任何命中都在**写入前**中止——不能先把私有内容复制进 `github/` 再报错。
 
 **刻意不发布**（在 `CURATED_EXCLUDES` 里有规则，不是靠记忆）：
 内部审计文档、AI 编码工具的配置与忽略文件、`data/`、`tmp/`、一切构建产物。

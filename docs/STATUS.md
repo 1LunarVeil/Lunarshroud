@@ -1,6 +1,6 @@
 # Current status
 
-Last reviewed: 2026-10-17 (Asia/Shanghai)  
+Last reviewed: 2026-10-18 (Asia/Shanghai)  
 Current candidate: `0.9.0-beta.2`  
 Release posture: Windows beta; do **not** describe as 1.0 or stable.
 
@@ -12,17 +12,95 @@ The current candidate is **`0.9.0-beta.2`**, rebuilt on 2026-10-17 after the
 independent release audit summarized under *Thirteenth round* below; its
 fingerprints are in *Currently deployed pair (0.9.0-beta.2)*.
 
-Current working-tree checks (2026-10-17, after the audit fixes):
+Current working-tree checks (2026-10-18, after the post-takeover hardening):
 
 ```text
-backend    python -m pytest -q                      508 passed
-coverage   --cov=backend --cov-fail-under=75        88.41% (gate 75)
-frontend   node --test frontend/tests/*.mjs          20 passed
+backend    python -m pytest -q                      532 passed
+coverage   --cov=backend --cov-fail-under=75        88.01% (gate 75)
+frontend   node --test frontend/tests/*.mjs          21 passed
 syntax     node --check (17 files)                   clean
 lint       python -m ruff check backend tools        clean
 mirror     tools/check_release_mirror.py             CLEAN, 154 files
-rust       cargo fmt/clippy/test                     clean, 14 passed
-build      PyInstaller twice, pinned env             identical backend.exe (854F95A7…)
+rust       cargo fmt/clippy/test                     clean, 20 passed
+build      PyInstaller onedir, pinned env            backend.exe 0515C0E6…
+```
+
+## Post-takeover hardening (2026-10-18, deployed)
+
+A read-only, three-way review of the beta.2 tree (backend lifecycle, Tauri
+shell, silent failures/test gaps) re-derived the release state instead of
+trusting the previous session's claims. It found no P1, but several P2
+defects that could reproduce the reported instability. All were fixed,
+tested red-green and rebuilt into the deployed pair:
+
+- **Port reservation ownership.** A stale monitor from a stopped generation
+  could release the *new* generation's reservation for the same reused port;
+  the next auto-assigned instance could then bind the same port. Reservations
+  are now released only when no other starting/running/stopping instance owns
+  the key and the process is confirmed dead. A monitor that wakes while the
+  stop path is still terminating no longer fabricates `STOPPED` or releases
+  the port. Tests: `test_port_reservation_survives_the_old_generations_stale_release`,
+  `test_release_port_keeps_reservation_while_the_process_is_alive`.
+- **System tools never fall back to bare names.** Python and Rust now resolve
+  `taskkill.exe`/`nvidia-smi.exe` from the real system directory
+  (`GetSystemDirectoryW` in Rust) and disable the helper when it cannot be
+  resolved; `which_on_path` skips relative `PATH` entries. Tests:
+  `test_system_tools_are_disabled_without_systemroot`,
+  `test_which_on_path_ignores_relative_path_entries`,
+  `system_tools_are_resolved_inside_system32`, and the missing-tool Rust test.
+- **Capability probes cannot execute CWD files.** `probe_server` resolves
+  relative `llama-server` names only against the application directory/PATH;
+  an unresolved name returns a failed probe instead of `Popen`-ing a same-named
+  file in the current directory. `_warm_server_probe` skips unresolved paths.
+  Test: `test_probe_server_never_executes_a_relative_name_from_cwd`.
+- **Incomplete `--help` no longer claims unsupported flags.** Missing options
+  are called unsupported only when the probe is complete; an unparsed
+  `--spec-type` block reports unknown instead of "all values unsupported".
+- **Shell/backend data directory alignment.** The launcher reproduces the
+  backend's writable-candidate order (including `<launcher>\backend\data`)
+  and strips a UTF-8 BOM, so a `launcher_port` saved in a restricted-environment
+  fallback directory is honored. Verified end-to-end: with every normal user
+  directory pointed at a file, the second start listened on the edited
+  `17531`, not the default.
+- **Tauri lifecycle/diagnostics.** Single-instance creation failure no longer
+  masquerades as "already running"; rapid crash loops back off up to 30 s;
+  WebView2 falls back from the exe directory to `%LOCALAPPDATA%`; the
+  readiness response is capped at 8 KiB and does not follow redirects;
+  shutdown waits briefly for the backend and always logs the exit; the child
+  stderr log falls back to the runtime temp directory; launcher log writes are
+  serialized.
+- **Client/API robustness.** Non-idempotent requests are no longer retried on
+  network failure (duplicate instance/preset creation); WS parse/handler
+  errors are logged; log-feed drops are surfaced as `logs_dropped`; late
+  stdout lines cannot reopen a finalized instance log; an unreadable config is
+  never overwritten with defaults; `/api/models/vram-estimate` samples GPUs
+  off the event loop; missing static assets return 404 instead of
+  `index.html`; deleting an unknown instance returns 404; NVML's
+  `NVML_VALUE_NOT_AVAILABLE` sentinel is reported as unknown.
+- **Release mirror gate.** Missing `github/` now fails closed (opt-in
+  `--allow-missing-mirror` for the public mirror itself); `--apply` runs the
+  privacy/forbidden checks *before* writing anything; runtime directories
+  created beside the exe (`webview2-data/`, `logs/`, `runtime-temp/`,
+  `appdata/`) and local AI session directories (`dsh-session-*`, `CLAUDE.md`)
+  are excluded at any depth.
+- **Portable deployer.** An incomplete onedir build (no `_internal`) is
+  rejected before touching the destination; launcher, backend and runtime are
+  swapped together and restored on failure.
+
+Verification for this revision:
+
+```text
+pytest        532 passed, coverage 88.01%
+frontend      21 passed, 17 JS files syntax-clean
+rust          fmt/clippy clean, 20 tests
+mirror        CLEAN, 154 files
+packaged      tmp/release_smoke.py: 22/22 (isolated APPDATA, dead proxy,
+              HMAC readiness, token rotation, Job reaping, clean-shutdown log)
+broken TEMP   launcher + backend reach ready with TEMP/TMP pointing at a
+              nonexistent path
+single inst.  second launch exits 0; exactly one launcher/backend remain
+fallback      all normal user-data env vars unusable: backend uses
+              <app>\backend\data; edited launcher_port=17531 is honored
 ```
 
 The fresh-environment row in the older block below is not a re-run in the
@@ -154,9 +232,9 @@ Built in this workspace with `SOURCE_DATE_EPOCH=1790000000`,
 `tools/Publish-PortableRuntime.ps1 -Destination . -SkipDesktopShortcut`:
 
 ```text
-launcher  C5D0B038FFA8BBABE13A5B55734768403006F16357560C7A2D2460B26BFDCFF7
-backend   854F95A7016387AF5BD10FA61E7843559634148F1882F35C977ABEDC12602BB3
-installer 864606CE6EC0EA45F53E92D5774DF39F90B470B4A171C3BB5C702B83A7784A06
+launcher  927F94E4B788E990E9ED52703D9E25E4D715AEA277C59C739A6CAC805E9513A6
+backend   0515C0E61A5A3625162F21FEC943A78EB7AF2C8EBDDE6F210A20B467BB41E1FC
+installer 8F29EB402ED746656C4A340399A95AE54B7A6C6D94BADAA4205D732EE8079259
           (src-tauri/target/release/bundle/nsis/LunarShroud_0.9.0-beta.2_x64-setup.exe)
 ```
 

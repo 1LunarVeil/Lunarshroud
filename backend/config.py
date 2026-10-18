@@ -383,7 +383,16 @@ def _load_config_from_file() -> dict[str, Any]:
         )
         save_config(DEFAULT_CONFIG)
         return DEFAULT_CONFIG.copy()
-    except OSError:
+    except OSError as exc:
+        # 读不了不等于损坏：可能是 AV/共享锁、ACL 或路径被替换成目录。
+        # 绝不能在后续保存时用默认值覆盖真实配置 —— 标记后 update_config 拒绝落盘。
+        global _config_load_failed
+        _config_load_failed = True
+        LOGGER.warning(
+            "无法读取配置文件 %s（%s）；本次使用默认值，且不会覆盖原文件",
+            CONFIG_FILE,
+            exc,
+        )
         return DEFAULT_CONFIG.copy()
 
 
@@ -396,6 +405,9 @@ def save_config(cfg: dict[str, Any]) -> None:
 
 # 全局配置单例（首次导入时加载）
 _config: dict[str, Any] | None = None
+# 配置文件存在但读取失败（锁/权限/路径类型）。此时内存里是默认值，后续保存
+# 必须拒绝，否则会把用户真实配置覆盖成默认值。
+_config_load_failed = False
 
 # update_config 的"读-改-写-重绑"必须整体串行：并发 PUT 各自基于旧快照
 # 计算 candidate，后落盘者会把先落盘者的键覆盖回去（R4 静默丢更新）。
@@ -415,6 +427,12 @@ def update_config(updates: dict[str, Any]) -> dict[str, Any]:
     unknown = [key for key in updates if key not in DEFAULT_CONFIG]
     if unknown:
         raise ValueError(f"unsupported config key(s): {', '.join(sorted(unknown))}")
+    if _config_load_failed:
+        # 当前内存配置来自"读取失败后的默认值"；保存会把用户真实配置覆盖掉。
+        raise ValueError(
+            "configuration file could not be read; refusing to overwrite it with "
+            "defaults. Fix the file permission/lock and restart the launcher."
+        )
     global _config
     # 读-改-写-重绑整体持锁：否则并发 PUT 各自基于旧快照算 candidate，
     # 后落盘者会把先落盘者的键覆盖回去 —— 静默丢更新（审计 R4）。

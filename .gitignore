@@ -93,6 +93,18 @@ secrets*.json
 wheelhouse/
 SHA256SUMS.txt
 
+# 应用在 exe 同目录创建的运行时目录（Tauri 外壳的 WebView2 数据目录、
+# 回退日志、PyInstaller 运行时临时目录）。从源码树根直接运行便携版时，
+# 这些目录会出现在仓库根，里面的路径与缓存都不是源码。
+webview2-data/
+logs/
+runtime-temp/
+appdata/
+
+# 外部 AI 工具导出的本地会话目录（dsh-session-*）与 Claude Code 指令文件。
+dsh-session-*/
+CLAUDE.md
+
 # 本地调试产物 / IDE 私有设置（绝不提交）
 # .claude/settings.local.json 里记着本机用户名与绝对路径，不能进历史
 tmp/

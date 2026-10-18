@@ -66,10 +66,15 @@ def test_portable_runtime_deployer_stages_matching_launcher_and_backend(tmp_path
     root = Path(__file__).resolve().parents[2]
     deployer = root / "tools" / "Publish-PortableRuntime.ps1"
     launcher_source = tmp_path / "release-launcher.exe"
-    backend_source = tmp_path / "release-backend.exe"
+    runtime = tmp_path / "dist" / "backend"
+    backend_source = runtime / "backend.exe"
     destination = tmp_path / "portable"
     launcher_source.write_bytes(b"new launcher")
+    backend_source.parent.mkdir(parents=True)
     backend_source.write_bytes(b"new backend")
+    # onedir 是唯一的产品布局：缺 _internal 的部署必须被拒绝。
+    (runtime / "_internal").mkdir()
+    (runtime / "_internal" / "python311.dll").write_bytes(b"runtime")
 
     result = subprocess.run(
         [
@@ -140,6 +145,39 @@ def test_portable_runtime_deployer_copies_the_onedir_runtime(tmp_path):
     assert (destination / "backend" / "_internal" / "sub" / "base_library.zip").read_bytes() == b"stdlib"
 
 
+def test_portable_runtime_deployer_rejects_an_incomplete_onedir_build(tmp_path):
+    """只有 backend.exe、没有 _internal 的构建必须拒绝部署。
+
+    旧脚本把它当成 onefile 并删除目标上已有的 _internal —— 部署后后端
+    找不到 Python 运行时，用户只看到"后端启动失败"。
+    """
+    root = Path(__file__).resolve().parents[2]
+    deployer = root / "tools" / "Publish-PortableRuntime.ps1"
+    launcher_source = tmp_path / "release-launcher.exe"
+    backend_source = tmp_path / "release-backend.exe"
+    destination = tmp_path / "portable"
+    launcher_source.write_bytes(b"new launcher")
+    backend_source.write_bytes(b"new backend")
+
+    result = subprocess.run(
+        [
+            "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", str(deployer),
+            "-LauncherSource", str(launcher_source),
+            "-BackendSource", str(backend_source),
+            "-Destination", str(destination),
+            "-SkipDesktopShortcut",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode != 0
+    assert "incomplete" in (result.stdout + result.stderr).lower()
+    assert not (destination / "backend" / "backend.exe").exists()
+
+
 def test_deployer_resolves_relative_destination_from_powershell_location(tmp_path):
     r"""`-Destination .` must follow PowerShell's location, not .NET's cwd.
 
@@ -150,9 +188,13 @@ def test_deployer_resolves_relative_destination_from_powershell_location(tmp_pat
     root = Path(__file__).resolve().parents[2]
     deployer = root / "tools" / "Publish-PortableRuntime.ps1"
     launcher_source = tmp_path / "release-launcher.exe"
-    backend_source = tmp_path / "release-backend.exe"
+    runtime = tmp_path / "dist" / "backend"
+    backend_source = runtime / "backend.exe"
     launcher_source.write_bytes(b"new launcher")
+    backend_source.parent.mkdir(parents=True)
     backend_source.write_bytes(b"new backend")
+    (runtime / "_internal").mkdir()
+    (runtime / "_internal" / "python311.dll").write_bytes(b"runtime")
     target_parent = tmp_path / "chosen-parent"
     elsewhere = tmp_path / "elsewhere"
     target_parent.mkdir()

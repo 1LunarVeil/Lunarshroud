@@ -34,6 +34,17 @@ Notable changes follow the Keep a Changelog structure. The project is currently 
 - Allowed values declared in the **argument position** are now parsed: `--pooling {none,mean,cls,last,rank}` and `--reasoning [on|off|auto]` style hints feed `upstream_options`, so those dropdowns track the local build instead of a static snapshot (previously only `allowed values:` text and the `--spec-type` special case were understood).
 - `GGML_ASSERT` crash lines are now recognized as the fatal cause and, when the assertion is one we have reproduced, translated into an actionable workaround. The first entry is v0.7.0's `GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max)`, which fires when an embedding model is loaded with a single slot and no `--embeddings`; both workarounds (enable the embeddings endpoint, or use 2+ parallel slots) were verified end to end through the launcher.
 
+### Fixed (post-takeover hardening, 2026-10-18)
+
+- Restart/stop races no longer release a port that a newer generation is still using; a process that has not exited keeps its handle and reservation. This removes a duplicate-port class behind "port already in use" launch failures.
+- System helpers (`taskkill.exe`, `nvidia-smi.exe`) are resolved from the actual system directory and disabled if that fails; relative `PATH` entries are ignored. A relative `llama-server` name can no longer execute a same-named file from the current directory during capability probing.
+- Capability results from an incomplete `--help` no longer report supported flags as unsupported.
+- In restricted environments the launcher and backend now choose the same writable data directory, so a saved `launcher_port` is honored instead of being overridden by the old `%APPDATA%` value.
+- Single-instance mutex failures no longer show "already running"; crash-loop restarts back off to 30 s; WebView2 falls back to `%LOCALAPPDATA%` when the exe directory is read-only; the readiness probe caps the response body and refuses redirects; a normal close always logs the backend exit.
+- Non-idempotent API calls are no longer automatically retried on network errors (which could create duplicate instances/presets); missing static assets return 404; an unreadable config is never overwritten with defaults; GPU sampling for VRAM estimates runs off the event loop.
+- The release mirror gate fails closed when `github/` is missing, checks privacy/forbidden rules before `--apply` writes, and excludes runtime directories created beside the exe.
+- The portable deployer rejects an incomplete onedir build and swaps launcher/backend/runtime together with rollback.
+
 ### Changed
 
 - Release builds now pin `SOURCE_DATE_EPOCH=1790000000` and `PYTHONHASHSEED=0`. Without them, consecutive PyInstaller builds embedded different timestamps/hash iteration order; with them, two consecutive builds produced byte-identical `backend.exe` and `lunarshroud.exe`. The NSIS installer still varies because makensis writes its own metadata, so release verification checks the installed binary hashes.

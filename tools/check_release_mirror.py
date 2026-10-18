@@ -58,6 +58,9 @@ EXCLUDED_DIR_NAMES = frozenset({
     "__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache",
     "node_modules", ".venv", "venv", "env",
     "htmlcov", "shots", "wheelhouse",
+    # 应用运行时目录：便携版从任意工作目录启动都可能在 exe 旁创建它们；
+    # 规则按目录名在任意层级排除，而不是只认仓库根。
+    "webview2-data", "runtime-temp", "appdata", "logs",
 })
 
 # 只在这些位置排除的目录（构建产物 / 运行时数据 / 镜像自身）
@@ -78,6 +81,16 @@ EXCLUDED_DIR_PREFIXES = (
     # 配置损坏时 config.py:284 会写 config.json.corrupt（内含本机模型目录绝对路径）。
     # 这些派生名不可枚举，逐条列名必然漏 —— 审计已实证漏网并被 --apply 复制进镜像。
     "data/",
+    # 应用在 exe 同目录创建的运行时目录。用户从源码树根直接运行便携版时，
+    # 这些目录就落在仓库根：WebView2 缓存含本机路径/站点数据，launcher.log
+    # 含环境变量，runtime-temp 可残留 PyInstaller 解压件 —— 都不是源码。
+    "webview2-data/",
+    "logs/",
+    "runtime-temp/",
+    "appdata/",
+    # 外部 AI 工具导出的本地会话目录（dsh-session-*）：整段对话、附件与
+    # 本机绝对路径都在里面，绝不能进公开镜像。
+    "dsh-session-",
 )
 
 # 构建产物/归档后缀（注意：.png/.ico 是源码资源，不能按后缀一刀切）
@@ -106,6 +119,8 @@ EXCLUDED_GLOBS = (
     ".env", ".env.*",
     "*.pem", "*.key", "*.pfx", "*.p12",
     "credentials*.json", "secrets*.json",
+    # Claude Code 的项目指令文件（任意层级）：含本机工具约定，公开约定见 AGENTS.md。
+    "CLAUDE.md",
 )
 
 # 规则 2：**刻意**不进镜像的工作树文件 —— 每一条都要有理由。
@@ -130,6 +145,8 @@ CURATED_EXCLUDES = {
         "含本机绝对路径（内部演进记录，不对外）",
     "docs/archive/":
         "历史交接/测试材料，含本机绝对路径；docs/ 是 0.9.0-beta.1 权威文档，不改不搬",
+    "CLAUDE.md":
+        "AI 编码工具（Claude Code）的项目指令，非面向用户的项目文档；公开约定见 AGENTS.md",
 }
 
 # 2026-09-18 起：原本还有 3 个 tools/*.py 因硬编码本机模型库绝对路径被排除。
@@ -166,6 +183,14 @@ FORBIDDEN_GLOBS = (
     "*backend/dist/*", "backend/dist/*", "*backend/build/*", "backend/build/*",
     "backend/_internal/*", "*backend/_internal/*",
     "data/*",
+    # 应用运行时目录与本地 AI 会话：即使它们在镜像里出现也必须判违规。
+    # 前缀 `*` 让规则覆盖任意层级（fnmatch 的 `*` 也匹配 `/`）。
+    "webview2-data/*", "*webview2-data/*",
+    "logs/*", "*logs/*",
+    "runtime-temp/*", "*runtime-temp/*",
+    "appdata/*", "*appdata/*",
+    "dsh-session-*/*", "*dsh-session-*/*",
+    "CLAUDE.md", "*CLAUDE.md",
 )
 
 # 规则 4：镜像文本里不能出现本机痕迹。
@@ -224,7 +249,9 @@ def is_excluded(rel: str) -> tuple[bool, str]:
     """工作树相对路径是否不进镜像；返回 (排除?, 原因)。"""
     for part in rel.split("/"):
         if part in EXCLUDED_DIR_NAMES:
-            return True, f"缓存/IDE 目录 {part}/"
+            return True, f"缓存/IDE/运行时目录 {part}/"
+        if part.startswith("dsh-session-"):
+            return True, "本地 AI 会话目录 dsh-session-*/"
     for prefix in EXCLUDED_DIR_PREFIXES:
         if rel == prefix.rstrip("/") or rel.startswith(prefix):
             return True, f"构建/运行时路径 {prefix}"
@@ -240,7 +267,7 @@ def is_excluded(rel: str) -> tuple[bool, str]:
 
 
 def _pruned_dir(rel_dir: str, name: str) -> bool:
-    if name in EXCLUDED_DIR_NAMES:
+    if name in EXCLUDED_DIR_NAMES or name.startswith("dsh-session-"):
         return True
     rel = f"{rel_dir}/{name}" if rel_dir else name
     return any(rel.startswith(prefix) for prefix in EXCLUDED_DIR_PREFIXES)
@@ -468,8 +495,24 @@ def report(result: dict, stream) -> int:
 
 
 def apply(root: Path = ROOT, mirror: Path = MIRROR, stream=sys.stdout) -> int:
-    """把镜像刷成工作树的样子（与检查共用同一套规则）。返回检查退出码。"""
+    """把镜像刷成工作树的样子（与检查共用同一套规则）。返回检查退出码。
+
+    **先检查、后写入**：`--apply` 是发布动作，不能先把含本机路径的文件复制
+    进镜像、再在报告里说它有问题 —— 那时私有内容已经落在公开树里了。
+    """
     expected = expected_tree(root)
+    forbidden = sorted(rel for rel in expected if is_forbidden(rel))
+    if forbidden:
+        print("--apply 中止：以下待发布路径命中禁用规则，未写入任何文件：", file=stream)
+        for rel in forbidden:
+            print(f"  ! {rel}", file=stream)
+        return 2
+    privacy = privacy_hits(root, sorted(expected))
+    if privacy:
+        print("--apply 中止：工作树待发布文件含本机痕迹，未写入任何文件：", file=stream)
+        for rel, label, snippet in privacy:
+            print(f"  ! {rel}  [{label}]  …{snippet}…", file=stream)
+        return 2
     actual = walk(mirror, prune_excluded=False)
 
     added, changed, removed = [], [], []
@@ -516,6 +559,11 @@ def main(argv=None) -> int:
     parser.add_argument("--apply", action="store_true",
                         help="按同一套规则刷新镜像（默认只检查、不写盘）")
     parser.add_argument("--json", action="store_true", help="输出机器可读 JSON")
+    parser.add_argument(
+        "--allow-missing-mirror",
+        action="store_true",
+        help="镜像目录不存在时跳过（默认 fail closed）",
+    )
     parser.add_argument("--root", default=str(ROOT), help=argparse.SUPPRESS)
     parser.add_argument("--mirror", default=str(MIRROR), help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -525,17 +573,24 @@ def main(argv=None) -> int:
         if args.apply:
             print(f"错误：镜像目录不存在，拒绝 --apply：{mirror}", file=sys.stderr)
             return 2
-        # 门禁脚本自身会随镜像发布。在公开镜像自身里运行时
-        # <root>/github 不存在 —— 那不是“镜像丢了”，而是“我就在
-        # 镜像里”，此时无事可比。显式说出来并放行，不要静默给个假绿 ——
-        # 但也不能报 FAIL，否则公开仓库的 CI 会永久红。
+        if args.allow_missing_mirror:
+            # 显式 opt-in（例如在公开镜像自身里运行）：这里没有可比的镜像。
+            print(
+                "== LunarShroud 发布镜像门禁 =="
+                f"未找到镜像目录 {mirror}；已按 --allow-missing-mirror 跳过。",
+                file=sys.stdout,
+            )
+            return 0
+        # Fail closed：镜像丢失/路径写错时绝不能返回 0，否则发布流程会
+        # 在"一个文件都没比"的情况下拿到假绿。公开仓库的 CI 用
+        # `if: hashFiles('github/**') != ''` 跳过本步骤，不需要放行分支。
         print(
-            "== LunarShroud 发布镜像门禁 =="
-            f"未找到镜像目录 {mirror}；本次不执行比对。"
-            "（工作树里运行时该目录必须存在；公开镜像内无事可比）",
-            file=sys.stdout,
+            f"错误：未找到发布镜像目录 {mirror}。"
+            "工作树里该目录必须存在；若你就在公开镜像内运行，请显式加 "
+            "--allow-missing-mirror。",
+            file=sys.stderr,
         )
-        return 0
+        return 2
 
     if args.apply:
         return apply(root, mirror)

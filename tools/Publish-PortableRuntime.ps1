@@ -86,6 +86,12 @@ $launcher = Get-VerifiedPath $LauncherSource 'Launcher source'
 $backend = Get-VerifiedPath $BackendSource 'Backend source'
 $backendRuntimeSource = Split-Path -Parent $backend
 $internalSource = Join-Path $backendRuntimeSource '_internal'
+if (-not (Test-Path -LiteralPath $internalSource -PathType Container)) {
+    throw "Backend runtime is incomplete: '$internalSource' is missing. Run PyInstaller backend.spec (onedir) before deploying."
+}
+if (@(Get-ChildItem -LiteralPath $internalSource -Recurse -File).Count -eq 0) {
+    throw "Backend runtime is incomplete: '$internalSource' contains no files."
+}
 $destinationRoot = Resolve-UserPath $Destination
 $launcherDestination = Join-Path $destinationRoot 'LunarShroud.exe'
 $backendDestination = Join-Path $destinationRoot 'backend\backend.exe'
@@ -117,31 +123,72 @@ $backendStage = "$backendDestination.next"
 $internalStage = "$internalDestination.next"
 Copy-Item -LiteralPath $launcher -Destination $launcherStage -Force
 Copy-Item -LiteralPath $backend -Destination $backendStage -Force
-if (Test-Path -LiteralPath $internalSource -PathType Container) {
-    Copy-TreeVerified $internalSource $internalStage 'Backend runtime staging'
-} elseif (Test-Path -LiteralPath $internalStage) {
-    Remove-Item -LiteralPath $internalStage -Recurse -Force
-}
+Copy-TreeVerified $internalSource $internalStage 'Backend runtime staging'
+
+$launcherRollback = "$launcherDestination.rollback"
+$backendRollback = "$backendDestination.rollback"
+$internalRollback = "$internalDestination.rollback"
+$rolledBack = $false
+$swapped = $false
 
 try {
     Assert-SameHash $launcher $launcherStage 'Launcher staging'
     Assert-SameHash $backend $backendStage 'Backend staging'
-    Copy-Item -LiteralPath $launcherStage -Destination $launcherDestination -Force
-    Copy-Item -LiteralPath $backendStage -Destination $backendDestination -Force
-    if (Test-Path -LiteralPath $internalStage -PathType Container) {
-        if (Test-Path -LiteralPath $internalDestination) {
-            Remove-Item -LiteralPath $internalDestination -Recurse -Force
+
+    # 三段一起换入：任何一步失败都把旧的三段整体恢复。只换 _internal 而留下
+    # 新 launcher/backend 会产生版本不匹配；没有回滚则可能得到"新 exe + 缺
+    # 运行时"的不可启动组合。运行中的 exe 无法改名，先让用户关闭应用。
+    foreach ($path in @($launcherRollback, $backendRollback, $internalRollback)) {
+        if (Test-Path -LiteralPath $path) {
+            Remove-Item -LiteralPath $path -Recurse -Force
         }
-        Move-Item -LiteralPath $internalStage -Destination $internalDestination
-        Assert-SameTree $internalSource $internalDestination 'Backend runtime deployment'
-    } elseif (Test-Path -LiteralPath $internalDestination) {
-        # 切换回 onefile 时清掉旧 onedir 运行时，避免留下不匹配的 _internal。
-        Remove-Item -LiteralPath $internalDestination -Recurse -Force
     }
+    if (Test-Path -LiteralPath $launcherDestination) {
+        Move-Item -LiteralPath $launcherDestination -Destination $launcherRollback
+    }
+    if (Test-Path -LiteralPath $backendDestination) {
+        Move-Item -LiteralPath $backendDestination -Destination $backendRollback
+    }
+    if (Test-Path -LiteralPath $internalDestination) {
+        Move-Item -LiteralPath $internalDestination -Destination $internalRollback
+    }
+
+    Move-Item -LiteralPath $launcherStage -Destination $launcherDestination
+    Move-Item -LiteralPath $backendStage -Destination $backendDestination
+    Move-Item -LiteralPath $internalStage -Destination $internalDestination
+
     Assert-SameHash $launcher $launcherDestination 'Launcher deployment'
     Assert-SameHash $backend $backendDestination 'Backend deployment'
+    Assert-SameTree $internalSource $internalDestination 'Backend runtime deployment'
+    $swapped = $true
+}
+catch {
+    # 尽力恢复旧对；清理失败不覆盖原始异常。
+    foreach ($path in @($launcherDestination, $backendDestination, $internalDestination)) {
+        if (Test-Path -LiteralPath $path) {
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if (Test-Path -LiteralPath $launcherRollback) {
+        Move-Item -LiteralPath $launcherRollback -Destination $launcherDestination -ErrorAction SilentlyContinue
+    }
+    if (Test-Path -LiteralPath $backendRollback) {
+        Move-Item -LiteralPath $backendRollback -Destination $backendDestination -ErrorAction SilentlyContinue
+    }
+    if (Test-Path -LiteralPath $internalRollback) {
+        Move-Item -LiteralPath $internalRollback -Destination $internalDestination -ErrorAction SilentlyContinue
+    }
+    $rolledBack = $true
+    throw
 }
 finally {
+    if ($swapped -or $rolledBack) {
+        foreach ($path in @($launcherRollback, $backendRollback, $internalRollback)) {
+            if (Test-Path -LiteralPath $path) {
+                Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
     Remove-Item -LiteralPath $launcherStage,$backendStage -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $internalStage -Recurse -Force -ErrorAction SilentlyContinue
 }

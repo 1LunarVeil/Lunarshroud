@@ -119,8 +119,10 @@ async function _request(method, path, body, attempt = 0) {
     if (e && e.name === 'AbortError') {
       throw new Error(t('api.requestTimeout'));
     }
-    // 网络失败可能是后端正在重启：刷新会话后重试一次
-    if (attempt < 1) {
+    // 网络失败可能是后端正在重启：只对**幂等**请求自动重试。
+    // POST/PUT/DELETE 可能已经在后端执行过，响应丢失时重试会创建重复实例/
+    // 预设或重复停止；这类请求交给调用方决定是否重试。
+    if (attempt < 1 && (method === 'GET' || method === 'HEAD')) {
       await new Promise((resolve) => setTimeout(resolve, RETRY_AFTER_MS));
       _resetSessionCache();
       return _request(method, path, body, attempt + 1);
@@ -223,10 +225,18 @@ function _createWebSocketWatcher(path, { onMessage, onStatus } = {}) {
       };
       sock.onmessage = (ev) => {
         if (closed) return;
+        let message;
         try {
-          onMessage(JSON.parse(ev.data));
-        } catch {
-          // 忽略解析失败
+          message = JSON.parse(ev.data);
+        } catch (error) {
+          console.error('[WS] 收到无法解析的消息', error);
+          return;
+        }
+        try {
+          onMessage(message);
+        } catch (error) {
+          // 处理函数抛错不能让整个实时推送静默停摆；至少留下可诊断的日志。
+          console.error('[WS] 消息处理失败', error);
         }
       };
       sock.onclose = () => {
@@ -237,7 +247,8 @@ function _createWebSocketWatcher(path, { onMessage, onStatus } = {}) {
       sock.onerror = () => {
         // onclose 随后触发，统一在 onclose 中处理
       };
-    } catch {
+    } catch (error) {
+      console.warn('[WS] 连接失败，将按退避重连', error);
       scheduleReconnect();
     }
   }

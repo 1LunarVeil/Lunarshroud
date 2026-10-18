@@ -905,6 +905,122 @@ def test_failed_termination_keeps_the_live_handle_and_reserved_port(monkeypatch)
     assert len(attempts) >= 2, f"第二次 stop 没有重试终止：{attempts}"
 
 
+def test_port_reservation_survives_the_old_generations_stale_release():
+    """重启复用同一端口时，旧一代迟到的 _release_port 不得删掉新一代的预留。
+
+    旧监控线程在 stop_event 置位后可能晚一步醒来；无条件 discard 会让一个
+    自动分配端口的新实例拿到同一端口，两个 llama-server 同时 bind —— 这正是
+    重启并发测试想避免的状态损坏。
+    """
+    from core.process_manager import Instance, InstanceStatus, ProcessManager
+
+    class DeadProcess:
+        pid = 111
+        stdout = None
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    class LiveProcess(DeadProcess):
+        pid = 222
+
+        def poll(self):
+            return None
+
+    manager = ProcessManager()
+    old = Instance(
+        id="old", name="old", preset_id=None, preset_name=None, params={},
+        argv=[], command_string="", host="127.0.0.1", port=18091,
+        status=InstanceStatus.RUNNING, process=DeadProcess(),
+    )
+    new = Instance(
+        id="new", name="new", preset_id=None, preset_name=None, params={},
+        argv=[], command_string="", host="127.0.0.1", port=18091,
+        status=InstanceStatus.STARTING, process=LiveProcess(),
+    )
+    manager._instances[old.id] = old
+    manager._instances[new.id] = new
+    manager._reserved_ports.add((new.host, new.port))
+
+    manager._release_port(old)
+    assert (new.host, new.port) in manager._reserved_ports, (
+        "旧一代释放了新一代仍在使用的端口预留"
+    )
+
+    # 新一代也死了之后才允许释放。
+    new.process = DeadProcess()
+    new.status = InstanceStatus.STOPPED
+    old.status = InstanceStatus.STOPPED
+    manager._release_port(new)
+    assert (new.host, new.port) not in manager._reserved_ports
+
+
+def test_release_port_keeps_reservation_while_the_process_is_alive():
+    """进程未确认死亡时释放端口，下一个实例会被分配到同一端口并 bind 失败。"""
+    from core.process_manager import Instance, InstanceStatus, ProcessManager
+
+    class LiveProcess:
+        pid = 333
+        stdout = None
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            raise __import__("subprocess").TimeoutExpired("alive", timeout)
+
+    manager = ProcessManager()
+    instance = Instance(
+        id="live", name="live", preset_id=None, preset_name=None, params={},
+        argv=[], command_string="", host="127.0.0.1", port=18092,
+        status=InstanceStatus.FAILED, process=LiveProcess(),
+    )
+    manager._instances[instance.id] = instance
+    manager._reserved_ports.add((instance.host, instance.port))
+
+    manager._release_port(instance)
+    assert (instance.host, instance.port) in manager._reserved_ports, (
+        "进程仍活着时端口预留被释放（AGENTS §2.14.3）"
+    )
+
+
+def test_psutil_tree_kill_reports_surviving_descendants(monkeypatch):
+    """psutil 只杀掉父进程、孙进程存活时不得报告"树已死"。"""
+    import core.process_manager as pm
+    import psutil
+
+    class FakeParent:
+        pid = 444
+
+        def children(self, recursive=True):
+            return [object()]
+
+        def kill(self):
+            pass
+
+    class FakePopen:
+        pid = 444
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(psutil, "Process", lambda pid: FakeParent())
+    monkeypatch.setattr(
+        psutil, "wait_procs", lambda procs, timeout=0: ([procs[0]], procs[1:])
+    )
+
+    assert pm.ProcessManager._kill_tree_with_psutil(FakePopen()) is False
+
+
 def test_frozen_data_dir_falls_back_when_appdata_is_unwritable(tmp_path, monkeypatch):
     """打包后端不能因为 %APPDATA% 不可写就在 lifespan 里 exit 3。
 
@@ -2772,6 +2888,107 @@ def test_nvidia_smi_is_resolved_to_an_absolute_path_or_disabled(monkeypatch):
     monitor = gpu_monitor.SystemMonitor()
     assert monitor._query_gpus() == []
     assert monitor.get_gpu_processes() == []
+
+
+def test_system_tools_are_disabled_without_systemroot(monkeypatch):
+    """SystemRoot 缺失时必须禁用系统工具，绝不退回裸名（AGENTS §2.1）。
+
+    裸名会走 CreateProcess 搜索序，应用目录与 CWD 都排在 System32 之前，
+    而这两个位置在便携/CurrentUser 安装下都是用户可写的。旧实现此时返回
+    ``name``，gpu_monitor 又对它做 ``os.path.isfile``（相对 CWD 解析），
+    等于把植入件当成 nvidia-smi 执行。
+    """
+    if os.name != "nt":
+        pytest.skip("Windows-specific invariant")
+
+    from core import gpu_monitor, server_probe
+
+    monkeypatch.delenv("SystemRoot", raising=False)
+    monkeypatch.delenv("windir", raising=False)
+    assert server_probe.system_tool("taskkill.exe") is None
+    assert gpu_monitor.system_tool("nvidia-smi.exe") is None
+    monkeypatch.setattr(gpu_monitor, "which_on_path", lambda name: None)
+    assert gpu_monitor._nvidia_smi() is None
+
+
+def test_probe_server_never_executes_a_relative_name_from_cwd(monkeypatch, tmp_path):
+    """探测相对名必须按应用目录/PATH 解析；解析失败时绝不能相对 CWD 执行。"""
+    from core import server_probe
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "planted-probe.exe").write_bytes(b"MZ")
+
+    def refuse(*args, **kwargs):
+        raise AssertionError(f"探测路径被相对 CWD 执行了: {args!r}")
+
+    monkeypatch.setattr(server_probe.subprocess, "Popen", refuse)
+    probe = server_probe.probe_server("planted-probe.exe")
+    assert probe.probed is False
+    assert "不存在" in (probe.error or "")
+
+
+def test_unreadable_config_is_not_overwritten_with_defaults(monkeypatch, tmp_path):
+    """配置文件存在但读不了时，后续保存不得用默认值覆盖真实配置。"""
+    import config
+
+    blocked = tmp_path / "config.json"
+    blocked.mkdir()  # open() -> IsADirectoryError（一种真实可复现的 OSError）
+    monkeypatch.setattr(config, "CONFIG_FILE", blocked)
+    monkeypatch.setattr(config, "_config", None)
+    monkeypatch.setattr(config, "_config_load_failed", False)
+
+    assert config.load_config()["launcher_port"] == 17520
+    assert config._config_load_failed is True
+    with pytest.raises(ValueError, match="could not be read"):
+        config.update_config({"theme": "light"})
+
+
+def test_fractional_port_is_rejected_and_integer_port_is_normalized(tmp_path):
+    """float 端口会让 argv 里的 --port 与实例记录/健康探测分叉。"""
+    from core.process_manager import ProcessManager
+
+    server = tmp_path / "llama-server.exe"
+    server.write_bytes(b"")
+    model = tmp_path / "m.gguf"
+    model.write_bytes(b"")
+    manager = ProcessManager()
+
+    with pytest.raises(ValueError, match="port must be an integer"):
+        manager._validate_start(
+            {"model": str(model), "port": 8080.9}, str(server)
+        )
+    with pytest.raises(ValueError, match="port must be an integer"):
+        manager._validate_start(
+            {"model": str(model), "port": True}, str(server)
+        )
+
+    params = {"model": str(model), "port": 8080.0}
+    manager._validate_start(params, str(server))
+    assert params["port"] == 8080
+
+
+def test_which_on_path_ignores_relative_path_entries(monkeypatch, tmp_path):
+    """相对 PATH 项等于 CWD；命中它会把可写目录劫持重新引进来。"""
+    from core import server_probe
+
+    (tmp_path / "tool.exe").write_bytes(b"")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", ".")
+    assert server_probe.which_on_path("tool.exe") is None
+
+    monkeypatch.setenv("PATH", str(tmp_path))
+    found = server_probe.which_on_path("tool.exe")
+    assert found is not None and os.path.isabs(found)
+
+
+def test_nvml_unavailable_memory_sentinel_is_unknown():
+    """Windows WDDM 的 2^64-1 哨兵不能显示成 17 TiB 显存。"""
+    from core.gpu_monitor import _NVML_VALUE_NOT_AVAILABLE, _nvml_memory_mb
+
+    assert _nvml_memory_mb(None) is None
+    assert _nvml_memory_mb(0) is None
+    assert _nvml_memory_mb(_NVML_VALUE_NOT_AVAILABLE) is None
+    assert _nvml_memory_mb(1024 * 1024 * 512) == 512
 
 
 def test_release_version_is_consistent_across_manifests():

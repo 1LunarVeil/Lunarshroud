@@ -86,7 +86,13 @@ def compare_param_default(meta: Any, probe: ServerProbe | None) -> dict[str, Any
         result["note"] = "未探测到 llama-server"
         return result
     if cli not in probe.options:
-        result["note"] = "本机构建不支持该选项"
+        # 只有探测结果完整时，"选项不存在"才可信。--help 截断/解析失败时
+        # 说"不支持"会把整条命令行误判成不可用（MIN_COMPLETE_OPTIONS）。
+        result["note"] = (
+            "本机构建不支持该选项"
+            if probe.complete
+            else "探测结果不完整，无法判定该选项是否支持"
+        )
         return result
 
     raw = probe.default_of(cli)
@@ -171,7 +177,12 @@ def server_capabilities_from_probe(probe: ServerProbe | None) -> dict[str, Any]:
     # `none` 是 schema 有意排除的（不选任何值即等于 none），不算漂移。
     spec_supported = set(probe.spec_types)
     spec_declared = set(_schema_spec_types())
-    unsupported_spec = sorted(spec_declared - spec_supported - {"none"})
+    # 解析到了 --spec-type 却没有任何取值 = 解析器没读懂，不是"全都不支持"。
+    # 没有 --spec-type 选项本身时，这个构建确实不支持任何取值，照常报漂移。
+    if "--spec-type" in probe.options and not spec_supported:
+        unsupported_spec: list[str] = []
+    else:
+        unsupported_spec = sorted(spec_declared - spec_supported - {"none"})
 
     summary = {
         "params_total": len(comparisons),
@@ -183,6 +194,7 @@ def server_capabilities_from_probe(probe: ServerProbe | None) -> dict[str, Any]:
 
     return {
         "probed": probe.probed,
+        "complete": probe.complete,
         "error": probe.error,
         "path": probe.path,
         "version": probe.version,

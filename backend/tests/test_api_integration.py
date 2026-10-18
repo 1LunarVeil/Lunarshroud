@@ -448,6 +448,19 @@ def test_capabilities_endpoint_aggregates_build_and_model(api_client, monkeypatc
     assert payload["model"]["recommended_spec_type"] == "ngram-mod"
 
 
+def test_missing_static_asset_returns_404_instead_of_index(api_client):
+    """缺失的 JS/CSS 必须是 404，不能回退 index.html 200 骗过浏览器。"""
+    response = api_client.get("/js/definitely-missing-module.js")
+    assert response.status_code == 404
+    assert "asset not found" in response.json()["detail"]
+
+
+def test_remove_unknown_instance_returns_404(api_client):
+    """删除不存在的实例必须 404，不能 200 + removed:false 让 UI 假报成功。"""
+    response = api_client.delete("/api/instances/does-not-exist")
+    assert response.status_code == 404
+
+
 def test_capabilities_endpoint_with_bad_model_path_still_200(api_client, tmp_path):
     """模型路径不可解析时也必须是 200 + 明确的 error 字段。"""
     response = api_client.get(
