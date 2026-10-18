@@ -1587,9 +1587,47 @@ mod tests {
         append_launcher_log_at, backend_readiness_is_authentic, backend_runtime_temp,
         dir_is_writable, external_url_is_allowed, next_generation_failures, parse_backend_port,
         random_session_secret, readiness_proof, ready_probe_url, supervision_backoff, system_tool,
-        webview2_data_dir, BackendSupervisor, LAUNCHER_LOG_MAX_BYTES,
+        wait_for_process_exit, webview2_data_dir, BackendSupervisor, LAUNCHER_LOG_MAX_BYTES,
     };
+    use std::path::Path;
     use std::time::Duration;
+
+    /// 测试专用目录：放在测试二进制旁边（Cargo 刚写过它，保证可写），
+    /// 不依赖继承的 %TEMP% —— 受限令牌/沙箱下 TEMP 可能不可写，测试不能
+    /// 因此变成"作者机器 20 passed、别处 16/20"的门禁噪声。
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let base = std::env::current_exe()
+                .expect("test executable path")
+                .parent()
+                .expect("test executable parent")
+                .to_path_buf();
+            let dir = base.join(format!("lunarshroud-test-{label}-{}", std::process::id()));
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir).expect("remove stale test dir");
+            }
+            std::fs::create_dir_all(&dir).expect("create test dir next to the test binary");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            // 不用 `let _ =`：清理失败要留下可见记录，便于发现泄漏残留。
+            if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                eprintln!(
+                    "warning: could not remove test dir {}: {error}",
+                    self.0.display()
+                );
+            }
+        }
+    }
 
     #[test]
     fn parses_valid_backend_port() {
@@ -1618,28 +1656,19 @@ mod tests {
 
     #[test]
     fn webview2_data_dir_prefers_the_application_directory() {
-        let dir = std::env::temp_dir().join(format!("lunarshroud-webview2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let chosen = webview2_data_dir(Some(&dir)).expect("writable exe dir");
-        assert_eq!(chosen, dir.join("webview2-data"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = TestDir::new("webview2");
+        let chosen = webview2_data_dir(Some(dir.path())).expect("writable exe dir");
+        assert_eq!(chosen, dir.path().join("webview2-data"));
     }
 
     #[test]
     fn writable_probe_matches_the_backend_contract() {
-        let dir =
-            std::env::temp_dir().join(format!("lunarshroud-writable-probe-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(dir_is_writable(&dir));
+        let dir = TestDir::new("writable");
+        assert!(dir_is_writable(dir.path()));
         // 用一个文件冒充目录：mkdir 必然失败。
-        let blocked = dir.join("blocked");
-        let _ = std::fs::remove_dir_all(&blocked);
-        let _ = std::fs::remove_file(&blocked);
+        let blocked = dir.path().join("blocked");
         std::fs::write(&blocked, b"not a dir").unwrap();
         assert!(!dir_is_writable(&blocked));
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_file(&blocked);
     }
 
     #[test]
@@ -1763,9 +1792,8 @@ mod tests {
 
     #[test]
     fn launcher_log_appends_timestamped_lines() {
-        let dir = std::env::temp_dir().join(format!("lunarshroud-log-test-{}", std::process::id()));
-        let path = dir.join("logs").join("launcher.log");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = TestDir::new("log");
+        let path = dir.path().join("logs").join("launcher.log");
 
         append_launcher_log_at(&path, 1000, "backend restarted").unwrap();
         append_launcher_log_at(&path, 1001, "backend exited").unwrap();
@@ -1773,16 +1801,12 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("[1000] backend restarted"));
         assert!(contents.contains("[1001] backend exited"));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn launcher_log_rotates_when_it_exceeds_the_limit() {
-        let dir =
-            std::env::temp_dir().join(format!("lunarshroud-log-rotate-{}", std::process::id()));
-        let path = dir.join("logs").join("launcher.log");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = TestDir::new("log-rotate");
+        let path = dir.path().join("logs").join("launcher.log");
 
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, vec![b'x'; LAUNCHER_LOG_MAX_BYTES as usize]).unwrap();
@@ -1794,8 +1818,6 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("[2000] after rotation"));
         assert!(!contents.contains('x'), "新文件不该带上旧内容");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1867,5 +1889,23 @@ mod tests {
     #[cfg(not(windows))]
     fn system_tools_are_disabled_without_systemroot() {
         assert!(system_tool("taskkill.exe").is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn wait_for_process_exit_observes_a_real_child() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .expect("spawn cmd");
+        let pid = child.id();
+        assert!(wait_for_process_exit(pid, Duration::from_secs(5)));
+        let _ = child.wait();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn wait_for_process_exit_returns_false_for_a_missing_pid() {
+        assert!(!wait_for_process_exit(u32::MAX, Duration::from_millis(10)));
     }
 }

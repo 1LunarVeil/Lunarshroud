@@ -15,14 +15,14 @@ fingerprints are in *Currently deployed pair (0.9.0-beta.2)*.
 Current working-tree checks (2026-10-18, after the post-takeover hardening):
 
 ```text
-backend    python -m pytest -q                      532 passed
+backend    python -m pytest -q                      533 passed
 coverage   --cov=backend --cov-fail-under=75        88.01% (gate 75)
 frontend   node --test frontend/tests/*.mjs          21 passed
 syntax     node --check (17 files)                   clean
 lint       python -m ruff check backend tools        clean
 mirror     tools/check_release_mirror.py             CLEAN, 154 files
-rust       cargo fmt/clippy/test                     clean, 20 passed
-build      PyInstaller onedir, pinned env            backend.exe 0515C0E6…
+rust       cargo fmt/clippy/test                     clean, 22 passed
+build      PyInstaller onedir, pinned env            backend.exe A1BAACAA…
 ```
 
 ## Post-takeover hardening (2026-10-18, deployed)
@@ -91,9 +91,9 @@ tested red-green and rebuilt into the deployed pair:
 Verification for this revision:
 
 ```text
-pytest        532 passed, coverage 88.01%
+pytest        533 passed, coverage 88.01%
 frontend      21 passed, 17 JS files syntax-clean
-rust          fmt/clippy clean, 20 tests
+rust          fmt/clippy clean, 22 tests
 mirror        CLEAN, 154 files
 packaged      tmp/release_smoke.py: 22/22 (isolated APPDATA, dead proxy,
               HMAC readiness, token rotation, Job reaping, clean-shutdown log)
@@ -103,6 +103,15 @@ single inst.  second launch exits 0; exactly one launcher/backend remain
 fallback      all normal user-data env vars unusable: backend uses
               <app>\backend\data; edited launcher_port=17531 is honored
 ```
+
+A follow-up independent verification (R8, 2026-10-18) reproduced the deployed
+pair and the gates, and flagged three issues that are now fixed: Rust tests
+depending on inherited `%TEMP%` (now hermetic; 22/22 with `TEMP`/`TMP` pointing
+at a nonexistent path), an external temp-file residue in `backend/`
+(`jy4s_b4h`; removed, with a narrow gate rule for 8-character tempfile-style
+residue), and the NVML device-memory sentinel call site (now both `used` and
+`total` go through `_nvml_memory_mb`, pinned by a call-site test). See
+`RISK_ASSESSMENT.md` for the follow-up section.
 
 Not re-run this round: NSIS install/uninstall (the earlier onedir install
 evidence stands), the 4–8 h soak, and packaged screenshots. The browser check
@@ -239,14 +248,16 @@ Built in this workspace with `SOURCE_DATE_EPOCH=1790000000`,
 `tools/Publish-PortableRuntime.ps1 -Destination . -SkipDesktopShortcut`:
 
 ```text
-launcher  BCF0F721186CB3719EDA3EC2E1DA9B0A98055F5DB86F73E468DAC31488DD5679
-backend   0515C0E61A5A3625162F21FEC943A78EB7AF2C8EBDDE6F210A20B467BB41E1FC
-installer DFF36CC8E90FB6607207382991A02C18F72ECDFC790794A32405CE9E052A376F
+launcher  2003E4A6C983E4544C006F7704B3D97E6408FB39497F2EA19BD9258DBC48B9F8
+backend   A1BAACAA21FD6CDC49CBF8E7DA79556AA21D44056630627E87BF1A59ABD93B5E
+installer 7FE43CDA8026F271F684EA3B4AE4AE402CC18A741E1BABA9F00142EB51B080C0
           (src-tauri/target/release/bundle/nsis/LunarShroud_0.9.0-beta.2_x64-setup.exe)
 ```
 
-The backend build was run twice and produced the same `backend.exe` hash both
-times. The NSIS installer is still not byte-reproducible (makensis metadata).
+The earlier `854F95A7` build was run twice and produced the same `backend.exe`
+hash both times. The 2026-10-18 hardening rebuild (`A1BAACAA…`) was built once;
+byte-reproducibility of this round's launcher is not claimed. The NSIS installer
+is still not byte-reproducible (makensis metadata).
 
 **The sidecar is now PyInstaller `onedir` (2026-10-18).** The first beta.2
 deployment still failed on the user's machine with PyInstaller's

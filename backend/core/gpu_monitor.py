@@ -71,8 +71,10 @@ def _nvml_query_gpus() -> list[dict[str, Any]] | None:
                 name = f"GPU {index}"
             try:
                 mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                used_mb = round(mem.used / 1024 / 1024)
-                total_mb = round(mem.total / 1024 / 1024)
+                # used/total 都必须过哨兵：WDDM 下驱动可能把任一字段报成
+                # NVML_VALUE_NOT_AVAILABLE（2^64-1），裸除法会显示 17 TiB。
+                used_mb = _nvml_memory_mb(mem.used)
+                total_mb = _nvml_memory_mb(mem.total)
             except Exception:
                 used_mb = None
                 total_mb = None

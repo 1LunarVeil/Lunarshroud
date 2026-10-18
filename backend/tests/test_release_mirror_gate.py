@@ -67,6 +67,8 @@ APP_RUNTIME_ARTIFACTS = [
     "backend/dsh-session-session-abc123/session.v4.jsonl",
     "backend/webview2-data/EBWebView/Cache/data_0",
     "sub/CLAUDE.md",
+    # 外部工具曾在 backend/ 根掉落 8 字符 tempfile 风格残留（jy4s_b4h）。
+    "backend/jy4s_b4h",
 ]
 
 MUST_STILL_MIRROR = [

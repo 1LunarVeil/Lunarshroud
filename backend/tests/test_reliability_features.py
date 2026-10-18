@@ -565,6 +565,36 @@ def test_nvml_path_parses_gpus_and_processes(monkeypatch):
     assert procs[1]["memory_used_mb"] is None  # usedGpuMemory=0 → 不可得
 
 
+def test_nvml_device_memory_sentinel_is_unknown_at_the_call_site(monkeypatch):
+    """设备显存总量/已用量的哨兵必须在 _nvml_query_gpus 调用点生效。
+
+    只测 helper 不够：AGENTS §6.2 警告过"纯函数绿、调用点没改"。这里让
+    NVML 返回 Windows WDDM 的 2^64-1 哨兵，断言两个字段都变成 None。
+    """
+    import core.gpu_monitor as gpu_monitor
+
+    sentinel = gpu_monitor._NVML_VALUE_NOT_AVAILABLE
+
+    class SentinelMem(_FakePyNVML._Mem):
+        used = sentinel
+        total = sentinel
+
+    class SentinelPyNVML(_FakePyNVML):
+        @staticmethod
+        def nvmlDeviceGetMemoryInfo(handle):
+            return SentinelMem()
+
+    monkeypatch.setattr(gpu_monitor, "pynvml", SentinelPyNVML)
+    monkeypatch.setattr(gpu_monitor, "_NVML_UNAVAILABLE", False)
+    monkeypatch.setattr(gpu_monitor, "_NVML_READY", True)
+
+    gpus = gpu_monitor._nvml_query_gpus()
+
+    assert gpus and len(gpus) == 1
+    assert gpus[0]["memory_used_mb"] is None
+    assert gpus[0]["memory_total_mb"] is None
+
+
 def test_nvml_init_failure_falls_back_to_nvidia_smi(monkeypatch):
     """NVML 初始化失败时应退回 nvidia-smi 子进程路径。"""
     import core.gpu_monitor as gpu_monitor

@@ -86,7 +86,7 @@ Get-ChildItem frontend\js -File | Where-Object Extension -in '.js', '.mjs' | For
 cargo test --manifest-path src-tauri\Cargo.toml --locked
 ```
 
-当前源码基线（2026-10-18）：532 个 Python 测试、21 个前端测试、17 个 JavaScript 文件语法检查、20 个 Rust 测试；产品代码覆盖率 88.01%。测试数量随回归测试增长，门禁始终是 **0 失败 + 覆盖率 ≥75%**，以实际运行为准。测试不替代真实模型和长时间压力测试。当前验证状态见 [docs/STATUS.md](docs/STATUS.md)，未完成风险、证据与 beta/1.0 判断见 [docs/RISK_ASSESSMENT.md](docs/RISK_ASSESSMENT.md)。
+当前源码基线（2026-10-18）：533 个 Python 测试、21 个前端测试、17 个 JavaScript 文件语法检查、22 个 Rust 测试；产品代码覆盖率 88.01%。测试数量随回归测试增长，门禁始终是 **0 失败 + 覆盖率 ≥75%**，以实际运行为准。测试不替代真实模型和长时间压力测试。当前验证状态见 [docs/STATUS.md](docs/STATUS.md)，未完成风险、证据与 beta/1.0 判断见 [docs/RISK_ASSESSMENT.md](docs/RISK_ASSESSMENT.md)。
 
 ## 构建安装包
 

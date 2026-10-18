@@ -121,6 +121,10 @@ EXCLUDED_GLOBS = (
     "credentials*.json", "secrets*.json",
     # Claude Code 的项目指令文件（任意层级）：含本机工具约定，公开约定见 AGENTS.md。
     "CLAUDE.md",
+    # 外部工具在源码根掉落的 tempfile 风格残留（8 位小写字母/数字，无扩展名）。
+    # 实测 2026-10-18 出现 backend/jy4s_b4h（4 字节），不是源码也不是数据；
+    # 按 8 字符名精确匹配，避免把正常源码文件一起排掉。
+    "backend/????????",
 )
 
 # 规则 2：**刻意**不进镜像的工作树文件 —— 每一条都要有理由。
@@ -191,6 +195,7 @@ FORBIDDEN_GLOBS = (
     "appdata/*", "*appdata/*",
     "dsh-session-*/*", "*dsh-session-*/*",
     "CLAUDE.md", "*CLAUDE.md",
+    "backend/????????",
 )
 
 # 规则 4：镜像文本里不能出现本机痕迹。

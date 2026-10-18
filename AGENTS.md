@@ -48,11 +48,13 @@ python tools/check_release_mirror.py       # 发布镜像门禁（见 §3）
 **禁用**该工具；Rust 外壳用 `GetSystemDirectoryW` 而不是 `SystemRoot` 环境变量。
 `which_on_path()` 跳过相对 `PATH` 项；`probe_server()` 只按应用目录/PATH 解析
 相对名，解析失败返回"未探测"，绝不相对 CWD 执行。
-钉它的测试：`test_system_tools_are_disabled_without_systemroot`、
+钉它的测试：Python 的 `test_system_tools_are_disabled_without_systemroot`、
 `test_which_on_path_ignores_relative_path_entries`、
-`test_probe_server_never_executes_a_relative_name_from_cwd`，以及 Rust 的
-`system_tools_are_resolved_inside_system32` /
-`missing_system_tools_are_disabled_instead_of_falling_back_to_a_bare_name`。
+`test_probe_server_never_executes_a_relative_name_from_cwd`；Rust Windows 侧的
+`system_tools_are_resolved_inside_system32` 与
+`missing_system_tools_are_disabled_instead_of_falling_back_to_a_bare_name`
+（`system_tools_are_disabled_without_systemroot` 在 Rust 里是 `cfg(not(windows))`，
+只验证非 Windows 的编译期分支，不能当 Windows 证据）。
 
 ### 2.2 会话令牌不得发给"尚未确认是谁"的对端
 
@@ -345,3 +347,9 @@ UTF-8 / UTF-16LE / UTF-16BE / latin-1 以及 gzip/zlib 容器——所以"把路
    进入 lifespan 的测试会建库、清洗密钥并收口历史状态，一旦漏掉就会改写用户
    数据（2026-10-17 实测发生过）。`test_regressions.py::test_test_suite_never_uses_the_repository_data_directory`
    钉住这一性质。
+5. **测试必须自密闭，不得依赖继承的 `%TEMP%` 可写。** 受限令牌/沙箱下测试
+   二进制写 `%TEMP%` 会被拒绝（2026-10-18 核验：同一份代码在作者机器 20/20、
+   在核验环境 16/20）。测试目录应放在测试二进制旁边（Cargo 刚写过、必然可写）
+   或由夹具注入；清理失败要记录，不能用 `let _ =` 静默吞掉。
+   证据：把 `TEMP`/`TMP` 指向不存在的路径后直接运行 Rust 测试二进制，
+   `22/22` 通过。
