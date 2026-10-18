@@ -104,6 +104,12 @@ fallback      all normal user-data env vars unusable: backend uses
               <app>\backend\data; edited launcher_port=17531 is honored
 ```
 
+Not re-run this round: NSIS install/uninstall (the earlier onedir install
+evidence stands), the 4–8 h soak, and packaged screenshots. The browser check
+used the DevTools protocol (DOM snapshot + console) because screenshot capture
+timed out in this headless session; the dashboard and the parameter-editor
+modal rendered with zero console errors and zero 404s.
+
 The fresh-environment row in the older block below is not a re-run in the
 developer tree: a copy with no `data/`, `tmp/`, `.venv`, `backend/dist`,
 `backend/build` or `src-tauri/target` was bootstrapped by `setup.ps1` under
