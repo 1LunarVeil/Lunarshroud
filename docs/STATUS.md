@@ -1,6 +1,6 @@
 # Current status
 
-Last reviewed: 2026-10-18 (Asia/Shanghai)  
+Last reviewed: 2026-10-19 (Asia/Shanghai)  
 Current candidate: `0.9.0-beta.2`  
 Release posture: Windows beta; do **not** describe as 1.0 or stable.
 
@@ -109,9 +109,17 @@ real model    deployed launcher + Qwen3.5-4B Q4_K_M: RUNNING, raw
 embedding     nomic-embed-text-v1.5 Q4_K_M (space-containing model path):
               RUNNING, /v1/embeddings returned a 768-dim vector, stop,
               port release and clean launcher exit
-soak          partial 15-minute real-model run: 402/402 requests, 0 failures,
-              min/avg/max 0.203/0.242/0.281 s, llama-server RSS ~3.18 GB
-              flat for the whole run; the full 4–8 h soak remains open
+soak          4-hour real-model run (2026-10-19): 7186/7186 requests, 0 failures,
+              min/avg/p50/p95/p99/max 0.203/0.248/0.25/0.266/0.281/2.078 s;
+              llama-server RSS 3178.8 -> 2795.0 MB (slope -2.053 MB/min),
+              handles 221 -> 271, threads 41 -> 39, GPU ~3004 MB steady;
+              stop/port/orphan/real-data checks all pass. The automated report
+              verdict is FAIL only on the AC precondition (plugged=False at
+              12:00:07); power events show a ~3-minute unplug window
+              (11:59:24-12:02:40), current battery 96% on AC, no sleep/resume,
+              max sample gap 61.2 s. Product soak criteria pass; see the
+              4-hour soak section below. Earlier 15-minute run: 402/402,
+              0 failures, RSS ~3.18 GB flat.
 ```
 
 A follow-up independent verification (R8, 2026-10-18) reproduced the deployed
@@ -124,10 +132,40 @@ residue), and the NVML device-memory sentinel call site (now both `used` and
 `RISK_ASSESSMENT.md` for the follow-up section.
 
 Not re-run this round: NSIS install/uninstall (the earlier onedir install
-evidence stands), the 4–8 h soak, and packaged screenshots. The browser check
-used the DevTools protocol (DOM snapshot + console) because screenshot capture
-timed out in this headless session; the dashboard and the parameter-editor
-modal rendered with zero console errors and zero 404s.
+evidence stands) and packaged screenshots. The 4-hour soak was run on
+2026-10-19; see the next section. The browser check used the DevTools protocol
+(DOM snapshot + console) because screenshot capture timed out in this headless
+session; the dashboard and the parameter-editor modal rendered with zero
+console errors and zero 404s.
+
+## 4-hour real-model soak (2026-10-19)
+
+The deployed root pair was exercised for 14,405 s through the launcher API in an
+isolated `APPDATA`/`LOCALAPPDATA`/`USERPROFILE`/`TEMP` sandbox
+(`tmp/soak-4h-20261019/`). Qwen3.5-4B Q4_K_M ran with `ctx_size=8192`,
+`cache_ram=0`, auto-assigned port.
+
+- Requests: **7,186 / 7,186 succeeded, 0 failures**; latency min/avg/p50/p95/
+  p99/max **0.203 / 0.248 / 0.25 / 0.266 / 0.281 / 2.078 s**; throughput
+  0.499 req/s.
+- Resources: RSS **3,178.8 MB -> 2,795.0 MB** (slope -2.053 MB/min), max
+  3,180.4 MB; handles 221 -> 271; threads 41 -> 39; GPU memory 3,004 MB steady,
+  max 3,246 MB.
+- Lifecycle: instance STOPPED, port 8080 released, launcher exited 0,
+  management port 17520 released, no orphan LunarShroud/backend/llama-server
+  process.
+- Integrity: real `%APPDATA%\LunarShroud` and `%LOCALAPPDATA%\LunarShroud`
+  byte-identical before/after; launcher/backend/installer hashes match the
+  deployed pair; scanned logs contain no traceback and no supervisor restart.
+- Environment deviation: the preflight AC check read `plugged=False` at
+  12:00:07 (battery 99%). Windows Kernel-Power event 105 shows power changes at
+  11:59:24 and 12:02:40, i.e. a roughly three-minute unplug window; at 16:03 the
+  battery was 96% on AC. There were no sleep/resume events and the maximum
+  sample gap was 61.2 s, so the run was continuous. The automated report's
+  aggregate verdict is therefore **FAIL solely on the AC precondition**, not on
+  a product check; the product soak criteria pass. The generated
+  `report.json`/`report.md` are preserved unchanged, and this classification is
+  the human review.
 
 The fresh-environment row in the older block below is not a re-run in the
 developer tree: a copy with no `data/`, `tmp/`, `.venv`, `backend/dist`,
@@ -248,8 +286,9 @@ on the reverted tree, 2 passed after restore).
 
 Not verified in this round: a real-browser click-through of the new external-link
 handler (headless WebView2 automation is unavailable here; the scheme allowlist
-has a Rust unit test), a 4–8 hour soak, multi-GPU/Windows 10 coverage, and
-packaged-mode screenshot evidence. Those remain outstanding as before.
+has a Rust unit test), an 8-hour soak (the 4-hour soak passed on 2026-10-19),
+multi-GPU/Windows 10 coverage, and packaged-mode screenshot evidence. Those
+remain outstanding as before.
 
 ### Deployed `0.9.0-beta.2` pair (2026-10-18)
 
@@ -573,9 +612,9 @@ checks that were still open:
   768-dimensional embeddings; 10 consecutive launch/stop cycles reused port 8080
   with zero failures and no leftover `llama-server`.
 
-The 4–8 h soak, multi-hardware matrix, code signing and build provenance remain
-open; the risk document states that beta publication is acceptable with those
-disclosed, but 1.0 is not.
+The 8-hour soak (the 4-hour soak passed on 2026-10-19), multi-hardware matrix,
+code signing and build provenance remain open; the risk document states that
+beta publication is acceptable with those disclosed, but 1.0 is not.
 
 ### Seventh-round hardening (2026-10-17, deployed)
 
