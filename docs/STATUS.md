@@ -115,8 +115,9 @@ soak          4-hour real-model run (2026-10-19): 7186/7186 requests, 0 failures
               handles 221 -> 271, threads 41 -> 39, GPU ~3004 MB steady;
               stop/port/orphan/real-data checks all pass. The automated report
               verdict is FAIL only on the AC precondition (plugged=False at
-              12:00:07); power events show a ~3-minute unplug window
-              (11:59:24-12:02:40), current battery 96% on AC, no sleep/resume,
+              12:00:07); Kernel-Power event 105 shows power changes at
+              11:59:24 and 12:02:40, consistent with a ~3-minute unplug
+              window around start, current battery 96% on AC, no sleep/resume,
               max sample gap 61.2 s. Product soak criteria pass; see the
               4-hour soak section below. Earlier 15-minute run: 402/402,
               0 failures, RSS ~3.18 GB flat.
@@ -159,8 +160,8 @@ isolated `APPDATA`/`LOCALAPPDATA`/`USERPROFILE`/`TEMP` sandbox
   deployed pair; scanned logs contain no traceback and no supervisor restart.
 - Environment deviation: the preflight AC check read `plugged=False` at
   12:00:07 (battery 99%). Windows Kernel-Power event 105 shows power changes at
-  11:59:24 and 12:02:40, i.e. a roughly three-minute unplug window; at 16:03 the
-  battery was 96% on AC. There were no sleep/resume events and the maximum
+  11:59:24 and 12:02:40, consistent with a roughly three-minute unplug window
+  around start; at 16:03 the battery was 96% on AC. There were no sleep/resume events and the maximum
   sample gap was 61.2 s, so the run was continuous. The automated report's
   aggregate verdict is therefore **FAIL solely on the AC precondition**, not on
   a product check; the product soak criteria pass. The generated
