@@ -190,19 +190,24 @@ installer `4C439483…` (the same installer hash as the deployed pair). Results:
   runtime artifacts) was removed; real `%APPDATA%`/`%LOCALAPPDATA%` data and
   desktop/Start-Menu shortcuts were restored.
 
-The only unverified item is the **Add/Remove Programs registry entry**. This is
-an environment restriction, not yet a confirmed product defect: the test's
-Python `HKCU` write probe passes, but a diagnostic `NSIS_HOOK_POSTINSTALL`
-marker showed the NSIS installer running with `TEMP=...\Temp\Low` and
-`HKCU_WRITE_ERROR` for both `HKCU` and `SHCTX`; the same failure occurred in a
-`Highest` scheduled task outside the shell sandbox. The installer script writes
-`${UNINSTKEY}` under `SHCTX` for `currentUser`, and the hook is present. A
-normal interactive-desktop install/uninstall still must confirm the entry.
+The Add/Remove entry and shortcuts are still unobservable in this session. A
+controlled minimal NSIS probe (not LunarShroud) ran through its full wizard:
+`.onInit` wrote `ran.txt`, the install section created `probe.txt` and
+`uninstall.exe`, but it created no Desktop/Start-Menu shortcut and no HKCU
+`Software\NSISProbe` or Uninstall key. `ran.txt` reports a per-user
+`...\Temp\Low` temporary path; the Start Menu ACL grants the sandbox group only
+`ReadAndExecute`. This is a low-integrity / restricted-token restriction of the
+current Codex session, not a LunarShroud-specific NSIS bug. The same restriction explains why the
+LunarShroud installer copies files but cannot create shortcuts or the
+Add/Remove entry here.
 
-An official `cargo tauri build` re-run produced installer `0E1A0FCC…` with the
-same NSIS payload (`87B0B2E1…`); the documented release installer remains
-`4C439483…`. P1 is therefore **conditional pass**: all product checks above
-pass; the Add/Remove entry remains environment-blocked.
+A candidate installer `860FC8FC…` adds an explicit HKCU `POSTINSTALL` hook in
+`src-tauri/nsis/hooks.nsh` as belt-and-braces; it embeds the same NSIS launcher
+`87B0B2E1…` and backend `A1BAACAA…`. The old `4C439483…` installer is
+superseded for release. P1 remains **environment-blocked**: install/launch/
+uninstall/cleanup pass, but Add/Remove and shortcuts must be confirmed on a
+normal non-sandboxed Windows desktop before release. The portable zip remains
+usable without an installer.
 
 The fresh-environment row in the older block below is not a re-run in the
 developer tree: a copy with no `data/`, `tmp/`, `.venv`, `backend/dist`,
@@ -337,6 +342,9 @@ Built in this workspace with `SOURCE_DATE_EPOCH=1790000000`,
 launcher  0E778DD0C7AFDB1C0DAA17A7D24FFEC3498DB1BE0E61B75AD9FA820627DA3DD8
 backend   A1BAACAA21FD6CDC49CBF8E7DA79556AA21D44056630627E87BF1A59ABD93B5E
 installer 4C43948374E8F6F14BE2ECB323D0BA4181E2ACE390576A6C4DF9774649AC0657
+          (historical installer; superseded)
+candidate 860FC8FC9FDCDAA11BDBCC4010D50DBA9E863CE815E2A71C19C421F1D2647619
+          (explicit HKCU POSTINSTALL hook; pending normal-desktop validation)
           (src-tauri/target/release/bundle/nsis/LunarShroud_0.9.0-beta.2_x64-setup.exe)
 ```
 
