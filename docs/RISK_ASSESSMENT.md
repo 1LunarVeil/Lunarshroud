@@ -1,7 +1,7 @@
 # 剩余风险评估
 
 评估对象：`0.9.0-beta.2` 当前部署对（哈希见 STATUS.md 的部署段）
-评估日期：2026-10-19  
+评估日期：2026-10-20  
 结论：**可以作为 beta 发布，但不能按 1.0 宣传。** 本轮能自行验证的风险已实测；
 不能在本机闭环的风险（代码签名、8 小时长稳、多硬件矩阵、构建来源证明）仍
 构成发布门槛，必须如实披露；4 小时真实模型长稳已于 2026-10-19 通过。
@@ -24,7 +24,7 @@
 | R5 | llama.cpp 默认 `--cache-ram 8192` 会让宿主内存随提示词缓存增长 | 中 | 中 | 本轮对照实测：默认 610 s 内 llama-server RSS 5.2→11.4 GB 后平台化；`--cache-ram 0` 时稳定在 3.21 GB（见下文） | 8 GB 内存机器可能被挤压；已写入使用指南，需用户按内存调低/设 0 |
 | R6 | 本机其他进程/其他 Windows 用户可直接访问 llama-server 实例端口 | 中 | 中（共享机器） | 实例默认监听 `127.0.0.1`，但默认不设 `--api-key`；llama.cpp 自己会打印 “no API key is set” 警告 | 同机进程可调用模型、消耗 GPU；管理 API 仍受令牌保护。共享机器应在参数里设置 API 密钥 |
 | R7 | 无自动更新，漏洞修复依赖用户手动换版 | 中 | 中 | 发布流程只产出安装包与校验和 | 旧版本可能长期停留在有已知问题的依赖上 |
-| R8 | 卸载清理与安装位置注册表键 | 低 | 低 | 2026-10-18 再次授权实测：静默安装/启动/卸载均成功；新 `PREUNINSTALL` 钩子清除 `webview2-data/`、`runtime-temp/`、`logs/` 与诊断日志，安装目录被移除；真实 APPDATA/LOCALAPPDATA 数据不变，快捷方式恢复。卸载注册表项在本会话**无法观测**（最小 NSIS 安装器同样写不进 HKCU，而同一任务里的 Python 可以），是环境限制；2026-10-17 的正常桌面实测曾观测到 | 再次安装会复用旧目录；删除数据/手工清理可恢复默认。发布前需在普通交互桌面再确认一次 Add/Remove 条目 |
+| R8 | 卸载清理与安装位置注册表键 | 低 | 低 | 2026-10-20 直接复跑：安装/启动/卸载/清理全部通过；安装器内 launcher 是 NSIS 变体 `87B0B2E1…`（根便携版 `0E778DD0…`，仅差 3 字节 `BUNDLE_TYPE_VAR` `NSS`/`UNK`，已用测试钉住）；安装版后端 `A1BAACAA…`、`_internal` 757，401/404/HMAC/config 200、WM_CLOSE、端口释放、无后端残留；卸载 exit 0，安装目录（含 WebView2/log）移除，真实数据/快捷方式恢复。Add/Remove 条目仍**无法观测**：Python HKCU 探针通过，但 POSTINSTALL 钩子实测安装器为低完整性（`TEMP=...\Temp\Low`，`HKCU_WRITE_ERROR` 对 HKCU 和 SHCTX 均失败），Highest 计划任务同样失败；2026-10-17 正常桌面曾观测到 | 再次安装会复用旧目录；删除数据/手工清理可恢复默认。发布前需在普通交互桌面再确认一次 Add/Remove 条目 |
 | R9 | 非 ASCII/含空格模型路径、长路径 | 低 | 中 | 非 ASCII/空格路径实测 RUNNING、768 维嵌入；315 字符路径实测 llama.cpp 报 `failed to open GGUF`，重建后启动前检查会报 `path_too_long` | >260 字符仍不受支持，但用户会得到明确原因和“移到更短目录”的修复建议 |
 | R10 | 启动器日志含每次启动的 `session_id` | 低 | 低 | 隔离日志扫描：令牌 0 命中；重建后 `backend.log` 只写 `backend started pid=…`，测试钉住不含 session | 已收口；无需再分享前手工删除 |
 | R11 | 用户数据（`config.json`、`history.db`、预设）无自动备份/云同步 | 低 | 中 | 配置与预设原子写入；历史库有上限；新增 `Backup-UserData.ps1` / `Restore-UserData.ps1`，带 SHA-256 清单、篡改拒绝和 `pre-restore` 回退点 | 仍需用户主动运行；没有云同步/自动定时备份 |
@@ -69,6 +69,19 @@
   12:02:40 两次电源变化，与约 3 分钟拔电窗口一致，16:03 电池 96% 且已接 AC；
   无睡眠/恢复事件，最大采样间隔 61.2 s，运行连续。产品 soak 判据通过，
   原始 `report.json`/`report.md` 保留未改，环境偏差按人工复核记录。
+
+- **P1 NSIS 直接复跑（2026-10-20）**：`tmp/nsis_install_test.py` 对
+  `4C439483…` 安装包直接运行。安装/启动/卸载/清理全部通过：`_internal`
+  757 项、后端 `A1BAACAA…`、安装版 launcher `87B0B2E1…`（NSIS 变体；
+  根便携版 `0E778DD0…` 仅差 3 字节 `BUNDLE_TYPE_VAR` `NSS`/`UNK`）、
+  401/404/HMAC/config 200、WM_CLOSE、无后端残留、端口释放；卸载后安装
+  目录（含 WebView2/log）删除，真实数据和快捷方式恢复。唯一未观测的是
+  Add/Remove 条目：Python HKCU 探针通过，但安装器的 POSTINSTALL 钩子
+  实测 `TEMP=...\Temp\Low` 且 `HKCU_WRITE_ERROR`（HKCU 与 SHCTX 都失败），
+  Highest 计划任务同样失败，属于低完整性沙箱限制；安装脚本本身在
+  `currentUser` 下写入 `${UNINSTKEY}`，需普通交互桌面最终确认。官方
+  Tauri 重建 `0E1A0FCC…` 的 NSIS payload 相同；发布安装包仍为
+  `4C439483…`。
 
 ## 本轮实测证据
 

@@ -1,6 +1,6 @@
 # Current status
 
-Last reviewed: 2026-10-19 (Asia/Shanghai)  
+Last reviewed: 2026-10-20 (Asia/Shanghai)  
 Current candidate: `0.9.0-beta.2`  
 Release posture: Windows beta; do **not** describe as 1.0 or stable.
 
@@ -12,7 +12,7 @@ The current candidate is **`0.9.0-beta.2`**, rebuilt on 2026-10-17 after the
 independent release audit summarized under *Thirteenth round* below; its
 fingerprints are in *Currently deployed pair (0.9.0-beta.2)*.
 
-Current working-tree checks (2026-10-18, after the post-takeover hardening):
+Current working-tree checks (full suite 2026-10-18; soak/P1 2026-10-19/20):
 
 ```text
 backend    python -m pytest -q                      533 passed
@@ -23,6 +23,9 @@ lint       python -m ruff check backend tools        clean
 mirror     tools/check_release_mirror.py             CLEAN, 155 files
 rust       cargo fmt/clippy/test                     clean, 22 passed
 build      PyInstaller onedir, pinned env            backend.exe A1BAACAA…
+nsis       install/launch/uninstall                   pass; Add/Remove entry
+                                                      blocked by sandbox,
+                                                      normal-desktop check pending
 ```
 
 ## Post-takeover hardening (2026-10-18, deployed)
@@ -132,12 +135,12 @@ residue), and the NVML device-memory sentinel call site (now both `used` and
 `total` go through `_nvml_memory_mb`, pinned by a call-site test). See
 `RISK_ASSESSMENT.md` for the follow-up section.
 
-Not re-run this round: NSIS install/uninstall (the earlier onedir install
-evidence stands) and packaged screenshots. The 4-hour soak was run on
-2026-10-19; see the next section. The browser check used the DevTools protocol
-(DOM snapshot + console) because screenshot capture timed out in this headless
-session; the dashboard and the parameter-editor modal rendered with zero
-console errors and zero 404s.
+P1 NSIS install/uninstall was re-run on 2026-10-20; see "NSIS P1 re-run"
+below. Packaged screenshots were not re-run. The 4-hour soak was run on
+2026-10-19; see "4-hour real-model soak". The browser check used the DevTools
+protocol (DOM snapshot + console) because screenshot capture timed out in this
+headless session; the dashboard and the parameter-editor modal rendered with
+zero console errors and zero 404s.
 
 ## 4-hour real-model soak (2026-10-19)
 
@@ -167,6 +170,39 @@ isolated `APPDATA`/`LOCALAPPDATA`/`USERPROFILE`/`TEMP` sandbox
   a product check; the product soak criteria pass. The generated
   `report.json`/`report.md` are preserved unchanged, and this classification is
   the human review.
+
+## NSIS P1 re-run (2026-10-20)
+
+`python tmp\nsis_install_test.py` was run directly against the documented
+installer `4C439483…` (the same installer hash as the deployed pair). Results:
+
+- Silent install exited 0; installed `_internal` has 757 entries; backend hash
+  `A1BAACAA…` matches. The installed launcher is `87B0B2E1…`, the NSIS bundle
+  variant. The root portable launcher is `0E778DD0…`; the two differ only in the
+  three-byte `BUNDLE_TYPE_VAR` marker (`NSS` vs `UNK`). The test now pins the
+  NSIS variant so a portable-marker build cannot be shipped by mistake.
+- Installed app reached backend ready on 17520; unauthenticated config returned
+  401; wrong readiness session returned 404; the readiness proof matched
+  HMAC-SHA256; the response contained no token; a valid token read config (200).
+- WM_CLOSE exited the installed app; no backend remained; port 17520 was
+  released.
+- Silent uninstall exited 0; the install directory (including WebView2/log
+  runtime artifacts) was removed; real `%APPDATA%`/`%LOCALAPPDATA%` data and
+  desktop/Start-Menu shortcuts were restored.
+
+The only unverified item is the **Add/Remove Programs registry entry**. This is
+an environment restriction, not yet a confirmed product defect: the test's
+Python `HKCU` write probe passes, but a diagnostic `NSIS_HOOK_POSTINSTALL`
+marker showed the NSIS installer running with `TEMP=...\Temp\Low` and
+`HKCU_WRITE_ERROR` for both `HKCU` and `SHCTX`; the same failure occurred in a
+`Highest` scheduled task outside the shell sandbox. The installer script writes
+`${UNINSTKEY}` under `SHCTX` for `currentUser`, and the hook is present. A
+normal interactive-desktop install/uninstall still must confirm the entry.
+
+An official `cargo tauri build` re-run produced installer `0E1A0FCC…` with the
+same NSIS payload (`87B0B2E1…`); the documented release installer remains
+`4C439483…`. P1 is therefore **conditional pass**: all product checks above
+pass; the Add/Remove entry remains environment-blocked.
 
 The fresh-environment row in the older block below is not a re-run in the
 developer tree: a copy with no `data/`, `tmp/`, `.venv`, `backend/dist`,
