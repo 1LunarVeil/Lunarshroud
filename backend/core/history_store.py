@@ -14,6 +14,7 @@ from typing import Any
 
 from config import HISTORY_DB
 
+from core import sqlite_recovery
 from core.param_builder import redact_command_text, scrub_sensitive_params
 
 LOGGER = logging.getLogger(__name__)
@@ -60,30 +61,26 @@ def _create_schema() -> None:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_history_started ON launch_history(started_at DESC)"
             )
+            # 幂等迁移：旧库没有运行时列。用 PRAGMA 判断，不能假设新库/旧库。
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(launch_history)")
+            }
+            for column in ("runtime_id", "runtime_label", "model_key", "variant_key"):
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE launch_history ADD COLUMN {column} TEXT")
 
 
 def _quarantine_corrupt_db(path: Path) -> None:
     """保留损坏库供取证，同时让新库可以立刻重建。
 
+    实现见 ``core.sqlite_recovery``：聊天库必须是同一套判据，各写一份迟早会
+    出现"修好了一个、另一个还是旧的错法"。
+
     WAL 模式下主库旁边还有 ``-wal`` / ``-shm``；只移走主库会让新连接继续
     读到旧 sidecar。移不动主库时重新抛出原异常（例如文件被其他进程锁住，
     那不是“损坏”，不应假装已恢复）。
     """
-    for candidate, suffix in (
-        (path, ""),
-        (Path(str(path) + "-wal"), "-wal"),
-        (Path(str(path) + "-shm"), "-shm"),
-    ):
-        if not candidate.exists():
-            continue
-        target = Path(str(path) + ".corrupt" + suffix)
-        try:
-            candidate.replace(target)
-            LOGGER.warning("quarantined history database file %s -> %s", candidate, target)
-        except OSError:
-            LOGGER.exception("failed to quarantine history database file %s", candidate)
-            if candidate == path:
-                raise
+    sqlite_recovery.quarantine_corrupt_files(path, "history")
 
 
 def _assert_readable() -> None:
@@ -99,11 +96,7 @@ def _assert_readable() -> None:
     只隔离 SQLite 明确报告损坏的情况（调用方检查错误文本）；锁/权限错误
     继续原样抛出。
     """
-    with closing(_get_conn()) as conn:
-        row = conn.execute("PRAGMA quick_check(1)").fetchone()
-        result = str(row[0]).strip().lower() if row is not None else "no result"
-        if result != "ok":
-            raise sqlite3.DatabaseError(f"database disk image is malformed: {result}")
+    sqlite_recovery.assert_readable(_get_conn, "history")
 
 
 def init_db() -> None:
@@ -118,21 +111,13 @@ def init_db() -> None:
     错误做隔离重建；锁冲突、权限错误等仍然原样抛出，避免把可恢复问题
     误判成损坏。
     """
-    path = str(HISTORY_DB)
-    if path in _initialized_paths:
-        return
-    try:
-        _create_schema()
-        _assert_readable()
-    except sqlite3.DatabaseError as exc:
-        message = str(exc).lower()
-        if "not a database" not in message and "malformed" not in message:
-            raise
-        LOGGER.warning("history database is corrupt (%s); quarantining and rebuilding", exc)
-        _quarantine_corrupt_db(Path(path))
-        _create_schema()
-        _assert_readable()
-    _initialized_paths.add(path)
+    sqlite_recovery.init_database(
+        path=Path(HISTORY_DB),
+        label="history",
+        connect=_get_conn,
+        create_schema=_create_schema,
+        initialized=_initialized_paths,
+    )
 
 
 def scrub_legacy_secrets() -> None:
@@ -203,6 +188,10 @@ def record_launch(
     params: dict[str, Any],
     command_text: str,
     status: str = "running",
+    runtime_id: str | None = None,
+    runtime_label: str | None = None,
+    model_key: str | None = None,
+    variant_key: str | None = None,
 ) -> int:
     """记录一次启动。返回记录 id。"""
     init_db()
@@ -213,11 +202,13 @@ def record_launch(
         cur = conn.execute(
             """INSERT INTO launch_history
                (instance_id, preset_id, preset_name, model_path, port,
-                params_json, command_text, started_at, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                params_json, command_text, started_at, status,
+                runtime_id, runtime_label, model_key, variant_key)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 instance_id, preset_id, preset_name, model_path, port,
                 json.dumps(safe_params, ensure_ascii=False), safe_command, started_at, status,
+                runtime_id, runtime_label, model_key, variant_key,
             ),
         )
         record_id = cur.lastrowid
@@ -291,7 +282,8 @@ def list_history(limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
     with closing(_get_conn()) as conn:
         rows = conn.execute(
             """SELECT id, instance_id, preset_id, preset_name, model_path, port,
-                      started_at, stopped_at, duration_seconds, status, exit_code, error_message
+                      started_at, stopped_at, duration_seconds, status, exit_code, error_message,
+                      runtime_id, runtime_label, model_key, variant_key
                FROM launch_history
                ORDER BY started_at DESC, id DESC
                LIMIT ? OFFSET ?""",
@@ -344,3 +336,21 @@ def get_history_params(record_id: int) -> dict[str, Any] | None:
         if row is None:
             return None
         return json.loads(row["params_json"])
+
+
+def get_history_runtime(record_id: int) -> dict[str, Any]:
+    """获取历史记录的运行时身份；旧记录返回空字段。
+
+    与 ``get_history_params`` 分开查询：重启路径只需要参数快照，不应为了
+    runtime_id 把整行（含 command_text）再解一遍；同时保持既有测试对
+    get_history_params 的 mock 契约。
+    """
+    init_db()
+    with closing(_get_conn()) as conn:
+        row = conn.execute(
+            "SELECT runtime_id, runtime_label FROM launch_history WHERE id = ?",
+            (record_id,),
+        ).fetchone()
+        if row is None:
+            return {"runtime_id": None, "runtime_label": None}
+        return {"runtime_id": row["runtime_id"], "runtime_label": row["runtime_label"]}

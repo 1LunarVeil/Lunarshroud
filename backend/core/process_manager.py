@@ -31,6 +31,7 @@ import httpx
 from config import get_config
 
 from core import history_store
+from core.config_resolver import model_identity, model_variant_key
 from core.param_builder import (
     build_argv,
     build_command_string,
@@ -41,7 +42,8 @@ from core.param_builder import (
 )
 from core.param_schema import SPEC_TYPES_REQUIRING_DRAFT_MODEL, split_multi_value
 from core.server_probe import (
-    probe_server_cached_only,
+    list_devices,
+    probe_server_cached,
     resolve_server_path,
     sanitized_child_env,
     system_tool,
@@ -52,6 +54,11 @@ LOGGER = logging.getLogger("lunarshroud.backend.processes")
 # 附加参数（手填的自由文本）最多允许拆出多少个片段：给它一个上限，
 # 免得一个手滑的粘贴把命令行撑到无法诊断的长度。
 MAX_EXTRA_ARG_TOKENS = 64
+
+# 启动前能力探测的超时（秒）。``server_probe.DEFAULT_TIMEOUT`` 是 15s，
+# 而一次启动最多要等 --help + --version 两轮；探测失败仅仅意味着"这次没有
+# 能力表可用"，不值得把一次本来能成功的启动拖成看起来像界面死了。
+LAUNCH_PROBE_TIMEOUT = 5.0
 
 # Windows 异常退出码。llama.cpp 在"草稿模型与主模型不兼容"这类情况下不会优雅
 # 报错，而是直接段错误（实测：gemma 的 MTP 头配 Qwen 主模型 → 0xC0000005），
@@ -108,13 +115,16 @@ def explain_fatal_line(fatal: str) -> str:
 # System32 工具与 llama-server 的路径解析都归 core.server_probe 一处实现，
 # 理由见 system_tool / resolve_server_path 的文档。
 # 实例落盘日志的单文件上限；超过则轮转出 .1（覆盖上一份）再开新文件。
-# 单个备份足够：实例日志是排障材料，不是审计材料（独立审计 L1）。
+# 单个备份足够：实例日志是排障材料，不是历史取证材料。
 INSTANCE_LOG_MAX_BYTES = 5 * 1024 * 1024
 
 # 单条日志行的字符上限。llama-server/GGUF 元数据可能吐出一行几十 MB 的内容；
 # 环形缓冲只限制行数，不限制单行大小，于是这一行会被原样 JSON 序列化进
 # WebSocket、再塞进一个 DOM 文本节点。截断并显式标注，比让 UI 卡死好。
 MAX_LOG_LINE_CHARS = 16 * 1024
+# Byte budget for one instance's in-memory log buffer. The line count alone is
+# not a memory bound: 100k configured lines x 16 KiB would be ~1.6 GiB.
+MAX_LOG_BUFFER_BYTES = 8 * 1024 * 1024
 
 
 
@@ -135,6 +145,74 @@ def _child_env() -> dict[str, str]:
     把一次性执行升级成持久化。子进程不需要其中任何一个变量。
     """
     return sanitized_child_env()
+
+
+# OpenVINO 后端的设备不是用 `--device` 选的，而是读 `GGML_OPENVINO_DEVICE`
+# 环境变量（实测 b11929：传 `--device OPENVINO1` 会直接报错
+# "OPENVINO1 is not the selected OpenVINO device (CPU). The OpenVINO device is
+# chosen with the GGML_OPENVINO_DEVICE environment variable, not -dev"）。
+#
+# 用户在参数面板「计算设备」里看到的设备名来自 `--list-devices`（OPENVINO0/1/2…），
+# 但**真正的取值**是这些设备背后的 `GGML_OPENVINO_DEVICE` 值（CPU / GPU.0 / GPU.1…），
+# 后者写在 `--list-devices` 每行描述的前缀里。所以启动器必须做一次翻译：
+# 设备的显示名 → 环境变量值；翻不出来就明确报错，绝不静默用错设备。
+OPENVINO_DEVICE_ENV = "GGML_OPENVINO_DEVICE"
+_OPENVINO_DEVICE_PREFIX = "GGML_OPENVINO_DEVICE="
+
+
+def _is_openvino_build(server_path: str) -> bool:
+    """这份 llama-server 是不是 OpenVINO 后端。
+
+    判据是同级 `ggml-openvino.dll`（权威），不是目录名——用户可能把 exe 拷到
+    任意目录。只用于决定"设备怎么传给后端"，判错时最坏结果是继续用 `--device`，
+    不会执行任何额外代码。
+    """
+    try:
+        directory = Path(server_path).parent
+    except (OSError, TypeError, ValueError):
+        return False
+    return (directory / "ggml-openvino.dll").is_file()
+
+
+def _is_rocm_build(server_path: str | None) -> bool:
+    """这份 llama-server 是不是 ROCm/HIP 后端（判据：同级 ggml-hip.dll）。"""
+    if not server_path:
+        return False
+    try:
+        directory = Path(server_path).parent
+    except (OSError, TypeError, ValueError):
+        return False
+    return (directory / "ggml-hip.dll").is_file()
+
+
+def openvino_device_env_value(device_name: str, devices: list[dict[str, Any]]) -> str:
+    """把 ``--list-devices`` 的设备名翻译成 ``GGML_OPENVINO_DEVICE`` 的取值。
+
+    例：``OPENVINO1`` → ``GPU.0``（描述里写着
+    ``GGML_OPENVINO_DEVICE=GPU.0 - NVIDIA GeForce RTX 5060 ...``）。
+    找不到该设备或描述里没有这个前缀时返回空串，由调用方拒绝启动——
+    猜一个设备等于让用户以为自己在用 GPU、实际在跑 CPU。
+    """
+    wanted = str(device_name or "").strip()
+    if not wanted:
+        return ""
+    for device in devices or []:
+        if str(device.get("name") or "").strip() != wanted:
+            continue
+        description = str(device.get("description") or "")
+        if _OPENVINO_DEVICE_PREFIX not in description:
+            return ""
+        after = description.split(_OPENVINO_DEVICE_PREFIX, 1)[1]
+        value = after.split(" - ", 1)[0].strip()
+        # `--list-devices` 给**当前选中**的设备加 " (selected)" 后缀
+        # （实测：`GGML_OPENVINO_DEVICE=CPU (selected) - AMD Ryzen 9 ...`）。
+        # 它只是显示标记，不是设备值的一部分；带进环境变量会让 OpenVINO
+        # 认为设备名非法。
+        for marker in (" (selected)", "(selected)"):
+            if value.endswith(marker):
+                value = value[: -len(marker)].strip()
+        return value
+    return ""
 
 
 def last_fatal_log_line(instance: Instance) -> str:
@@ -277,6 +355,16 @@ class Instance:
     argv: list[str]                           # 命令行 argv
     command_string: str                       # 可读命令行字符串
     restarted_from: str | None = None         # 重启来源实例 ID（重启链路追踪）
+    # 本次启动实际使用的运行时（用户可切换多个 llama.cpp 构建）。
+    # server_path 是解析后的绝对路径，重启必须沿用它而不是重新读全局配置。
+    runtime_id: str | None = None
+    runtime_label: str | None = None
+    server_path: str | None = None
+    # Logical model identity (manifest model: or local:<path>) and variant
+    # (usually the filename stem). Paths alone change when a file moves; these
+    # keys let history/instance grouping survive that.
+    model_key: str | None = None
+    variant_key: str | None = None
     # 反向指针：本实例已被哪一代替换。没有它，"重启"就没有"当前代次"的概念 ——
     # 对着一个已经换代的 ID 再按一次重启，会去抢同一端口并抛出莫名其妙的
     # "port is already in use"。见 restart_instance。
@@ -297,8 +385,13 @@ class Instance:
     ready_at: float | None = None
     exit_code: int | None = None
     error_message: str = ""
+    # 非致命提示（例如"ROCm 构建退回了 CPU"）：实例本身正常运行，界面不该把它
+    # 渲染成红色错误（见 dashboard.js 对 error_message 的处理）。
+    warnings: list[str] = field(default_factory=list)
     history_record_id: int | None = None  # 启动历史记录 ID（用于状态同步）
     logs: deque[LogEntry] = field(default_factory=lambda: deque(maxlen=5000))
+    _log_buffer_max_lines: int = 5000
+    _log_buffer_bytes: int = 0
     _log_subscribers: list[Callable[[LogEntry], None]] = field(default_factory=list)
     _status_subscribers: list[Callable[[Instance], None]] = field(default_factory=list)
     _monitor_thread: threading.Thread | None = None
@@ -326,12 +419,20 @@ class Instance:
 
     def to_dict(self, include_logs: bool = False, log_limit: int = 200) -> dict[str, Any]:
         """转为字典（用于 API 响应）"""
+        try:
+            context_size = max(0, int(self.params.get("ctx_size") or 0))
+        except (TypeError, ValueError):
+            context_size = 0
         d = {
             "id": self.id,
             "name": self.name,
             "preset_id": self.preset_id,
             "preset_name": self.preset_name,
             "restarted_from": self.restarted_from,
+            "runtime_id": self.runtime_id,
+            "runtime_label": self.runtime_label,
+            "model_key": self.model_key,
+            "variant_key": self.variant_key,
             "status": self.status.value,
             "pid": self.pid,
             "port": self.port,
@@ -344,7 +445,9 @@ class Instance:
             "ever_ready": self.ready_at is not None,
             "exit_code": self.exit_code,
             "error_message": self.error_message,
+            "warnings": list(self.warnings),
             "model_path": self.params.get("model", ""),
+            "context_size": context_size,
             "command": self.command_string,
         }
         if self.status == InstanceStatus.FAILED:
@@ -406,6 +509,9 @@ class ProcessManager:
         on_launched: Callable[[Instance], None] | None = None,
         restarted_from: str | None = None,
         chain_root: str | None = None,
+        server_path: str | None = None,
+        runtime_id: str | None = None,
+        runtime_label: str | None = None,
     ) -> Instance:
         """启动一个新实例。
 
@@ -426,7 +532,8 @@ class ProcessManager:
             FileNotFoundError: llama-server.exe 不存在或模型文件不存在
         """
         cfg = get_config()
-        llama_server_path = cfg["llama_server_path"]
+        # 显式选择的 runtime profile 优先；没有则保持原有全局配置行为。
+        llama_server_path = server_path or cfg["llama_server_path"]
 
         # 1. 校验
         llama_server_path = self._validate_start(params, llama_server_path)
@@ -454,6 +561,8 @@ class ProcessManager:
             instance_id = str(uuid.uuid4())
             model_path = params.get("model", "")
             instance_name = name or (model_path.split("\\")[-1].split("/")[-1] if model_path else f"instance-{instance_id[:8]}")
+            model_key = model_identity(model_path) if model_path else None
+            variant_key = model_variant_key(model_path) if model_path else None
 
             instance = Instance(
                 id=instance_id,
@@ -467,13 +576,39 @@ class ProcessManager:
                 port=port,
                 restarted_from=restarted_from,
                 chain_root=chain_root,
+                runtime_id=runtime_id,
+                runtime_label=runtime_label,
+                server_path=llama_server_path,
+                model_key=model_key,
+                variant_key=variant_key,
             )
             # 日志环形缓冲按配置分配（config: log_buffer_lines，默认 5000）
             try:
                 buffer_lines = max(100, int(cfg.get("log_buffer_lines", 5000) or 5000))
             except (TypeError, ValueError):
                 buffer_lines = 5000
-            instance.logs = deque(maxlen=buffer_lines)
+            instance.logs = deque()
+            instance._log_buffer_max_lines = buffer_lines
+            # OpenVINO 构建：把「计算设备」翻译成 GGML_OPENVINO_DEVICE。
+            # 只在该构建确实是 OpenVINO 且有设备选择时才做；翻译不出来就拒绝
+            # 启动——静默忽略会让用户以为在用 GPU，实际在跑 CPU。
+            instance._openvino_device_env = ""
+            requested_device = str(params.get("device") or "").strip()
+            if requested_device and _is_openvino_build(llama_server_path):
+                if "," in requested_device:
+                    raise ValueError(
+                        "OpenVINO 只支持单个计算设备（GGML_OPENVINO_DEVICE 只接受一个值）；"
+                        "请只填一个设备名，例如 OPENVINO1"
+                    )
+                available = list_devices(llama_server_path)
+                translated = openvino_device_env_value(requested_device, available)
+                if not translated:
+                    names = ", ".join(str(d.get("name") or "") for d in available) or "（无）"
+                    raise ValueError(
+                        f"OpenVINO 构建不认识设备 {requested_device!r}；"
+                        f"本机可用设备：{names}。请到「运行环境」页确认设备名。"
+                    )
+                instance._openvino_device_env = translated
             # 实例日志是否落盘（config: persist_instance_logs）
             instance._log_persist_enabled = bool(cfg.get("persist_instance_logs", True))
 
@@ -593,7 +728,7 @@ class ProcessManager:
         if not address.is_loopback and not api_key.strip():
             raise ValueError("an API key is required for non-loopback listen addresses")
 
-        # F14 / W5（实测形态）：`effective_host_and_key` 先 strip 再校验，而
+        # 实测形态：`effective_host_and_key` 先 strip 再校验，而
         # `start_instance` 读的是 params 里的**原样值** —— `" 127.0.0.1 "` 能过
         # 校验但 getaddrinfo 直接失败；空串过的是"默认回环"分支，原样流向
         # bind 语义不明。把**校验用过的等价形式**写回 params，让预留键、
@@ -622,6 +757,8 @@ class ProcessManager:
         model = params.get("model", "")
         if not model:
             raise ValueError("a model file path is required")
+        if not isinstance(model, str):
+            raise ValueError("model must be a string path")
         if not os.path.isfile(model):
             raise FileNotFoundError(f"model file not found: {model}")
 
@@ -672,11 +809,29 @@ class ProcessManager:
 
         # schema 声明的 min/max/options 必须真正生效，否则约束只存在于前端 HTML
         # 属性上，直连 API 或导入外部预设即可绕过（-c 1e12 / -fa banana 之类）。
-        # 带上本机探测结果：select 的合法取值以这份构建声明的为准（上游会新增
-        # 取值），而 cached_only 保证校验不会为了跑 --help 而起子进程。
-        validate_param_values(
-            params, probe=probe_server_cached_only(resolved_server_path)
-        )
+        #
+        # 这里**主动探测一次**：预检冷缓存时给的是
+        # "flag support will be verified at launch"，而启动路径此前只读缓存
+        # （``probe_server_cached_only``）、``DefaultGate.supported`` 对未知一律
+        # 放行 —— 于是那句承诺是假的：用户看到预检没有错误，点启动却在
+        # llama-server 参数解析阶段失败，日志只有一句
+        # ``error: invalid argument: --xxx``，跟模型/显存/端口都不沾边。
+        # 启动不是高频路径（一次 llama-server 加载本来就是秒级），而
+        # ``probe_server_cached`` 有单飞与总等待上界、永不抛异常，探测失败就照旧
+        # 降级 —— 代价是首次启动多等几百毫秒，收益是"本机不认的 flag 根本不会
+        # 写到命令行上"。
+        # 启动前探测用**更短的**超时（``probe_server_cached`` 的默认是 15s，
+        # --help + --version 两次最坏 30s 以上）。探测失败只是拿不到能力表，
+        # 不该把一次本来能成功的启动拖到用户以为界面死了。
+        probe = probe_server_cached(resolved_server_path, timeout=LAUNCH_PROBE_TIMEOUT)
+        if not probe.probed:
+            LOGGER.warning(
+                "capability probe unavailable for %s (%s); launching with the "
+                "unfiltered parameter set",
+                resolved_server_path,
+                probe.error,
+            )
+        validate_param_values(params, probe=probe)
 
         return os.path.abspath(resolved_server_path)
 
@@ -710,6 +865,12 @@ class ProcessManager:
     def _launch_process(self, instance: Instance) -> None:
         """启动子进程并设置状态"""
         instance._stop_event.clear()
+        env = _child_env()
+        # OpenVINO 的设备靠环境变量而不是 argv（见 openvino_device_env_value）。
+        # build_argv 已经把 --device 从 OpenVINO 的命令行里剔掉了，这里补上环境。
+        device_override = getattr(instance, "_openvino_device_env", "")
+        if device_override:
+            env[OPENVINO_DEVICE_ENV] = device_override
 
         # 启动子进程
         instance.process = subprocess.Popen(
@@ -726,7 +887,7 @@ class ProcessManager:
             # 有机会从可写目录被加载。argv[0] 由 _validate_start 保证是绝对路径。
             cwd=os.path.dirname(instance.argv[0]) or None,
             # 会话令牌不得下传给第三方构建，见 _child_env。
-            env=_child_env(),
+            env=env,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
         )
         instance.pid = instance.process.pid
@@ -880,6 +1041,25 @@ class ProcessManager:
         instance.status = InstanceStatus.RUNNING
         instance.ready_at = time.time()
         self._append_log(instance, "system", f"instance ready: http://{instance.host}:{instance.port}")
+        # ROCm 构建在没有兼容 AMD 显卡时会**静默退回 CPU**并正常就绪（实测
+        # b11929：`--list-devices` 为 (none)、`-ngl 99` 接受、服务正常监听，
+        # 生成速度 ~6.8 tok/s 与 Vulkan GPU 相差一个数量级）。不说出来，用户会
+        # 以为 ROCm 加速生效了。判据用启动前已缓存的设备枚举，不额外起进程。
+        #
+        # 写 `warnings` 而不是 `error_message`：后者在 RUNNING 态会被界面渲染成
+        # 红色错误横幅（dashboard.js），而这台服务是好的、只是没加速。
+        try:
+            if _is_rocm_build(instance.server_path) and not list_devices(instance.server_path):
+                note = (
+                    "ROCm 构建没有枚举到任何 ROCm 设备（本机无受支持的 AMD 独显），"
+                    "llama.cpp 已退回 CPU 推理；要 GPU 加速请改用 Vulkan 构建，"
+                    "或到「运行环境」页确认设备列表"
+                )
+                instance.warnings.append(note)
+                self._append_log(instance, "system", note)
+                LOGGER.warning("instance %s: %s", instance.id, note)
+        except Exception:  # noqa: BLE001 - 诊断提示不得影响运行中的实例
+            LOGGER.debug("rocm fallback check failed for %s", instance.id, exc_info=True)
         LOGGER.info(
             "instance %s ready at http://%s:%s", instance.id, instance.host, instance.port
         )
@@ -1183,8 +1363,8 @@ class ProcessManager:
     def _prune_terminal_instances(self) -> None:
         """Bound retained log buffers and terminal metadata during long sessions.
 
-        被剪枝实例的落盘日志一并删除，避免 data/logs/instances 无界增长
-        （独立审计 L1）。文件删除放在锁外做，不给热路径添 I/O。
+        被剪枝实例的落盘日志一并删除，避免 data/logs/instances 无界增长；
+        文件删除放在锁外做，不给热路径添 I/O。
         """
         with self._lock:
             terminal = [
@@ -1283,7 +1463,7 @@ class ProcessManager:
         """重启实例：停止后用相同参数重新启动。
 
         ``on_launched`` 透传给新世代的 start_instance：重启世代同样写启动
-        历史（独立审计 M1）。
+        历史。
 
         **必须按整条链串行，而不是按被点名的那一代串行。** 第一版只锁锚点，
         然后在锚点锁内解析链路 —— 但从下游 ID 进来的另一个线程根本不碰锚点锁，
@@ -1335,11 +1515,15 @@ class ProcessManager:
             # 的监听端口立即可复用，无需固定 sleep 等待
             self._stop_instance_locked(target, force=False)
 
-            if target.status == InstanceStatus.FAILED:
+            still_alive = target.process is not None and target.process.poll() is None
+            if target.status == InstanceStatus.FAILED and still_alive:
                 # 旧进程没死透就再起一代，等于同一个模型/端口上挂两个服务。
                 # 显式端口时 start_instance 的实测会**顺带**拦住它，但那样用户
                 # 只会看到一句莫名其妙的"端口被占用"，而且自动分配端口时根本拦不住
                 # —— 所以这里明确拒绝，而不是依赖下游的巧合。
+                #
+                # 注意不能只看 status：启动失败/异常退出后的 FAILED 实例进程早已
+                # 不在，restart 应当可以重新拉起。只有“停止失败且句柄仍活着”才拒绝。
                 raise RuntimeError(
                     f"instance {target.id} could not be stopped"
                     + (f": {target.error_message}" if target.error_message else "")
@@ -1353,6 +1537,9 @@ class ProcessManager:
                 name=name,
                 restarted_from=target.id,
                 chain_root=root.id,
+                server_path=target.server_path,
+                runtime_id=target.runtime_id,
+                runtime_label=target.runtime_label,
                 on_launched=on_launched,
             )
             target.replaced_by = new.id
@@ -1376,7 +1563,7 @@ class ProcessManager:
             # 状态检查与删除之间被 _prune_terminal_instances 抢先移除。
             return False
         self._release_port(instance)
-        # 落盘日志随实例一并清理（独立审计 L1）
+        # 落盘日志随实例一并清理。
         self._delete_instance_log_files(instance)
         return True
 
@@ -1405,9 +1592,20 @@ class ProcessManager:
     # ========== 日志和订阅 ==========
 
     def _append_log(self, instance: Instance, source: str, line: str) -> None:
-        """追加日志并通知订阅者"""
+        """追加日志并通知订阅者，同时守住行数与字节预算。"""
         entry = LogEntry(timestamp=time.time(), source=source, line=line)
         instance.logs.append(entry)
+        instance._log_buffer_bytes += len(line.encode("utf-8", "replace"))
+        max_lines = getattr(instance, "_log_buffer_max_lines", 5000) or 5000
+        while instance.logs and (
+            len(instance.logs) > max_lines
+            or instance._log_buffer_bytes > MAX_LOG_BUFFER_BYTES
+        ):
+            dropped = instance.logs.popleft()
+            instance._log_buffer_bytes -= len(
+                dropped.line.encode("utf-8", "replace")
+            )
+        instance._log_buffer_bytes = max(0, instance._log_buffer_bytes)
         self._persist_log_line(instance, entry)
         for sub in list(instance._log_subscribers):
             try:
@@ -1423,7 +1621,7 @@ class ProcessManager:
 
         崩溃/重启后内存环形缓冲即丢失，落盘使得事后排障成为可能；
         单实例写入失败只禁用该实例的落盘，不影响主流程。
-        单文件超过 INSTANCE_LOG_MAX_BYTES 时轮转出 .1（独立审计 L1）。
+        单文件超过 INSTANCE_LOG_MAX_BYTES 时轮转出 .1（单备份足够）。
         """
         if not instance._log_persist_enabled or instance._log_persist_failed:
             return

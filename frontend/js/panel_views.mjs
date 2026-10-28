@@ -21,6 +21,7 @@ import { t } from './i18n.mjs';
  * }} opts
  *
  * item 可带：
+ *   group / groupLabel  可选分组键/显示名；相邻且键变化时插入分组标题
  *   badge     原始 HTML，渲染在**标签行**右侧（适合"运行中"这类短徽标）
  *   meta      纯文本，会转义
  *   metaHtml  原始 HTML，渲染在**元信息行**（需要放徽标时用它 ——
@@ -34,6 +35,7 @@ export function renderList(el, ctx, opts) {
     return;
   }
 
+  let renderedGroup = null;
   el.innerHTML = `<div class="panel-list">${items
     .map((it) => {
       const meta = it.metaHtml
@@ -41,16 +43,27 @@ export function renderList(el, ctx, opts) {
         : it.meta
           ? `<span class="panel-list-meta-text">${ctx.escapeHtml(it.meta)}</span>`
           : '';
-      return `
-    <div class="panel-list-item ${String(it.key) === String(activeKey) ? 'active' : ''}" data-panel-key="${ctx.escapeHtml(
+      const active = String(it.key) === String(activeKey);
+      let header = '';
+      if (it.group !== undefined && it.group !== null) {
+        const groupKey = String(it.group);
+        if (groupKey !== renderedGroup) {
+          renderedGroup = groupKey;
+          header = `<div class="panel-list-group">${ctx.escapeHtml(
+            it.groupLabel || groupKey
+          )}</div>`;
+        }
+      }
+      return `${header}
+    <button type="button" class="panel-list-item ${active ? 'active' : ''}" data-panel-key="${ctx.escapeHtml(
         String(it.key)
-      )}">
-      <div class="panel-list-row">
+      )}"${active ? ' aria-current="true"' : ''}>
+      <span class="panel-list-row">
         <span class="panel-list-label">${ctx.escapeHtml(it.label)}</span>
         ${it.badge || ''}
-      </div>
-      ${meta ? `<div class="panel-list-meta">${meta}</div>` : ''}
-    </div>`;
+      </span>
+      ${meta ? `<span class="panel-list-meta">${meta}</span>` : ''}
+    </button>`;
     })
     .join('')}</div>`;
 

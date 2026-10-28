@@ -49,7 +49,9 @@ test('localizeBackendError maps known backend messages and passes unknowns throu
   setLocale('en-US');
   assert.equal(
     localizeBackendError('no available port in range 8080-8090'),
-    'No free port within the configured range'
+    'No free port within the configured instance port range (knowledge-base ' +
+      'embedding/rerank/OCR services share it with model instances); widen the ' +
+      'range in Settings or stop some instances and retry'
   );
 
   // 全新安装的第一道墙：llama_server_path 默认是空的，后端这条英文必须被本地化，
@@ -72,6 +74,19 @@ test('localizeBackendError maps known backend messages and passes unknowns throu
   assert.match(localizeBackendError(interrupted), /已中断/);
   setLocale('en-US');
   assert.match(localizeBackendError(interrupted), /interrupted/i);
+
+  // 配额拒绝必须是可行动的本地化文案，而不是英文原文或 [object Object]
+  setLocale('zh-CN');
+  assert.match(
+    localizeBackendError('message limit reached (500); start a new conversation or export this one'),
+    /上限/
+  );
+  assert.match(
+    localizeBackendError('conversation limit reached (500); delete an old conversation before creating a new one'),
+    /删除/
+  );
+  setLocale('en-US');
+  assert.match(localizeBackendError('prompt limit reached (500); delete an old prompt first'), /limit/i);
 
   // 未匹配的原样返回
   assert.equal(localizeBackendError('something unexpected'), 'something unexpected');
@@ -125,4 +140,19 @@ test('locale values never contain angle brackets (they are injected as HTML)', (
       );
     }
   }
+});
+
+test('knowledge backend errors map to localized messages', () => {
+  setLocale('en-US');
+  assert.match(
+    localizeBackendError('the selected knowledge base has no indexed content yet; add and index documents first'),
+    /no indexed content/
+  );
+  assert.match(
+    localizeBackendError('this PDF is scanned and needs an OCR model; set one in the knowledge base settings'),
+    /OCR/
+  );
+  setLocale('zh-CN');
+  assert.match(localizeBackendError('knowledge base not found'), /知识库不存在/);
+  assert.match(localizeBackendError('knowledge retrieval failed: service unreachable'), /检索失败/);
 });

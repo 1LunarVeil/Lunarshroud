@@ -8,6 +8,7 @@
 // 两种语言各写一份，切换语言时整页重绘。
 
 import { getLocale, t } from './i18n.mjs';
+import { hasUsableServer } from './configured_state.mjs';
 
 export const id = 'help';
 export const title = '新手指南';
@@ -19,7 +20,8 @@ const GUIDE = {
   'zh-CN': {
     intro:
       'LunarShroud 只是 llama.cpp 的桌面启动器：它不打包、也不自动下载 llama-server 和模型。' +
-      '第一次使用需要你准备两样东西——对应显卡的 llama-server.exe 和一个 GGUF 模型。',
+      '第一次使用需要你准备两样东西——对应显卡的 llama-server.exe 和一个 GGUF 模型。' +
+      '安装完成后所有功能都在本机离线运行：不检查更新、不上传遥测，只有你主动点击外部链接时才会访问网络。',
     steps: [
       {
         title: '安装启动器',
@@ -33,7 +35,11 @@ const GUIDE = {
         body:
           '打开 <a href="https://github.com/ggml-org/llama.cpp/releases" target="_blank" rel="noopener noreferrer">llama.cpp Releases</a>，' +
           '下载 Windows 包并按显卡选择：NVIDIA 选 <code>bin-win-cuda12.x-x64</code>（推荐）；' +
-          'AMD/Intel 选 <code>bin-win-vulkan-x64</code>；只有 CPU 选 <code>bin-win-cpu-x64</code>。' +
+          'AMD 独显可选 <code>bin-win-rocm-*-x64</code>（仅支持官方列表内的 gfx9/gfx10 型号），' +
+          '其余 AMD（含核显）选 <code>bin-win-vulkan-x64</code>；' +
+          'Intel 核显/Arc/NPU 选 <code>bin-win-openvino-*-x64</code>；只有 CPU 选 <code>bin-win-cpu-x64</code>。' +
+          '装好后到「运行环境」页能看到这份构建在本机**实际**枚举到的设备，' +
+          '参数面板的「计算设备」就填那里的设备名。' +
           '解压到固定目录（例如 <code>D:\\llama</code>），里面应当有 <code>llama-server.exe</code>。' +
           'NVIDIA 用户还需要 CUDA 运行库：安装 CUDA Toolkit 运行组件，或把发布包里的 ' +
           '<code>cudart64_*.dll</code> / <code>cublas64_*.dll</code> 放在 llama-server.exe 旁边。',
@@ -64,7 +70,11 @@ const GUIDE = {
       head: ['显卡', '选择文件', '备注'],
       rows: [
         ['NVIDIA RTX 30/40/50', 'bin-win-cuda12.x-x64', '需要 CUDA 运行库；不要选旧 CUDA 版本'],
-        ['AMD / Intel 独显/核显', 'bin-win-vulkan-x64', '驱动保持较新'],
+        ['AMD 独显（RX 6000/7000 等）', 'bin-win-rocm-*-x64 或 bin-win-vulkan-x64',
+          'ROCm 仅支持官方列表内的 gfx9/gfx10 独显；不在列表内（或核显）请用 Vulkan'],
+        ['AMD 核显 / 型号不确定', 'bin-win-vulkan-x64', '兼容性最好；「运行环境」页会列出识别到的 Vulkan 设备'],
+        ['Intel 核显 / Arc 独显 / NPU', 'bin-win-openvino-*-x64',
+          'OpenVINO 构建，走 Intel 的 CPU/GPU 插件；设备列表里 OPENVINO 开头的名字即可选设备'],
         ['只有 CPU', 'bin-win-cpu-x64', '速度慢，但兼容性最好'],
       ],
     },
@@ -111,7 +121,9 @@ const GUIDE = {
   'en-US': {
     intro:
       'LunarShroud is a desktop launcher for llama.cpp. It does not bundle or download llama-server or models. ' +
-      'You need two things: a llama-server.exe built for your GPU, and a GGUF model.',
+      'You need two things: a llama-server.exe built for your GPU, and a GGUF model. ' +
+      'After installation every feature runs locally and offline: there is no update check and no telemetry; ' +
+      'the only network access happens when you explicitly click an external link.',
     steps: [
       {
         title: 'Install the launcher',
@@ -125,7 +137,11 @@ const GUIDE = {
         body:
           'Open the <a href="https://github.com/ggml-org/llama.cpp/releases" target="_blank" rel="noopener noreferrer">llama.cpp releases</a> ' +
           'and pick the Windows package for your GPU: NVIDIA → <code>bin-win-cuda12.x-x64</code>; ' +
-          'AMD/Intel → <code>bin-win-vulkan-x64</code>; CPU only → <code>bin-win-cpu-x64</code>. ' +
+          'AMD discrete → <code>bin-win-rocm-*-x64</code> (listed gfx9/gfx10 models only), ' +
+          'otherwise AMD (iGPU included) → <code>bin-win-vulkan-x64</code>; ' +
+          'Intel iGPU/Arc/NPU → <code>bin-win-openvino-*-x64</code>; CPU only → <code>bin-win-cpu-x64</code>. ' +
+          'The Runtime page then shows the devices this build actually reports on your machine, ' +
+          'and the “compute device” parameter accepts those names. ' +
           'Extract it to a fixed folder (e.g. <code>D:\\llama</code>). NVIDIA also needs the CUDA runtime: ' +
           'install the CUDA Toolkit runtime or copy <code>cudart64_*.dll</code> / <code>cublas64_*.dll</code> next to llama-server.exe.',
       },
@@ -156,7 +172,11 @@ const GUIDE = {
       head: ['GPU', 'Download', 'Notes'],
       rows: [
         ['NVIDIA RTX 30/40/50', 'bin-win-cuda12.x-x64', 'Needs the CUDA runtime; avoid old CUDA builds'],
-        ['AMD / Intel GPU', 'bin-win-vulkan-x64', 'Keep the driver reasonably new'],
+        ['AMD discrete (RX 6000/7000…)', 'bin-win-rocm-*-x64 or bin-win-vulkan-x64',
+          'ROCm only covers listed gfx9/gfx10 discrete GPUs; use Vulkan otherwise (iGPUs included)'],
+        ['AMD integrated / unsure', 'bin-win-vulkan-x64', 'Most compatible; the Runtime page lists detected Vulkan devices'],
+        ['Intel iGPU / Arc / NPU', 'bin-win-openvino-*-x64',
+          'OpenVINO build using Intel CPU/GPU plugins; devices starting with OPENVINO are selectable'],
         ['CPU only', 'bin-win-cpu-x64', 'Slow but most compatible'],
       ],
     },
@@ -243,7 +263,7 @@ function renderShell() {
   root.innerHTML = `
     <div class="page-header">
       <div>
-        <div class="page-title">${ctx.escapeHtml(t('help.title'))}</div>
+        <h1 class="page-title">${ctx.escapeHtml(t('help.title'))}</h1>
         <div class="page-subtitle">${ctx.escapeHtml(t('help.subtitle'))}</div>
       </div>
       <div class="page-actions">
@@ -284,7 +304,7 @@ function renderShell() {
   root.querySelector('#help-refresh').addEventListener('click', refreshChecklist);
 }
 
-function checklistItem(state, title, detail, goto) {
+function checklistItem(state, title, detail, goto, gotoLabel) {
   const icon = { ok: '✓', warn: '!', error: '✕', info: 'i' }[state] || 'i';
   return `
     <div class="help-check help-check-${state}">
@@ -293,7 +313,13 @@ function checklistItem(state, title, detail, goto) {
         <div class="help-check-title">${ctx.escapeHtml(title)}</div>
         ${detail ? `<div class="help-check-detail">${ctx.escapeHtml(detail)}</div>` : ''}
       </div>
-      ${goto ? `<button class="btn btn-sm btn-secondary" data-goto="${goto}">${ctx.escapeHtml(t('help.openSettings'))}</button>` : ''}
+      ${
+        goto
+          ? `<button class="btn btn-sm btn-secondary" data-goto="${goto}">${ctx.escapeHtml(
+              gotoLabel || t('help.openSettings')
+            )}</button>`
+          : ''
+      }
     </div>`;
 }
 
@@ -311,8 +337,27 @@ async function refreshChecklist() {
   }
 
   const items = [];
-  if (!cfg || !String(cfg.llama_server_path || '').trim()) {
+  let runtimes = [];
+  try {
+    const data = await ctx.Api.listRuntimes();
+    runtimes = (data && data.runtimes) || [];
+  } catch {
+    runtimes = [];
+  }
+  if (!hasUsableServer({ serverPath: cfg && cfg.llama_server_path, runtimes })) {
     items.push(checklistItem('error', t('help.check.serverMissing'), '', 'settings'));
+  } else if (!String((cfg && cfg.llama_server_path) || '').trim()) {
+    // 全局路径空、但注册表里有构建：这是**已配置**，不是缺失。能力探测读的是全局
+    // 路径，所以这里不能去问探测结果，否则会报一条与事实相反的"探测失败"。
+    items.push(
+      checklistItem(
+        'ok',
+        t('help.check.serverFromRuntime', { count: runtimes.length }),
+        '',
+        'runtimes',
+        t('help.openRuntimes')
+      )
+    );
   } else {
     let server = null;
     try {

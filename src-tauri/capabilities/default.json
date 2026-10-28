@@ -6,6 +6,8 @@
   "permissions": [
     "core:default",
     "open-file-dialog",
-    "get-backend-session"
+    "get-backend-session",
+    "set-close-to-tray",
+    "quit-app"
   ]
 }

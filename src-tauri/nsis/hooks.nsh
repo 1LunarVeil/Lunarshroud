@@ -29,6 +29,11 @@
   RMDir /r "$INSTDIR\webview2-data"
   RMDir /r "$INSTDIR\runtime-temp"
   RMDir /r "$INSTDIR\logs"
+  ; The app falls back to LocalAppData when the install directory is not
+  ; writable. Those are cache/temp artifacts, never user config, so clean them
+  ; without touching the LunarShroud data directory itself.
+  RMDir /r "$LOCALAPPDATA\LunarShroud\webview2-data"
+  RMDir /r "$LOCALAPPDATA\LunarShroud\runtime-temp"
   Delete "$INSTDIR\launcher-boot.log"
   Delete "$INSTDIR\debug.log"
   Delete "$INSTDIR\backend\backend-child.log"

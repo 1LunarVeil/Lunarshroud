@@ -3,12 +3,14 @@
 
 import { t, localizeBackendError } from './i18n.mjs';
 import { emptyStateHtml } from './panel_views.mjs';
+import { createRequestGate } from './runtime.mjs';
 
 export const id = 'history';
 export const title = '启动历史';
 
 let ctx = null;
 let root = null;
+const detailGate = createRequestGate();
 let records = [];
 let page = 1;
 const PAGE_SIZE = 50;
@@ -19,7 +21,7 @@ export function init(el, appCtx) {
   root.innerHTML = `
     <div class="page-header">
       <div>
-        <div class="page-title">${ctx.escapeHtml(t('history.title'))}</div>
+        <h1 class="page-title">${ctx.escapeHtml(t('history.title'))}</h1>
         <div class="page-subtitle">${ctx.escapeHtml(t('history.subtitle'))}</div>
       </div>
       <div class="page-actions">
@@ -35,7 +37,9 @@ export function init(el, appCtx) {
 }
 
 export function onShow() { refresh(); }
-export function onHide() {}
+export function onHide() {
+  detailGate.cancel();
+}
 
 async function refresh() {
   const offset = (page - 1) * PAGE_SIZE;
@@ -64,6 +68,7 @@ function renderTable() {
           <th>${ctx.escapeHtml(t('history.status'))}</th>
           <th>${ctx.escapeHtml(t('history.duration'))}</th>
           <th>${ctx.escapeHtml(t('dash.preset'))}</th>
+          <th>${ctx.escapeHtml(t('dash.runtime'))}</th>
           <th>${ctx.escapeHtml(t('history.actions'))}</th>
         </tr>
       </thead>
@@ -72,10 +77,11 @@ function renderTable() {
           <tr>
             <td>${ctx.formatTime(r.started_at)}</td>
             <td>${ctx.escapeHtml(ctx.basename(r.model_path) || r.model_path || '-')}</td>
-            <td class="text-mono">${r.port || '-'}</td>
+            <td class="text-mono">${ctx.escapeHtml(String(r.port ?? '-'))}</td>
             <td>${ctx.statusBadge(r.status)}</td>
             <td class="text-mono">${ctx.formatDuration(r.duration_seconds)}</td>
             <td>${ctx.escapeHtml(r.preset_name || '-')}</td>
+            <td>${ctx.escapeHtml(r.runtime_label || r.runtime_id || '-')}</td>
             <td>
               <button class="btn btn-sm btn-ghost" data-action="detail" data-id="${r.id}">${ctx.escapeHtml(t('history.detail'))}</button>
               <button class="btn btn-sm btn-ghost" data-action="relaunch" data-id="${r.id}">${ctx.escapeHtml(t('history.relaunch'))}</button>
@@ -134,25 +140,29 @@ async function handleAction(action, id) {
 }
 
 async function showDetail(id) {
+  const request = detailGate.begin();
   try {
     const h = await ctx.Api.getHistory(id);
+    if (!detailGate.isCurrent(request)) return;
     const params = h.params || {};
     const paramRows = Object.keys(params).map((k) => `
-      <tr><td class="text-mono">${ctx.escapeHtml(k)}</td><td class="text-mono" style="word-break:break-all;">${ctx.escapeHtml(JSON.stringify(params[k]))}</td></tr>
+      <tr><td class="text-mono">${ctx.escapeHtml(k)}</td><td class="text-mono" break-all>${ctx.escapeHtml(JSON.stringify(params[k]))}</td></tr>
     `).join('');
     const body = `
       <div class="mb-4 text-sm">
         <div><strong>${ctx.escapeHtml(t('history.time'))}:</strong> ${ctx.formatTime(h.started_at)}${h.stopped_at ? ` ~ ${ctx.formatTime(h.stopped_at)}` : ''}</div>
         <div><strong>${ctx.escapeHtml(t('dash.model'))}:</strong> ${ctx.escapeHtml(h.model_path || '-')}</div>
-        <div><strong>${ctx.escapeHtml(t('dash.port'))}:</strong> ${h.port || '-'}</div>
-        <div><strong>${ctx.escapeHtml(t('history.status'))}:</strong> ${ctx.statusBadge(h.status)}${h.exit_code !== null && h.exit_code !== undefined ? ` · exit ${h.exit_code}` : ''}</div>
+        ${h.model_key ? `<div><strong>${ctx.escapeHtml(t('history.modelKey'))}:</strong> <span class="text-mono">${ctx.escapeHtml(h.model_key)}</span>${h.variant_key ? ` · <span class="text-mono">${ctx.escapeHtml(h.variant_key)}</span>` : ''}</div>` : ''}
+        <div><strong>${ctx.escapeHtml(t('dash.port'))}:</strong> ${ctx.escapeHtml(String(h.port ?? '-'))}</div>
+        <div><strong>${ctx.escapeHtml(t('history.status'))}:</strong> ${ctx.statusBadge(h.status)}${h.exit_code !== null && h.exit_code !== undefined ? ` · exit ${ctx.escapeHtml(String(h.exit_code))}` : ''}</div>
         <div><strong>${ctx.escapeHtml(t('dash.preset'))}:</strong> ${ctx.escapeHtml(h.preset_name || '-')}</div>
-        ${h.error_message ? `<div style="color:var(--color-danger);"><strong>${ctx.escapeHtml(t('dash.error'))}:</strong> ${ctx.escapeHtml(localizeBackendError(h.error_message))}</div>` : ''}
+        <div><strong>${ctx.escapeHtml(t('dash.runtime'))}:</strong> ${ctx.escapeHtml(h.runtime_label || h.runtime_id || '-')}</div>
+        ${h.error_message ? `<div class="text-danger"><strong>${ctx.escapeHtml(t('dash.error'))}:</strong> ${ctx.escapeHtml(localizeBackendError(h.error_message))}</div>` : ''}
       </div>
       <div class="mb-2"><strong>${ctx.escapeHtml(t('history.launchCommand'))}:</strong></div>
-      <pre class="text-mono" style="background:#0F172A; color:#E2E8F0; padding:10px; border-radius:8px; font-size:12px; white-space:pre-wrap; word-break:break-all; max-height:160px; overflow:auto;">${ctx.escapeHtml(h.command_text || '')}</pre>
+      <pre class="text-mono code-preview scroll-panel-160">${ctx.escapeHtml(h.command_text || '')}</pre>
       <div class="mt-4 mb-2"><strong>${ctx.escapeHtml(t('history.paramList', { count: Object.keys(params).length }))}:</strong></div>
-      <div class="table-wrap" style="max-height:200px; overflow:auto;">
+      <div class="table-wrap" scroll-panel-200>
         <table class="table">
           <thead><tr><th>${ctx.escapeHtml(t('presets.param'))}</th><th>${ctx.escapeHtml(t('presets.value'))}</th></tr></thead>
           <tbody>${paramRows || `<tr><td colspan="2" class="empty-state">${ctx.escapeHtml(t('history.noParams'))}</td></tr>`}</tbody>
@@ -164,6 +174,7 @@ async function showDetail(id) {
       { label: t('history.copyCommand'), class: 'btn-primary', size: 'lg', onClick: () => ctx.copyToClipboard(h.command_text || '') },
     ]);
   } catch (e) {
+    if (!detailGate.isCurrent(request)) return;
     ctx.showToast(`${t('history.detailFailed')}: ${localizeBackendError(e.message)}`, 'error');
   }
 }

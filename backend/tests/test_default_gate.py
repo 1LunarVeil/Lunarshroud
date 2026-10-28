@@ -93,13 +93,14 @@ def test_no_probe_degrades_to_the_previous_behaviour():
 def test_golden_argv_is_token_stable_without_a_probe():
     """逐 token 钉住默认参数的命令行 —— 降级路径不允许漂移。"""
     argv = build_argv(get_default_params(), FAKE_EXE)
-    # 只剩"我们有意覆盖上游"的那几个 + host/port（后者故意不省，理由见 schema）。
+    # 只剩"我们有意覆盖上游"的那几个 + host/port（后者故意不省，理由见 schema）
+    # + --cors-origins localhost（上游默认 * 会让任意网页读取本机输出）。
     # 注意这里**没有 -ngl**：n_gpu_layers 的默认值已改为哨兵 -1，即不写本参数、
     # 交给 llama-server 自己适配（显存不够时自动降层而不是崩）。把 -ngl 加回默认
     # 命令行等于重新关掉 llama.cpp 唯一的自救机制，需要显式的理由。
     assert argv[1:] == [
         "--jinja", "-c", "8192", "-np", "1", "-fa", "on",
-        "--host", "127.0.0.1", "--port", "8080",
+        "--host", "127.0.0.1", "--port", "8080", "--cors-origins", "localhost",
     ]
 
 
@@ -496,7 +497,7 @@ def test_probe_run_uses_create_no_window(tmp_path, monkeypatch):
     不带这个 flag 时，每次启动预热（--help / --version 各一次）都会给
     llama-server 弹一个可见控制台窗口 —— 用户看到的就是"闪命令行"。
 
-    接缝随 H1 修复后移到了 Popen（subprocess.run 的超时在 Windows 包装脚本
+    接缝随超时修复后移到了 Popen（subprocess.run 的超时在 Windows 包装脚本
     场景下不构成时间上界）；断言对象相应改为 Popen 的 kwargs。
     """
     import os

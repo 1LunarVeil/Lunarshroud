@@ -5,9 +5,17 @@
 // 与 settings 同款契约；showModal 单实例，二级交互用浮层内联展开区而非嵌套弹窗）。
 
 import { tauriInvoke } from './api.js?v=1';
-import { isParamEnabled, shouldAutoAssignPort, mergeUpstreamOptions } from './runtime.mjs';
+import {
+  createRequestGate,
+  diffModelDefaults,
+  isParamEnabled,
+  shouldAutoAssignPort,
+  mergeUpstreamOptions,
+  parseNumericInput,
+} from './runtime.mjs';
 import { t, localizeBackendError } from './i18n.mjs';
 import { confirmLaunch } from './preflight.mjs';
+import { createParamView } from './param_editor_view.mjs';
 
 export const id = 'param_editor';
 export const title = '参数编辑器';
@@ -22,7 +30,32 @@ let schemaMap = {};      // key -> param def
 let groups = [];
 let presetCache = [];
 let recipes = [];         // 用途配方（后端按本机构建标注 unsupported）
+// 运行环境选择：'' = 跟随设置里的默认运行时；否则为已注册 profile id。
+// schema / 能力 / 配方都按所选构建重新取，不能沿用上一个构建的 supported 标记。
+let runtimeProfiles = [];
+let runtimePreference = '';
+let selectedRuntimeId = '';
+let schemaRuntimeId = '';
+let runtimesLoaded = false;
+let runtimesPromise = null;
+// 模型默认值（manifest < 用户保存）及其来源标签
+let modelDefaults = null;
+let lastDefaultsPath = null;
+// Must mirror backend/core/config_resolver.py MANAGED_KEYS. Saving these as
+// model defaults would redirect the model or the security boundary, so the UI
+// filters them before the API even sees them.
+const MANAGED_DEFAULT_KEYS = new Set([
+  'model',
+  'model_dir',
+  'host',
+  'port',
+  'api_key',
+  'path',
+  'log_file',
+  'extra_args',
+]);
 let locale = 'zh-CN';
+let view = null; // pure HTML renderer, rebuilt on open
 // 从模型库/顶栏选择器跳过来的目标模型；schema 未就绪时先存着，加载完成后再应用
 let pendingModelPath = null;
 // 模型能力（来自 P1 探测层）
@@ -39,6 +72,20 @@ const capsCache = new Map(); // path -> caps，来回切换模型不重复请求
 export function open(appCtx) {
   ctx = appCtx;
   locale = document.documentElement.lang === 'en-US' ? 'en-US' : 'zh-CN';
+  view = createParamView({
+    escapeHtml: appCtx.escapeHtml,
+    t,
+    locale,
+    getValues: () => currentValues,
+  });
+  // 每次打开都重新读运行环境：用户可能刚在「运行环境」页注册/移除过构建。
+  runtimesLoaded = false;
+  runtimesPromise = null;
+  modelDefaults = null;
+  lastDefaultsPath = null;
+  // 浮层关闭会销毁卡片 DOM，但模块级 lastCardPath 还在；不置空的话重新打开时
+  // refreshModelCard 会直接 return，模型能力卡与"应用模型默认值"按钮整块消失。
+  lastCardPath = null;
   // 跨模块传参沿用既有 window.__pending* 约定（原 onShow 里的逻辑平移）
   if (window.__pendingModelPath) {
     pendingModelPath = window.__pendingModelPath;
@@ -57,8 +104,10 @@ export function open(appCtx) {
       <div class="pe-pane" id="param-groups"></div>
     </div>
   `;
-  // 动作按钮全部收进底部命令条，不用 showModal 的 footer 机制
-  const overlay = ctx.showModal(t('params.title'), wrap, []);
+  // 动作按钮全部收进底部命令条，不用 showModal 的 footer 机制。
+  // 初始焦点放在编辑器容器上（内部控件尚未渲染，不能聚焦第一个按钮）。
+  wrap.tabIndex = -1;
+  const overlay = ctx.showModal(t('params.title'), wrap, [], { initialFocus: wrap });
   overlay.querySelector('.modal').classList.add('modal-xl', 'modal-param-editor');
   root = overlay;
 
@@ -69,7 +118,10 @@ export function open(appCtx) {
       'beforebegin',
       `
     <div class="pe-header-actions">
-      <select class="select" id="load-preset-select" style="min-width:200px;">
+      <select class="select" id="runtime-select" aria-label="${ctx.escapeHtml(t('params.runtimeSelect'))}" title="${ctx.escapeHtml(t('params.runtimeSelectHint'))}">
+        <option value="">${ctx.escapeHtml(t('params.runtimeDefault'))}</option>
+      </select>
+      <select class="select" id="load-preset-select" aria-label="${ctx.escapeHtml(t('params.loadPreset'))}" min-w-preset>
         <option value="">${ctx.escapeHtml(t('params.loadPreset'))}</option>
       </select>
       <button class="btn btn-secondary btn-sm" id="btn-reset-defaults">${ctx.escapeHtml(t('params.resetDefaults'))}</button>
@@ -83,7 +135,7 @@ export function open(appCtx) {
   footer.innerHTML = `
     <div class="inline-sheet" id="pe-sheet" hidden></div>
     <div class="pe-cmd-row">
-      <button type="button" class="pe-cmd-toggle" id="pe-cmd-toggle" title="${ctx.escapeHtml(t('params.cmdToggle'))}">
+      <button type="button" class="pe-cmd-toggle" id="pe-cmd-toggle" title="${ctx.escapeHtml(t('params.cmdToggle'))}" aria-expanded="false" aria-controls="cmd-preview">
         <span class="pe-cmd-chevron" aria-hidden="true">▸</span>
         <code class="pe-cmd-summary" id="pe-cmd-summary"></code>
       </button>
@@ -98,7 +150,14 @@ export function open(appCtx) {
   `;
 
   bindEvents();
-  loadRecipes();
+  refreshRuntimeSelect();
+  // 运行环境列表与 schema 并行加载；若设置里的默认运行时变了，缓存 schema 需要重建
+  ensureRuntimes().then(() => {
+    refreshRuntimeSelect();
+    if (schema && selectedRuntimeId !== schemaRuntimeId) {
+      switchRuntime(selectedRuntimeId, { silent: true });
+    }
+  });
   // Ctrl+Enter 绑在浮层上（随浮层销毁自动解绑）；焦点放进浮层，键盘事件才能冒泡上来
   wrap.tabIndex = -1;
   wrap.focus({ preventScroll: true });
@@ -112,6 +171,7 @@ export function open(appCtx) {
     renderGroups();
     updateCommandPreview();
     refreshPresetDropdown();
+    loadRecipes();
     applyPendingModel();
   } else {
     loadSchema();
@@ -129,45 +189,49 @@ function updateModalTitle() {
     : t('params.title');
 }
 
-function paramLabel(p) {
-  return locale === 'en-US' && p.label_en ? p.label_en : p.label;
-}
-
-function paramHelp(p) {
-  return locale === 'en-US' && p.help_en ? p.help_en : p.help;
-}
-
-function optionLabel(p, opt) {
-  const labels = locale === 'en-US' && p.option_labels_en ? p.option_labels_en : p.option_labels;
-  if (labels && labels[opt] !== undefined) return labels[opt];
-  return opt;
-}
-
-function groupLabel(g) {
-  return locale === 'en-US' && g.label_en ? g.label_en : g.label;
-}
+const paramLabel = (p) => view.paramLabel(p);
+const paramHelp = (p) => view.paramHelp(p);
+const paramControlId = (p) => view.paramControlId(p);
+const groupLabel = (g) => view.groupLabel(g);
 
 function bindEvents() {
   // 重置确认也走内联 sheet：showConfirm 会顶掉编辑器浮层（showModal 单实例）
   root.querySelector('#btn-reset-defaults').addEventListener('click', () => openInlineSheet('reset'));
+  root.querySelector('#runtime-select').addEventListener('change', (event) => {
+    switchRuntime(event.target.value);
+  });
   root.querySelector('#btn-copy-cmd').addEventListener('click', () => {
     ctx.copyToClipboard(lastCommand);
   });
   root.querySelector('#btn-save-preset').addEventListener('click', () => openInlineSheet('preset'));
   root.querySelector('#btn-launch-now').addEventListener('click', () => openInlineSheet('launch'));
   // 命令条：点击摘要行展开/收起全文
-  root.querySelector('#pe-cmd-toggle').addEventListener('click', () => {
+  root.querySelector('#pe-cmd-toggle').addEventListener('click', (event) => {
     const full = root.querySelector('#cmd-preview');
     const chevron = root.querySelector('.pe-cmd-chevron');
     const expanded = !full.hidden;
     full.hidden = expanded;
     chevron.classList.toggle('open', !expanded);
+    event.currentTarget.setAttribute('aria-expanded', String(!expanded));
   });
   root.querySelector('#load-preset-select').addEventListener('change', async (e) => {
     const id = e.target.value;
     if (!id) return;
     try {
       const p = await ctx.Api.getPreset(id);
+      // 预设可以固定某个运行环境；目标构建不可用时保留当前选择并明确告警。
+      if (p.runtime_id && p.runtime_id !== selectedRuntimeId) {
+        const target = runtimeProfiles.find(
+          (profile) => profile.id === p.runtime_id && profile.status === 'ok'
+        );
+        if (target) {
+          if (!(await switchRuntime(target.id, { silent: true }))) {
+            throw new Error(t('params.presetRuntimeUnavailable'));
+          }
+        } else {
+          ctx.showToast(t('params.presetRuntimeMissing', { id: p.runtime_id }), 'warning');
+        }
+      }
       Object.assign(currentValues, JSON.parse(JSON.stringify(defaults)), p.params);
       refreshAllControls();
       updateCommandPreview();
@@ -179,9 +243,129 @@ function bindEvents() {
   });
 }
 
+function ensureRuntimes() {
+  if (runtimesLoaded) return Promise.resolve();
+  if (!runtimesPromise) {
+    runtimesPromise = loadRuntimes().finally(() => {
+      runtimesPromise = null;
+    });
+  }
+  return runtimesPromise;
+}
+
+async function loadRuntimes() {
+  try {
+    const payload = await ctx.Api.listRuntimes();
+    runtimeProfiles = Array.isArray(payload && payload.runtimes) ? payload.runtimes : [];
+    runtimePreference =
+      payload && payload.preferences ? String(payload.preferences.gguf || '') : '';
+  } catch {
+    // 运行环境接口失败不能挡住调参：退回"仅用设置里的 llama-server 路径"
+    runtimeProfiles = [];
+    runtimePreference = '';
+  }
+  const usable = (id) =>
+    Boolean(id) && runtimeProfiles.some((profile) => profile.id === id && profile.status === 'ok');
+  if (selectedRuntimeId && !usable(selectedRuntimeId)) selectedRuntimeId = '';
+  if (!selectedRuntimeId && usable(runtimePreference)) selectedRuntimeId = runtimePreference;
+  runtimesLoaded = true;
+  refreshRuntimeSelect();
+}
+
+function refreshRuntimeSelect() {
+  const select = root && root.querySelector('#runtime-select');
+  if (!select) return;
+  const options = [`<option value="">${ctx.escapeHtml(t('params.runtimeDefault'))}</option>`];
+  for (const profile of runtimeProfiles) {
+    const name = profile.display_name || profile.id;
+    const suffix = profile.status === 'ok' ? '' : ` (${t('runtimes.probeFailed')})`;
+    options.push(
+      `<option value="${ctx.escapeHtml(String(profile.id))}"${profile.status === 'ok' ? '' : ' disabled'}>${ctx.escapeHtml(
+        name + suffix
+      )}</option>`
+    );
+  }
+  select.innerHTML = options.join('');
+  select.value = selectedRuntimeId;
+}
+
+/**
+ * 切换运行环境：schema 的 supported/upstream_options 是**按构建**的，必须整体
+ * 重新取；再按新 schema 过滤用户当前值，避免把上一个构建的私有字段带进命令行。
+ */
+async function switchRuntime(nextId, { silent = false } = {}) {
+  const target = String(nextId || '');
+  if (schema && target === selectedRuntimeId) {
+    refreshRuntimeSelect();
+    return true;
+  }
+  const previousId = selectedRuntimeId;
+  selectedRuntimeId = target;
+  refreshRuntimeSelect();
+  if (!schema) return true; // 首次加载：loadSchema 会带上这个选择
+
+  const preserved = { ...currentValues };
+  capsCache.clear();
+  lastCardPath = null;
+  modelCaps = null;
+  nativeCtxLimit = null;
+  modelDefaults = null;
+  lastDefaultsPath = null;
+  try {
+    const nextSchema = await ctx.Api.getParamSchema(target || undefined);
+    if (target !== selectedRuntimeId) return true; // 已被更晚的一次切换取代
+    schema = nextSchema;
+    schemaRuntimeId = target;
+    groups = schema.groups || [];
+    schemaMap = {};
+    for (const p of schema.params || []) schemaMap[p.key] = p;
+    const merged = JSON.parse(JSON.stringify(defaults));
+    for (const key of Object.keys(schemaMap)) {
+      if (Object.prototype.hasOwnProperty.call(preserved, key)) merged[key] = preserved[key];
+    }
+    currentValues = merged;
+    if (activeGroupKey && !groups.some((g) => g.key === activeGroupKey)) {
+      activeGroupKey = (groups[0] && groups[0].key) || null;
+    }
+    recipes = [];
+    renderNav();
+    renderGroups();
+    await loadRecipes();
+    updateCommandPreview();
+    refreshModelCard();
+    if (!silent) {
+      const profile = runtimeProfiles.find((item) => item.id === target);
+      ctx.showToast(
+        t('params.runtimeSwitched', {
+          name: profile ? profile.display_name || profile.id : t('params.runtimeDefault'),
+        }),
+        'success',
+        1800
+      );
+    }
+    return true;
+  } catch (e) {
+    if (target !== selectedRuntimeId) return true;
+    selectedRuntimeId = previousId;
+    refreshRuntimeSelect();
+    if (!silent) {
+      ctx.showToast(
+        `${t('params.runtimeSwitchFailed')}: ${localizeBackendError(e.message)}`,
+        'error'
+      );
+    }
+    return false;
+  }
+}
+
 async function loadSchema() {
   try {
-    schema = await ctx.Api.getParamSchema();
+    await ensureRuntimes();
+    const requested = selectedRuntimeId;
+    const loadedSchema = await ctx.Api.getParamSchema(requested || undefined);
+    if (requested !== selectedRuntimeId) return; // 等待期间用户又切换了运行环境
+    schema = loadedSchema;
+    schemaRuntimeId = requested;
     const d = await ctx.Api.getParamDefaults();
     defaults = d || {};
     groups = schema.groups || [];
@@ -194,6 +378,7 @@ async function loadSchema() {
     renderGroups();
     updateCommandPreview();
     refreshPresetDropdown();
+    loadRecipes();
     // 从模型库/选择器跳过来的目标模型也等 schema 就绪后再应用
     applyPendingModel();
   } catch (e) {
@@ -265,158 +450,8 @@ function renderGroups() {
   refreshAllControls();
 }
 
-function groupHtml(g) {
-  return `
-    <div class="collapse open" data-group="${g.key}">
-      <div class="collapse-header">
-        <span class="collapse-arrow">▶</span>
-        <span class="collapse-title">${ctx.escapeHtml(groupLabel(g))}</span>
-      </div>
-      <div class="collapse-body" data-group-body="${g.key}"></div>
-    </div>
-  `;
-}
-
-/** 本机构建不认这个 flag —— 界面必须说清楚，不能只是把控件灰掉 */
-function isUnsupported(p) {
-  return p && p.supported === false;
-}
-
-/** 宽控件（路径/文本/密码/多选卡片）在参数网格里独占整行 —— 压缩反而难用 */
-function isWideField(p) {
-  return (
-    p.multiple ||
-    p.type === 'file' ||
-    p.type === 'dir' ||
-    p.type === 'password' ||
-    p.type === 'text'
-  );
-}
-
-function paramHtml(p) {
-  // 单位已挪进输入框内右缀（见 controlHtml），label 行只留名字与徽标
-  const requiredMark = p.required ? `<span class="required">*</span>` : '';
-  const unsupported = isUnsupported(p);
-  const badge = unsupported
-    ? `<span class="tag tag-warn" style="margin-left:6px;" title="${ctx.escapeHtml(t('params.unsupportedHint'))}">${ctx.escapeHtml(t('params.unsupported'))}</span>`
-    : '';
-  const hint = unsupported
-    ? `<div class="param-field-warn">${ctx.escapeHtml(t('params.unsupportedHint'))}</div>`
-    : '';
-  // 静态说明收进 label 尾部的 ? 提示圈（hover/聚焦延迟浮现），不再常驻 DOM；
-  // 动态状态（不支持提示、ctx 超限 note）仍内联 —— 状态是反馈，不能藏。
-  // 两列网格下 label 可能被截断，tooltip 首行放全名、其后是说明
-  const helpText = paramHelp(p);
-  const tipContent = helpText ? `${paramLabel(p)}\n${helpText}` : '';
-  const tip = tipContent
-    ? `<button type="button" class="param-help-tip" data-tip="${ctx.escapeHtml(tipContent)}" aria-label="${ctx.escapeHtml(t('params.helpTipAria'))}">?</button>`
-    : '';
-  // 开关类做成「label 左 + 开关右」的单行紧凑形态，与其余短控件同入一格
-  const isSwitch = p.type === 'switch';
-  const control = controlHtml(p);
-  const classes = [
-    'param-field',
-    unsupported ? 'param-field-unsupported' : '',
-    isWideField(p) ? 'param-field-wide' : '',
-    isSwitch ? 'param-field-switch' : '',
-  ]
-    .filter(Boolean)
-    .join(' ');
-  return `
-    <div class="${classes}" data-param="${p.key}" data-key="${p.key}">
-      <div class="param-field-label">
-        <span class="param-field-name">${ctx.escapeHtml(paramLabel(p))}</span>${requiredMark}
-        ${p.cli ? `<span class="tag tag-default" style="margin-left:6px;">${ctx.escapeHtml(p.cli)}</span>` : ''}
-        ${badge}${tip}${isSwitch ? control : ''}
-      </div>
-      ${isSwitch ? '' : `<div class="param-field-control">${control}</div>`}
-      ${hint}
-    </div>
-  `;
-}
-
-function controlHtml(p) {
-  const v = currentValues[p.key];
-  // 本机构建不认这个 flag：控件置灰，避免"勾了却没生效"
-  const disabled = isUnsupported(p) ? ' disabled' : '';
-  switch (p.type) {
-    case 'number':
-    case 'float': {
-      const step = p.step || (p.type === 'float' ? 'any' : '1');
-      // v 来自 currentValues（可被预设/导入带入任意字符串），与其他控件一样必须转义
-      const input = `<input type="number" class="input" data-key="${p.key}" value="${ctx.escapeHtml(v ?? '')}" min="${p.min ?? ''}" max="${p.max ?? ''}" step="${step}" placeholder="${ctx.escapeHtml(p.placeholder || '')}"${disabled} />`;
-      // 单位内嵌右缀（adornment）：缓解 label 行拥挤，且与数值视觉绑定
-      return p.unit
-        ? `<span class="input-unit-wrap">${input}<span class="input-unit">${ctx.escapeHtml(String(p.unit))}</span></span>`
-        : input;
-    }
-    case 'select': {
-      // 多值参数（如 --spec-type）用卡片式多选：原生 multiple select 靠蓝底
-      // 反白表示选中，选项之间没有分隔，值一多就分不清了。
-      if (p.multiple) return multiSelectHtml(p, v);
-      // 合并本机构建声明的取值：schema 的 options 是快照，上游新增的取值
-      // （如 build 10960 的 draft-dspark）不该永远选不到
-      const merged = mergeUpstreamOptions(p.options, p.upstream_options);
-      const opts = merged.map((opt) => {
-        const label = optionLabel(p, opt);
-        const sel = String(opt) === String(v) ? 'selected' : '';
-        return `<option value="${ctx.escapeHtml(String(opt))}" ${sel}>${ctx.escapeHtml(String(label))}</option>`;
-      }).join('');
-      return `<select class="select" data-key="${p.key}"${disabled}>${opts}</select>`;
-    }
-    case 'switch': {
-      const checked = v ? 'checked' : '';
-      return `<label class="switch"><input type="checkbox" data-key="${p.key}" ${checked}${disabled}/><span class="switch-slider"></span></label>`;
-    }
-    case 'file':
-    case 'dir': {
-      const val = v || '';
-      return `<input type="text" class="input" data-key="${p.key}" value="${ctx.escapeHtml(val)}" placeholder="${ctx.escapeHtml(p.placeholder || '')}"${disabled} /><button class="btn btn-secondary btn-sm" data-browse="${p.key}" data-browse-type="${p.type}"${disabled}>${ctx.escapeHtml(t('params.browse'))}</button>`;
-    }
-    case 'password':
-      return `<input type="password" class="input" data-key="${p.key}" value="${ctx.escapeHtml(v ?? '')}" placeholder="${ctx.escapeHtml(p.placeholder || '')}" autocomplete="off"${disabled} />`;
-    case 'text':
-    default:
-      return `<input type="text" class="input" data-key="${p.key}" value="${ctx.escapeHtml(v ?? '')}" placeholder="${ctx.escapeHtml(p.placeholder || '')}"${disabled} />`;
-  }
-}
-
-/** 把 "draft-mtp（多 Token 预测）" 拆成 { title, desc }，便于卡片分两行展示 */
-function splitOptionLabel(label) {
-  const m = String(label).match(/^([^(（]+)[（(]([^）)]*)[）)]\s*$/);
-  if (!m) return { title: String(label), desc: '' };
-  return { title: m[1].trim(), desc: m[2].trim() };
-}
-
-function multiSelectHtml(p, value) {
-  const selected = Array.isArray(value) ? value.map(String) : [];
-  // schema 的 options 是静态快照；把本机构建声明的取值合并进来，
-  // 否则上游新增的实现（实测 draft-dspark）永远选不到
-  const options = mergeUpstreamOptions(p.options, p.upstream_options);
-  const disabled = isUnsupported(p) ? ' disabled' : '';
-  const cards = options.map((opt) => {
-    const raw = String(opt);
-    const { title, desc } = splitOptionLabel(optionLabel(p, opt));
-    const checked = selected.includes(raw) ? 'checked' : '';
-    return `
-      <label class="option-card${checked ? ' selected' : ''}">
-        <input type="checkbox" data-opt="${ctx.escapeHtml(raw)}" ${checked}${disabled}/>
-        <span class="option-card-text">
-          <span class="option-card-title">${ctx.escapeHtml(title)}</span>
-          ${desc ? `<span class="option-card-desc">${ctx.escapeHtml(desc)}</span>` : ''}
-        </span>
-        <span class="option-card-check" aria-hidden="true">✓</span>
-      </label>`;
-  }).join('');
-  return `
-    <div class="option-cards" data-key="${p.key}" data-multiple="1" role="group">
-      <div class="option-cards-head">
-        <span data-count></span>
-        <button type="button" class="btn btn-sm btn-ghost" data-clear>${ctx.escapeHtml(t('params.multiClear'))}</button>
-      </div>
-      ${cards}
-    </div>`;
-}
+const groupHtml = (g) => view.groupHtml(g);
+const paramHtml = (p) => view.paramHtml(p);
 
 /** 同步卡片的选中样式与"已选 N 项"计数（不依赖 CSS :has，兼容旧 WebView2） */
 function syncOptionCards(container) {
@@ -468,22 +503,31 @@ function bindParamControl(fieldEl) {
   const input = fieldEl.querySelector(`[data-key="${key}"]`);
   if (!input) return;
   const handler = () => {
-    let val;
-    if (p.type === 'switch') {
-      val = input.checked;
-    } else if (p.type === 'number') {
-      val = input.value === '' ? null : Number(input.value);
-    } else if (p.type === 'float') {
-      val = input.value === '' ? null : parseFloat(input.value);
-    } else {
-      val = input.value;
+    if (p.type === 'number' || p.type === 'float') {
+      const parsed = parseNumericInput(input.value, p.type);
+      // 输入中间态（"-"、"0."）不能回写输入框：等到 blur/change 再规范化。
+      // 无效中间态保留上一个有效值，命令预览不会因为一个 "-" 跳成空。
+      if (parsed.valid) currentValues[key] = parsed.value;
+      refreshAllControls({ skipKey: key });
+      scheduleCommandPreview();
+      return;
     }
+    const val = p.type === 'switch' ? input.checked : input.value;
     currentValues[key] = val;
-    refreshAllControls();           // 联动重算
-    scheduleCommandPreview();       // 命令预览刷新（防抖）
+    refreshAllControls({ skipKey: key }); // 联动重算，但不回写正在编辑的控件
+    scheduleCommandPreview();             // 命令预览刷新（防抖）
   };
   input.addEventListener('input', handler);
   input.addEventListener('change', handler);
+  input.addEventListener('blur', () => {
+    if (p.type === 'number' || p.type === 'float') {
+      const parsed = parseNumericInput(input.value, p.type);
+      currentValues[key] = parsed.valid ? parsed.value : null;
+      if (!parsed.valid) input.value = ''; // 非数字文本不留在输入框里
+    }
+    refreshAllControls(); // 失焦时统一规范化并同步联动
+    scheduleCommandPreview();
+  });
   // 浏览按钮：使用原生文件选择对话框
   const browseBtn = fieldEl.querySelector(`[data-browse="${key}"]`);
   if (browseBtn) {
@@ -501,26 +545,29 @@ function bindParamControl(fieldEl) {
   }
 }
 
-function refreshAllControls() {
+function refreshAllControls({ skipKey = null } = {}) {
   for (const key in schemaMap) {
     const p = schemaMap[key];
     const field = root.querySelector(`.param-field[data-key="${key}"]`);
     if (!field) continue;
     const enabled = isParamEnabled(p, currentValues);
     field.classList.toggle('disabled', !enabled);
-    // 把 currentValues 回填到控件（用于预设加载/重置默认/浏览选择后同步显示）
+    // 把 currentValues 回填到控件（用于预设加载/重置默认/浏览选择后同步显示）。
+    // 正在编辑的控件（skipKey）不回写：数字输入的 "-" / "0." 中间态必须原样保留。
     const input = field.querySelector(`[data-key="${key}"]`);
     if (!input) continue;
     const v = currentValues[key];
     if (p.type === 'switch') {
-      input.checked = !!v;
+      if (key !== skipKey) input.checked = !!v;
     } else if (p.multiple) {
-      const selected = Array.isArray(v) ? v.map(String) : [];
-      input.querySelectorAll('input[data-opt]').forEach((box) => {
-        box.checked = selected.includes(box.dataset.opt);
-      });
+      if (key !== skipKey) {
+        const selected = Array.isArray(v) ? v.map(String) : [];
+        input.querySelectorAll('input[data-opt]').forEach((box) => {
+          box.checked = selected.includes(box.dataset.opt);
+        });
+      }
       syncOptionCards(input);
-    } else {
+    } else if (key !== skipKey) {
       input.value = (v === null || v === undefined) ? '' : String(v);
     }
   }
@@ -562,7 +609,10 @@ async function refreshModelCard() {
     return;
   }
 
-  const cached = capsCache.get(path);
+  // 能力是「构建 × 模型」的组合：换运行时必须重新探测，缓存键要带 runtime id。
+  const cacheKey = `${selectedRuntimeId}\u0000${path}`;
+  refreshModelDefaults(path);
+  const cached = capsCache.get(cacheKey);
   if (cached) {
     lastCardPath = path;
     modelCaps = cached;
@@ -578,19 +628,20 @@ async function refreshModelCard() {
   )}</div>`;
   let caps = null;
   try {
-    const payload = await ctx.Api.getCapabilities(path);
+    const payload = await ctx.Api.getCapabilities(path, selectedRuntimeId || undefined);
     caps = payload && payload.model;
   } catch {
     caps = null;
   }
-  // 等待期间路径可能已经改了，此时结果作废
+  // 等待期间路径或运行环境可能已经改了，此时结果作废
   if (String(currentValues.model || '').trim() !== path) return;
+  if (`${selectedRuntimeId}\u0000${path}` !== cacheKey) return;
 
   if (caps && caps.probed) {
     lastCardPath = path;
-    // 上限防止长会话无界增长（审计 R7）
+    // 上限防止长会话无界增长
     if (capsCache.size >= 64) capsCache.clear();
-    capsCache.set(path, caps);
+    capsCache.set(cacheKey, caps);
     modelCaps = caps;
     nativeCtxLimit = caps.context_length || null;
     paintModelCard(slot, caps);
@@ -611,14 +662,29 @@ async function refreshModelCard() {
  * 驱动预留），所以文案里必须带"估算"二字 —— 它更适合看**变化量**：把 ctx 从
  * 8K 调到 16K 会多占多少。
  */
+function vramSignature() {
+  return JSON.stringify([
+    String(currentValues.model || '').trim(),
+    currentValues.ctx_size,
+    currentValues.n_gpu_layers,
+    currentValues.cache_type_k,
+    currentValues.cache_type_v,
+    currentValues.parallel,
+    currentValues.mmproj,
+  ]);
+}
+
 async function refreshVramEstimate() {
   const slot = root && root.querySelector('#vram-estimate');
   if (!slot) return;
   const path = String(currentValues.model || '').trim();
   if (!path || !modelCaps) {
+    vramEstimateGate.cancel();
     slot.innerHTML = '';
     return;
   }
+  const request = vramEstimateGate.begin();
+  const signature = vramSignature();
 
   let payload = null;
   try {
@@ -634,8 +700,8 @@ async function refreshVramEstimate() {
   } catch {
     payload = null;
   }
-  // 等待期间参数可能又变了；这一帧作废（下一次防抖会补上）
-  if (String(currentValues.model || '').trim() !== path) return;
+  // 等待期间参数可能又变了；旧请求不得覆盖新参数的估算。
+  if (!vramEstimateGate.isCurrent(request) || signature !== vramSignature()) return;
   if (!slot.isConnected) return;
 
   if (!payload || !payload.probed) {
@@ -719,10 +785,22 @@ function paintModelCard(slot, caps) {
       <div class="card-header">
         <span class="card-title">${ctx.escapeHtml(t('params.capsTitle'))}</span>
         <div class="card-actions">
+          <button class="btn btn-sm btn-secondary" id="btn-apply-model-defaults" disabled>${ctx.escapeHtml(
+            t('params.modelDefaultsApply')
+          )}</button>
           <button class="btn btn-sm btn-secondary" id="btn-apply-recommended">${ctx.escapeHtml(
             t('params.capsApply')
           )}</button>
         </div>
+      </div>
+      <div class="model-caps-defaults" id="model-defaults-note" hidden></div>
+      <div class="model-caps-defaults-actions" id="model-defaults-actions" hidden>
+        <button type="button" class="btn btn-sm btn-secondary" id="btn-save-model-defaults">${ctx.escapeHtml(
+          t('params.modelDefaultsSave')
+        )}</button>
+        <button type="button" class="btn btn-sm btn-ghost" id="btn-clear-model-defaults" disabled>${ctx.escapeHtml(
+          t('params.modelDefaultsClear')
+        )}</button>
       </div>
       ${
         badges.length
@@ -752,6 +830,174 @@ function paintModelCard(slot, caps) {
   `;
   const btn = slot.querySelector('#btn-apply-recommended');
   if (btn) btn.addEventListener('click', applyRecommended);
+  const defaultsBtn = slot.querySelector('#btn-apply-model-defaults');
+  if (defaultsBtn) defaultsBtn.addEventListener('click', applyModelDefaults);
+  const saveDefaultsBtn = slot.querySelector('#btn-save-model-defaults');
+  if (saveDefaultsBtn) saveDefaultsBtn.addEventListener('click', saveModelDefaults);
+  const clearDefaultsBtn = slot.querySelector('#btn-clear-model-defaults');
+  if (clearDefaultsBtn) clearDefaultsBtn.addEventListener('click', clearModelDefaults);
+  updateModelDefaultsUI();
+}
+
+/** 读取该模型的默认值（manifest 与用户保存），只用于展示与一键应用。 */
+async function refreshModelDefaults(path) {
+  if (path === lastDefaultsPath) return;
+  lastDefaultsPath = path;
+  modelDefaults = null;
+  updateModelDefaultsUI();
+  let payload = null;
+  try {
+    payload = await ctx.Api.getModelDefaults(path);
+  } catch {
+    // 默认值读取失败不影响调参；保持按钮不可用即可
+    payload = null;
+  }
+  if (!root || String(currentValues.model || '').trim() !== path) return;
+  modelDefaults = payload;
+  updateModelDefaultsUI();
+}
+
+function modelDefaultsCounts() {
+  const sources = (modelDefaults && modelDefaults.sources) || {};
+  let manifest = 0;
+  let user = 0;
+  for (const source of Object.values(sources)) {
+    if (source === 'manifest') manifest += 1;
+    else if (source === 'user') user += 1;
+  }
+  return { manifest, user, total: manifest + user };
+}
+
+function updateModelDefaultsUI() {
+  const btn = root && root.querySelector('#btn-apply-model-defaults');
+  const note = root && root.querySelector('#model-defaults-note');
+  if (!btn || !note) return;
+  const { manifest, user, total } = modelDefaultsCounts();
+  btn.disabled = total === 0;
+  const path = String(currentValues.model || '').trim();
+  const actions = root.querySelector('#model-defaults-actions');
+  const saveBtn = root.querySelector('#btn-save-model-defaults');
+  const clearBtn = root.querySelector('#btn-clear-model-defaults');
+  const canEdit = Boolean(path && modelDefaults);
+  if (actions) actions.hidden = !canEdit;
+  if (saveBtn) saveBtn.disabled = !canEdit;
+  if (clearBtn) clearBtn.disabled = !canEdit || user === 0;
+  if (!total) {
+    note.hidden = true;
+    note.textContent = '';
+    btn.title = '';
+    return;
+  }
+  note.hidden = false;
+  const entries = Object.entries((modelDefaults && modelDefaults.sources) || {})
+    .filter(([, source]) => source !== 'global')
+    .map(([key, source]) => ({
+      label: schemaMap[key] ? paramLabel(schemaMap[key]) : key,
+      source: source === 'user' ? t('params.sourceUser') : t('params.sourceManifest'),
+    }));
+  const shown = entries
+    .slice(0, 6)
+    .map((entry) => `${entry.label}(${entry.source})`)
+    .join(' · ');
+  const more = entries.length > 6 ? ` +${entries.length - 6}` : '';
+  note.textContent = `${t('params.modelDefaultsNote', { manifest, user })} · ${shown}${more}`;
+  btn.title = t('params.modelDefaultsApplyHint', {
+    list: entries.map((entry) => entry.label).join(', '),
+  });
+}
+
+/** 应用模型默认值：只覆盖 manifest/用户显式设置的键，其余保持当前值。 */
+function applyModelDefaults() {
+  if (!modelDefaults) return;
+  const applied = [];
+  for (const [key, source] of Object.entries(modelDefaults.sources || {})) {
+    if (source === 'global') continue;
+    const def = schemaMap[key];
+    if (!def) continue;
+    currentValues[key] = modelDefaults.params[key];
+    applied.push(paramLabel(def));
+  }
+  if (!applied.length) {
+    ctx.showToast(t('params.modelDefaultsNothing'), 'info');
+    return;
+  }
+  refreshAllControls();
+  updateCommandPreview();
+  const sep = locale === 'en-US' ? ', ' : '、';
+  ctx.showToast(t('params.modelDefaultsApplied', { list: applied.join(sep) }), 'success');
+}
+
+/**
+ * 保存“当前参数中与全局默认不同”的键为用户模型默认值。
+ *
+ * 不保存整份默认字典：那会把 schema 的每个默认值都变成用户覆盖，未来
+ * 上游默认值调整会被无声挡住。空差异视为“没有用户覆盖”，走清除接口。
+ */
+async function saveModelDefaults() {
+  const path = String(currentValues.model || '').trim();
+  if (!path || !modelDefaults) return;
+  const button = root && root.querySelector('#btn-save-model-defaults');
+  if (button && button.disabled) return;
+  if (button) {
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+  }
+  const current = collectParams();
+  const params = diffModelDefaults(current, defaults, MANAGED_DEFAULT_KEYS);
+  try {
+    const payload =
+      Object.keys(params).length > 0
+        ? await ctx.Api.saveModelDefaults(path, params)
+        : await ctx.Api.clearModelDefaults(path);
+    modelDefaults = payload;
+    lastDefaultsPath = path;
+    updateModelDefaultsUI();
+    const count = Object.keys(params).length;
+    ctx.showToast(
+      count > 0
+        ? t('params.modelDefaultsSaved', { count })
+        : t('params.modelDefaultsCleared'),
+      'success'
+    );
+  } catch (e) {
+    ctx.showToast(
+      `${t('params.modelDefaultsSaveFailed')}: ${localizeBackendError(e.message)}`,
+      'error'
+    );
+  } finally {
+    if (button && button.isConnected) {
+      button.disabled = false;
+      button.removeAttribute('aria-busy');
+    }
+  }
+}
+
+async function clearModelDefaults() {
+  const path = String(currentValues.model || '').trim();
+  if (!path || !modelDefaults) return;
+  const button = root && root.querySelector('#btn-clear-model-defaults');
+  if (button && button.disabled) return;
+  if (button) {
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+  }
+  try {
+    modelDefaults = await ctx.Api.clearModelDefaults(path);
+    lastDefaultsPath = path;
+    updateModelDefaultsUI();
+    ctx.showToast(t('params.modelDefaultsCleared'), 'success');
+  } catch (e) {
+    ctx.showToast(
+      `${t('params.modelDefaultsSaveFailed')}: ${localizeBackendError(e.message)}`,
+      'error'
+    );
+  } finally {
+    if (button && button.isConnected) {
+      button.disabled = false;
+      button.removeAttribute('aria-busy');
+    }
+    updateModelDefaultsUI();
+  }
 }
 
 /** 一键应用探测出来的推荐值。只动这三项，其余参数保持用户的选择。 */
@@ -814,7 +1060,7 @@ async function loadRecipes() {
     return;
   }
   try {
-    const payload = await ctx.Api.getParamRecipes();
+    const payload = await ctx.Api.getParamRecipes(selectedRuntimeId || undefined);
     recipes = (payload && payload.recipes) || [];
   } catch {
     // 配方是便利功能，拉不到就不显示这一行，绝不挡住调参
@@ -927,9 +1173,11 @@ function applyCtxLimit() {
 
 // 防抖更新命令预览（连续输入时合并请求）
 let _cmdTimer = null;
+const commandPreviewGate = createRequestGate();
+const vramEstimateGate = createRequestGate();
 
 // 编辑器是单实例浮层：closeModal() 会整体移除 DOM，但两个防抖计时器挂在
-// 模块作用域上 —— 不自清的话关窗后仍会触发一次请求（审计 R6）。
+// 模块作用域上 —— 不自清的话关窗后仍会触发一次请求。
 document.addEventListener('modal-closed', () => {
   if (_cardTimer) {
     clearTimeout(_cardTimer);
@@ -949,19 +1197,34 @@ function scheduleCommandPreview() {
 async function updateCommandPreview() {
   // 跳过被禁用的参数（避免输出无效项）
   const params = collectParams();
+  const request = commandPreviewGate.begin();
   try {
-    const r = await ctx.Api.buildCommand(params);
+    const r = await ctx.Api.buildCommand(params, selectedRuntimeId || undefined);
+    if (!commandPreviewGate.isCurrent(request)) return;
     lastCommand = r.command || '';
     lastSuppressed = Array.isArray(r.suppressed) ? r.suppressed : [];
   } catch (e) {
+    if (!commandPreviewGate.isCurrent(request)) return;
     lastSuppressed = [];
     lastCommand = `// ${t('params.cmdBuildFailed')}: ${localizeBackendError(e.message)}`;
   }
+  const failed = lastCommand.startsWith('//');
   const pre = root && root.querySelector('#cmd-preview');
-  if (pre) pre.textContent = lastCommand;
+  if (pre) {
+    pre.textContent = lastCommand;
+    pre.classList.toggle('cmd-error', failed);
+  }
   // 命令条上的一行等宽摘要（CSS 截断，全文点开看）
   const summary = root && root.querySelector('#pe-cmd-summary');
-  if (summary) summary.textContent = lastCommand;
+  if (summary) {
+    summary.textContent = lastCommand;
+    summary.classList.toggle('cmd-error', failed);
+  }
+  const copyBtn = root && root.querySelector('#btn-copy-cmd');
+  if (copyBtn) {
+    copyBtn.disabled = failed;
+    copyBtn.title = failed ? t('params.cmdCopyUnavailable') : '';
+  }
   renderSuppressedHint();
 }
 
@@ -985,7 +1248,7 @@ function renderSuppressedHint() {
     const p = schemaMap[key];
     const name = p ? paramLabel(p) : key;
     const full = p && p.cli ? `${name} ${p.cli}` : name;
-    return `<span class="supp-chip" data-tip="${ctx.escapeHtml(full)}">${ctx.escapeHtml(name)}</span>`;
+    return `<span class="supp-chip" tabindex="0" data-tip="${ctx.escapeHtml(full)}">${ctx.escapeHtml(name)}</span>`;
   });
   box.hidden = false;
   box.innerHTML = `${ctx.escapeHtml(t('params.suppressedHint'))}：${chips.join('')}`;
@@ -1078,7 +1341,9 @@ function openInlineSheet(kind) {
       </div>
     `;
     sheet.querySelector('[data-sheet-cancel]').addEventListener('click', closeInlineSheet);
-    sheet.querySelector('[data-sheet-confirm]').addEventListener('click', () => doLaunch());
+    sheet.querySelector('[data-sheet-confirm]').addEventListener('click', (event) =>
+      doLaunch(event.currentTarget)
+    );
     sheet.querySelector('#launch-name').focus();
   } else if (kind === 'preset') {
     sheet.innerHTML = `
@@ -1144,7 +1409,15 @@ async function doSavePreset() {
   // 只保存启用的参数
   const params = collectParams();
   try {
-    await ctx.Api.createPreset({ name, description: desc, tags, params });
+    // runtime_id 随预设保存：同一组参数在不同构建上的 supported 集可能不同，
+    // 重新载入预设时应恢复当时的运行环境选择。
+    await ctx.Api.createPreset({
+      name,
+      description: desc,
+      tags,
+      params,
+      ...(selectedRuntimeId ? { runtime_id: selectedRuntimeId } : {}),
+    });
     ctx.showToast(t('params.presetSaved'), 'success');
     closeInlineSheet();
     refreshPresetDropdown();
@@ -1153,23 +1426,36 @@ async function doSavePreset() {
   }
 }
 
-async function doLaunch() {
+async function doLaunch(button) {
+  if (button && button.disabled) return;
   const sheet = root && root.querySelector('#pe-sheet');
   if (!sheet) return;
-  const params = collectParams();
-  // 端口等于 schema 默认值时视为“未指定”，交给后端自动分配，
-  // 避免连续启动第二个实例时撞默认端口（与仪表盘启动弹窗的行为一致）
-  if (shouldAutoAssignPort(params, defaults)) params.port = 0;
-  const name = sheet.querySelector('#launch-name').value.trim();
-  const body = { params, name };
-  if (!(await confirmLaunch(ctx, body))) return;
+  if (button) {
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+  }
   try {
-    const inst = await ctx.Api.createInstance(body);
-    ctx.showToast(t('dash.launched', { name: inst.name, port: inst.port }), 'success');
-    closeInlineSheet();
-    ctx.closeModal(); // 启动完成即收起编辑器（与旧行为一致：确认弹窗关闭）
-  } catch (e) {
-    ctx.showToast(`${t('dash.launchFailed')}: ${localizeBackendError(e.message)}`, 'error');
+    const params = collectParams();
+    // 端口等于 schema 默认值时视为“未指定”，交给后端自动分配，
+    // 避免连续启动第二个实例时撞默认端口（与仪表盘启动弹窗的行为一致）
+    if (shouldAutoAssignPort(params, defaults)) params.port = 0;
+    const name = sheet.querySelector('#launch-name').value.trim();
+    const body = { params, name };
+    if (selectedRuntimeId) body.runtime_id = selectedRuntimeId;
+    if (!(await confirmLaunch(ctx, body))) return;
+    try {
+      const inst = await ctx.Api.createInstance(body);
+      ctx.showToast(t('dash.launched', { name: inst.name, port: inst.port }), 'success');
+      closeInlineSheet();
+      ctx.closeModal(); // 启动完成即收起编辑器（与旧行为一致：确认弹窗关闭）
+    } catch (e) {
+      ctx.showToast(`${t('dash.launchFailed')}: ${localizeBackendError(e.message)}`, 'error');
+    }
+  } finally {
+    if (button && button.isConnected) {
+      button.disabled = false;
+      button.removeAttribute('aria-busy');
+    }
   }
 }
 
@@ -1181,6 +1467,16 @@ async function doLaunch() {
  * 且随浮层销毁自动解绑 —— 取代原 onShow/onHide 的全局绑定与解绑。
  */
 function onModalKeydown(event) {
+  // ESC 分层：先收起内联 sheet，再让全局 ESC 关闭编辑器。
+  if (event.key === 'Escape') {
+    const sheet = root && root.querySelector('#pe-sheet');
+    if (sheet && !sheet.hidden) {
+      event.preventDefault();
+      event.stopPropagation();
+      closeInlineSheet();
+    }
+    return;
+  }
   if (!(event.ctrlKey || event.metaKey) || event.key !== 'Enter') return;
   event.preventDefault();
   openInlineSheet('launch');

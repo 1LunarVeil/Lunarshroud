@@ -1,8 +1,143 @@
 # Current status
 
-Last reviewed: 2026-10-20 (Asia/Shanghai)  
+Last reviewed: 2026-10-27 (Asia/Shanghai)  
 Current candidate: `0.9.0-beta.2`  
 Release posture: Windows beta; do **not** describe as 1.0 or stable.
+
+## 2026-10-25/27 audit remediation, multi-backend support and real-device inference
+
+```text
+backend    python -m pytest backend/tests -q      763 passed, 1 skipped
+frontend   node --test frontend/tests/*.test.mjs  57 passed
+browser    npm run test:browser (core-paths)      3 passed
+lint       python -m ruff check backend tools      clean
+mirror     tools/check_release_mirror.py           CLEAN, 225 files
+rust       cargo test                              not run on VS 2026 (ring/cc)
+build      PyInstaller onedir                      rebuilt 2026-10-27 23:33
+portable   release/LunarShroud-0.9.0-beta.2-portable-x64.zip  rebuilt 2026-10-27
+```
+
+### Multi-backend support (CPU / Vulkan / OpenVINO / ROCm)
+
+Verified against four real llama.cpp b11929 Windows packages (kept in
+`study/`): they share an identical `--version` and an identical GPU flag
+surface, so the launcher identifies the backend from sibling accelerator
+DLLs and enumerates devices via `--list-devices`. On the audit machine
+(AMD CPU + AMD Radeon iGPU + NVIDIA discrete GPU): CPU→(none), Vulkan→
+{AMD iGPU, NVIDIA dGPU}, OpenVINO→{CPU, GPU.0 NVIDIA, GPU.1 AMD iGPU},
+ROCm→(none). Real-inference matrix through the launcher API with a
+4B Q4_K_M GGUF:
+
+- Vulkan NVIDIA (`--device Vulkan1`) → running, correct answer.
+- Vulkan AMD iGPU (`--device Vulkan0`) → running, correct answer.
+- OpenVINO CPU (`OPENVINO0`, translated to `GGML_OPENVINO_DEVICE=CPU`) →
+  running, correct answer.
+- OpenVINO GPU.0 (`OPENVINO1`) → the upstream OpenVINO GPU plugin crashes
+  (0xC0000409) right after model init; the launcher-side diagnosis is
+  accurate, and the workaround is documented in-app (CPU device, or the
+  Vulkan/CUDA build).
+- ROCm with no supported AMD GPU → service runs on CPU at ~6.8 tok/s; the
+  launcher now warns on the instance card instead of staying silent.
+- Invalid OpenVINO device name → 400 with a readable, localized error.
+
+### Security/quality fixes in this window
+
+- Cross-origin CORS exposure fixed: knowledge citations and the
+  knowledge-miss notice now reach the packaged (`tauri.localhost`) UI;
+  previously both headers were filtered by the browser because the expose
+  list carried only `X-LunarShroud-Dropped-Turns`. Pinned by a
+  real-middleware test plus a static reconciliation test over every header
+  the frontend reads.
+- OpenVINO builds do not accept `--device`; the launcher translates the
+  chosen device into `GGML_OPENVINO_DEVICE` and refuses unknown names (400).
+- Settings ↔ runtime-registry default now sync in both directions.
+- Knowledge-service idle reaper no longer races a concurrent acquire.
+
+### Repository hygiene (2026-10-27)
+
+Internal audit/remediation reports moved from the repository root to
+`archive/audit-2026/` (mirror-excluded by directory rule); stale caches
+(`.coverage`, `.pytest_cache`, `.ruff_cache`, `webview2-data/`, root logs)
+and a 2.6 GB leftover test fixture were removed; `dsh-session-*` moved to
+`archive/sessions/`. The portable zip was rebuilt from the freshly deployed
+root pair.
+
+Not verified: ROCm acceleration on a supported AMD discrete GPU, real NPU
+inference (no NPU on this machine), NSIS install/uninstall round, multi-hour
+soak.
+
+## 2026-10-23/24 click-through, false-green audit, retrieval measurement and visual pass
+
+```text
+backend    python -m pytest backend/tests -q      731 passed, 1 skipped
+frontend   node --test frontend/tests/*.test.mjs  57 passed
+browser    node --test frontend/tests/browser/core-paths.test.mjs   3 passed
+browser    deep-paths + adversarial (local, env-driven)            22 passed
+lint       python -m ruff check backend tools      clean
+tokens     backend/tests/test_design_tokens.py     clean
+mirror     tools/check_release_mirror.py           CLEAN, 220 files
+retrieval  377-chunk legal KB / 21 labelled + 10 unanswerable questions
+           dense 33% hit@1 MRR 0.440 · hybrid 47% 0.610 · +doc cap 47% 0.612
+           shipped (hybrid + cap + rerank) 76% hit@1 · 95% hit@3 · MRR 0.841
+build      PyInstaller onedir                      rebuilt 2026-10-24
+tauri      cargo tauri build --ci                  building 2026-10-24
+nsis       bundle/nsis/LunarShroud_0.9.0-beta.2_x64-setup.exe  built, not installed
+rust       cargo test                              not run on VS 2026 (ring/cc)
+```
+
+### Deployed pair (2026-10-24 00:26, launch- and render-verified)
+
+`tools/Publish-PortableRuntime.ps1 -Destination .` replaced the repository-root
+pair that the desktop shortcut launches. Deployed hashes match the build outputs
+byte for byte:
+
+```text
+LunarShroud.exe            3326a90c54b1a18e…  == src-tauri/target/release/lunarshroud.exe
+backend/backend.exe        a6e3934fdee6ddb6…  == backend/dist/backend/backend.exe
+installer                  src-tauri/target/release/bundle/nsis/LunarShroud_0.9.0-beta.2_x64-setup.exe
+```
+
+The packaged window was captured with `PrintWindow(PW_RENDERFULLCONTENT)` and
+shows this round's UI: the 26px page title, the first-run "下一步 / 当前状态"
+panel with its three working actions, the labelled theme/about buttons and the
+sidebar status block. Earlier on 2026-10-23 (hashes `f0253d3d…` / `5fe68d59…`)
+the same check confirmed the consolidated five-destination navigation had
+finally reached the shipped binary. After closing the app no `llama-server.exe`
+survived and GPU memory returned to 0 MiB.
+
+Not verified: NSIS install/uninstall, tray/`close_to_tray`, and a chat round-trip
+with a running model inside the packaged app.
+
+Everything above was verified against the **source tree and a dev backend**
+first, and then against the rebuilt repository-root pair (the launch check
+described above). Retrieval numbers come from `tools/eval_knowledge_retrieval.py`
+run against the real index.
+
+Defects this round found by clicking rather than by calling APIs — each fixed and
+verified red→green, see `AGENTS.md` §2.27–§2.30:
+
+- Hybrid retrieval was dense-only: the FTS arm quoted the whole question, so it
+  matched nothing on natural language, and the existing test happened to use an
+  exact 3-character phrase that passed either way.
+- A child module's `.page-actions` is hoisted into the shared tab toolbars, which
+  removes it from that module's subtree: the 卡片/列表 toggle never received its
+  own clicks, its pressed state never resynced, and list view had never been
+  implemented at all (selecting it hid the model grid).
+- Card 快速启动 was swallowed by the card's own `[data-open-model]` delegate.
+- Index cancellation had a backend, an API client method and tests, but no control.
+- Chat overflowed an 800px viewport because its edge bleed hardcoded the wide
+  layout's paddings.
+- A user-named missing source path was skipped silently while the UI reported
+  success; the add-paths dialog closed on failure and lost the user's text.
+- Node test dependencies placed inside `frontend/` (Tauri's `frontendDist`) broke
+  `cargo tauri build`; the JS package moved to the repository root and
+  `test_web_root_hygiene.py` now pins the allowlist.
+
+
+The source tree now includes the quota/data-safety and frontend reliability
+remediation recorded in the internal remediation report. Rust, Tauri/NSIS, real
+model/GPU soak and code signing remain release blockers; do not treat this
+working-tree check as a 1.0 candidate.
 
 ## Working tree has moved past the frozen candidates
 
@@ -21,12 +156,315 @@ frontend   node --test frontend/tests/*.mjs          21 passed
 syntax     node --check (17 files)                   clean
 lint       python -m ruff check backend tools        clean
 mirror     tools/check_release_mirror.py             CLEAN, 155 files
-rust       cargo fmt/clippy/test                     clean, 22 passed
+rust       cargo fmt/clippy/test                     clean, 23 passed
 build      PyInstaller onedir, pinned env            backend.exe A1BAACAA…
 nsis       install/launch/uninstall                   pass; Add/Remove entry
                                                       blocked by sandbox,
                                                       normal-desktop check pending
 ```
+
+Current working-tree checks after the UI/A11y pass, read-only registries (B1),
+runtime/defaults wiring (B2), draft/offline work (B3), guardrails (B4), M1
+polish and the maintainability split + model grouping (2026-10-21):
+
+```text
+backend    python -m pytest backend/tests -q          615 passed
+coverage   --cov=backend --cov-fail-under=75          85.67% (gate 75)
+frontend   node --test runtime + i18n + chat          38 passed
+syntax     node --check (all frontend js/mjs)          clean
+lint       python -m ruff check backend tools          clean
+a11y       Lighthouse snapshot                       100 accessibility on
+                                                      dashboard, models,
+                                                      runtimes, param editor
+                                                      (light + dark)
+browser    isolated 17641 audit                       runtime switch, model
+                                                      defaults provenance,
+                                                      preset runtime restore,
+                                                      history runtime column,
+                                                      panel drawer at 800px,
+                                                      settings dirty guard,
+                                                      model grouping;
+                                                      no unexpected console errors
+mirror     tools/check_release_mirror.py              CLEAN, 188 files
+```
+
+**B2 is wired into launching.** The parameter editor and dashboard can choose a
+registered runtime; schema, capabilities, recipes, command preview, preflight
+and `POST /api/instances` all carry `runtime_id`. Presets can pin a runtime;
+instances and history persist `runtime_id`/`runtime_label` (old SQLite databases
+migrate in place). `core/config_resolver.py` implements global < manifest < user
+defaults with per-key source tags; the UI shows provenance and applies defaults
+only on an explicit button. The launch transport is unchanged: local
+`llama-server.exe` + argv + loopback REST/WebSocket.
+
+**B3 and the offline contract are also in place (2026-10-21).** Draft-model
+compatibility reads only local GGUF metadata: total vocabulary size plus the
+first 256 token strings, cached by path/mtime/size; a definite mismatch blocks
+in preflight, an unreadable signature is an informational `unknown`, never a
+false `match`. Model manifests declaring `min_llama_cpp_build` are checked
+against the selected runtime's version line. `backend/tests/test_offline_contract.py`
+pins the absence of remote frontend assets/imports, the loopback + Tauri-IPC Tauri CSP,
+and the fact that only user-clicked documentation links leave the machine; see
+`docs/OFFLINE.md`. There is no update checker or telemetry.
+
+**B4 is complete.** The parameter editor can save the current differences as
+user model defaults and clear them again; it never stores the whole default
+dictionary and filters managed keys in the UI as well as the backend. Manifest
+`customFields` with boolean/string defaults and `setJinjaVariable` effects are
+merged into `chat_template_kwargs` as manifest defaults. `launch_guardrail`
+(`off` / `warn` / `strict`) controls warning friction; errors always block.
+Instances and history persist `model_key` (manifest key or `local:<path>`) and
+`variant_key` (filename stem); old databases migrate in place. New builds that
+support `--load-mode` get `--load-mode mmap` instead of the deprecated
+`--mmap` for the default memory-map intent.
+
+**M1 polish is complete.** Static analysis removed 23 unused CSS classes and
+reduced raw px in `style.css` from 529 to 241; padding/margin/gap/font-size/
+border-radius now use `tokens.css` exclusively, pinned by
+`test_design_tokens.py`. Settings now asks before discarding unsaved changes
+(X/Esc/backdrop), Logs auto-selects a running instance, shows a live
+“shown / total” line count and removes the empty state when the first line
+arrives, and Chat shows the runtime label plus an `aria-busy` loading state.
+At 900px and below the secondary context panel becomes a focus-managed left
+drawer instead of disappearing, so model/preset/log instance lists remain
+reachable; it auto-closes on selection, ESC/backdrop, and leaves no inert state
+behind when the window widens.
+
+The shell was also split for maintainability: `modal.mjs` owns the dialog
+stack/focus trap/confirm dialogs, `html.mjs` owns escaping, and
+`param_editor_view.mjs` owns pure parameter/group HTML rendering. The model
+library now asks the scan for manifests; when a manifest declares `model:`, a
+“group by model” toggle groups files under that logical key, with unkeyed files
+kept as “no manifest”. No behavior changes for directories without manifests.
+Lighthouse on the parameter editor in light and dark remained 100 for
+Accessibility, Best Practices, SEO and Agentic Browsing.
+
+### Real runtime validation (2026-10-21, local machine)
+
+The sandbox now has real CUDA 13.3 binaries and models, so the previously open
+success path was exercised:
+
+- Runtimes registered and probed successfully: official llama.cpp `b11698`
+  (`D:\AI-tools\llama.cpp\build\bin`), prism `b10709`, prism `b10777`.
+  All report `status=ok`; options 415 / 408 / 409 respectively.
+- Official `build\bin` has a neutral path but ships `ggml-cuda.dll`; backend
+  inference now falls back to sibling backend DLLs, so it reports CUDA instead
+  of unknown.
+- Real Qwen3.5-4B Q4_K_M launched on both prism b10777 and official b11698
+  (RTX 5060 Laptop 8 GB), reached `running`, served `/health` and
+  `/v1/models`, and completed `/v1/chat/completions` (about 92 tok/s on the
+  prism build for a short prompt).
+- Chat page loaded the real llama-server WebUI in the iframe; the Logs page
+  received the real WebSocket stream. Logs now auto-selects the first running
+  instance instead of showing “no instance”.
+- Real draft check: Qwen3.5-4B + gemma MTP draft ⇒ `draft_vocab_mismatch`
+  (gpt2 vs gemma4); Gemma-4-E4B + `mtp-gemma-4-E4B-it.gguf` ⇒ match, and a
+  real Gemma+MTP launch reached `running` with the draft model loaded.
+- Offline/proxy robustness: with `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`
+  pointed at a dead local port, runtime probing and a real model launch still
+  succeeded (backend health uses `trust_env=False`; probe/launch are local).
+- Purely upstream observation: the llama-server WebUI requests `/tools` and
+  receives 403 when tools are disabled; it does not affect launcher operation.
+- Final B4 real run: the official build launched with `--load-mode mmap` and no
+  deprecated `--mmap` warning; `model_key` / `variant_key` appeared in the
+  instance and history API, and the history detail showed them.
+- CORS hardening: the launcher now sends `--cors-origins localhost` by default.
+  A real request with `Origin: http://evil.example` received no
+  `Access-Control-Allow-Origin`; a `localhost` Origin was reflected. The Chat
+  iframe (same origin) still loaded. `cors_origins` is a managed key for model
+  defaults, so a manifest/user default cannot weaken it.
+
+### Native chat and product chrome (2026-10-21)
+
+The Chat page is no longer only an iframe around llama-server's WebUI. Its
+default mode is a native streaming chat backed by:
+
+- `core/chat_store.py` — local SQLite `chats.db` (bounded conversations,
+  messages, params and stats; no network).
+- `/api/chats*` CRUD and `POST /api/instances/{id}/chat/completions`, a
+  loopback SSE proxy that keeps API keys server-side and avoids webview CORS.
+- `markdown.mjs` (escaped, dependency-free rendering), `chat_stream.mjs`
+  (cross-chunk SSE parsing), conversation sidebar, stop/regenerate, system
+  prompt/temperature/max tokens, editable chat names, token/speed stats,
+  reasoning disclosure, code copy, Markdown export and a WebUI fallback.
+
+**Chat advanced (2026-10-21).** Editing a user turn truncates every later
+message and regenerates the reply; an auto-generated conversation title follows
+the edited first message, while a manually renamed title is left alone. Any
+saved message can fork a new conversation up to that point, copying params,
+model binding and stats without touching the source thread. The composer shows
+a context meter from the latest `total_tokens` (or prompt/generated counters)
+against the instance's `ctx_size`, turning amber near the limit. A prompt
+library offers six built-in prompts plus locally saved prompts and insertion at
+the composer caret; saved prompts can be edited in place or deleted; prompts
+live in `chats.db`, so in-app backups and `Backup-UserData.ps1` carry them. Real Qwen3.5-4B b11698 run in Chromium against
+an isolated backend: 2.1K/4.1K context meter after a 2103-token reply,
+edit → truncate → regenerated reply
+(1941 tokens), branch conversation created with one copied turn, prompt saved,
+inserted and deleted; no console errors.
+
+**Local text attachments (2026-10-21).** The native composer accepts text files
+through the paperclip, a browser file picker or drag/drop; the webview reads
+them with the File API and nothing is uploaded. An allow-list covers source,
+Markdown, JSON/YAML/CSV/log and similar text extensions; NUL-containing binary
+files and oversized files are rejected. Bounds are 200,000 characters per file,
+five files and 500,000 characters per message, 2,000,000 characters per
+conversation (recomputed server-side). Attachments live in `chats.db`
+`attachments` and are rendered as chips with a bounded preview/copy dialog;
+`buildMessagePayloadContent` wraps their full text in explicit file delimiters
+for llama-server, while the visible message stays clean. Attachment-only turns
+are allowed and use the file name for the automatic title; branches copy
+attachments, Markdown export includes their content, and both backup paths carry
+them inside `chats.db`. Real Qwen3.5-4B run: a local `secret-notes.md` containing
+`LUNARSHROUD_ATTACHMENT_CODE: 7391` produced `7391` (286 tokens), a dropped
+attachment-only `drop-test.txt` was included in the next turn, preview/copy,
+branch copy, reload persistence and an unsupported-`.png` warning all passed;
+console stayed clean.
+
+**Conversation search (2026-10-21).** The Chat sidebar now searches conversation
+titles, message text, attachment names and attachment content through
+`GET /api/chats/search`. Queries are bounded to 200 characters and 30/100
+results, use parameterized SQLite `LIKE` with `%`/`_` escaped, and return a
+short snippet plus match type (`title`/`message`/`attachment`) without sending
+whole attachments. The UI debounces input, preserves focus/caret across list
+refreshes, highlights matches in titles/snippets, supports Enter to open the
+first result and ArrowUp/Down navigation, and clears with Escape/×. Ctrl+F
+focuses and selects the conversation search box while Chat is in native mode. Verified in
+Chromium against the isolated backend: `7391` found two attachment hits with
+name/meta/snippet highlighting, `GGUF` found message hits, no-match and clear
+states worked, and the active conversation loaded from a result; console clean.
+
+**Packaged regression (2026-10-21, no installer).** The current source was
+rebuilt as a PyInstaller onedir backend plus an optimized Tauri binary
+(`tauri build --ci --no-bundle`), then launched as a standard-user process with
+isolated `APPDATA/LOCALAPPDATA/TEMP/USERPROFILE` and a synthetic `chats.db`.
+Windows UI Automation against the real WebView2 verified: Chat route, search for
+`7391` returning three attachment hits with names/snippets, prompt-library edit
+persisting (`Packaged prompt`), attachment preview content, conversation branch,
+message edit with attachment retained, and clean window-close/backend cleanup.
+The optimized release binary repeated Chat/search and prompt-library checks
+against the same isolated data. Backend logs stayed clean.
+
+The release binary then launched real official llama.cpp b11698 + Qwen3.5-4B
+Q4_K_M through the launch modal/preset. A real streamed chat answered
+`打包态流式成功` (`218 tokens · 84.6 tok/s · 3.0s`, context meter
+`237 / 4.1K`), and the packaged attachment picker attached a local
+`packaged-attachment.txt`; the next answer was `8642` (`352 tokens · 84.6 tok/s
+· 4.6s`, context `409 / 4.1K`). Stopping the instance left no `llama-server`
+process, closing the window left no launcher/backend process or listener, and
+the isolated `chats.db` retained the user message, attachment row and assistant
+reply. Evidence: `tmp/packaged-check-20261021-chat/packaged-real-chat.png`,
+`packaged-real-attachment.png`.
+
+WebView2 155 no longer exposes its CDP endpoint here even with
+`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=...` (an upstream
+153+ regression), so packaged interaction used UI Automation rather than CDP;
+the source Chromium run remains the console-error check. The release candidate
+pair is `src-tauri/target/release/lunarshroud.exe` `5C8BA375…` (4,165,120 B) and
+`backend/backend.exe` `28136B22…` (9,950,217 B) with 718 product files. It is not
+deployed: the repo-root portable pair remains `0E778DD0…` / `A1BAACAA…`, and no
+installer or signing work was performed.
+
+Ctrl+K now opens a command palette for pages, new chat, model picker, parameter
+editor, settings, theme and (in Tauri) an explicit quit. Instance cards on the
+dashboard have a direct Chat action. Model grouping also falls back to the
+containing folder when no manifest exists but that folder has multiple models;
+manifest keys still take priority. `Backup-UserData.ps1` now includes `chats.db`
+and its WAL/SHM files.
+
+**Model manifest editor (2026-10-21).** Model detail → 模型清单 → 编辑清单 opens a
+raw YAML/JSON editor with templates, live validation/preview, save and delete.
+The backend only writes beside an existing `.gguf`; it validates with the same
+parser used by scanning, refuses to create a second format beside an existing
+manifest, writes atomically, and copies the old file to
+`DATA_DIR/manifest-backups/` before overwrite/delete. The UI shows parsed model
+key/warnings before saving; GGUF probe data remains authoritative. Verified in
+real WebView2: template validation, save (`demo-org/editor-test`), automatic
+backup on overwrite, delete with backup, and the card/grouping refresh.
+
+**In-app backups and delayed restore (2026-10-21).** Settings → 数据备份 lists,
+creates, verifies, deletes and restores local backups. Backups contain
+`config.json`, SQLite snapshots of `history.db`/`chats.db` (sqlite3 backup API,
+including saved prompts), and `presets/`; model files are never copied. A restore is checksum-verified,
+staged in `restore-pending.json`, and applied on the next backend start before
+history/chat databases are opened — never under a live process. A pre-restore
+backup is written first; stale WAL/SHM sidecars are removed; presets are
+replaced rather than merged. The API rejects restore while instances are
+running, validates manifest paths against traversal, and the UI offers
+“quit now to apply”. End-to-end: created a backup, changed the theme and added a
+preset, staged restore, quit/relaunched, and verified the old theme/preset were
+restored and the new preset removed.
+
+**Desktop lifecycle (2026-10-21).** The Tauri shell now owns a tray icon with
+Show/Quit. `close_to_tray` (Settings → General, default **off**) makes the close
+button hide the window while the backend and llama-server instances keep
+running; the tray Quit menu or Ctrl+K → “退出 LunarShroud” performs a full
+shutdown. The setting is read from the same `config.json` as the backend and
+can be toggled at runtime through the `set_close_to_tray` Tauri command. The
+second-instance path uses EnumWindows (not FindWindowW) to restore a hidden
+window. Close-to-tray disabled, close-to-tray enabled, runtime toggle, hidden
+window restore and explicit quit were all verified in a real WebView2 session;
+backend Job cleanup left no orphan processes.
+
+### Real WebView2 validation (2026-10-21)
+
+The current debug Tauri binary was run against the real WebView2 runtime with
+an isolated data directory and a CDP audit over the Tauri boundary. Baseline
+DPR was 1.545 at 1243x797 (1657x1036 screen); every route rendered without
+horizontal overflow. At 800px/DPR2 the context panel became a working drawer
+(288x852, backdrop, ESC restores focus to the toggle); at 1280px/DPR2 it
+returned to a permanent panel. Settings exposed `role=dialog`, `aria-modal`, a
+labelledby target and initial focus inside the dialog.
+
+Two real defects were found and fixed:
+
+- **CSP blocked Tauri IPC on every invoke.** `get_backend_session` was reported
+  as a CSP violation and Tauri silently fell back to `postMessage`, logging an
+  error each time. `connect-src` now includes Tauri's local
+  `ipc:`/`http://ipc.localhost` bridge; the offline-contract allowlist was
+  tightened to those exact entries.
+- **Settings falsely reported unsaved changes on open.** The dirty check
+  compared backend `config` with rendered values; the theme radio reflects the
+  frontend preference (`system`) while the backend default is `dark`. Settings
+  now records a per-group `baseline` after first render, so only actual edits
+  are dirty. After the fix the modal closes directly and the console has zero
+  warnings/errors.
+
+End-to-end through the UI: official b11698 + real Qwen3.5-4B Q4_K_M launched
+from the dashboard, served the real WebUI in Chat, streamed real logs over the
+WebSocket, and after stopping, history showed
+`local:...Qwen3.5-4B-Q4_K_M.gguf · Qwen3.5-4B-Q4_K_M`. The repo-root portable
+pair predates these fixes and was not overwritten.
+
+Native chat was exercised in the same real WebView2 + official b11698 session:
+a streamed answer completed with `2716 tokens · 85.6 tok/s · 32.2s`, stop saved
+a partial `已中断 · 3.5s` message, regenerate replaced it, reload restored the
+conversation from `chats.db`, a fenced Python block rendered with a copy
+control, chat settings persisted the system prompt, WebUI switched back and
+forth, export produced the `已导出对话` action, and Ctrl+K navigated to Logs by
+filter. Directory-only grouping produced `目录 · Qwen3.5-4B-GGUF` for two
+hardlinked models without a manifest. Screenshots:
+`tmp/feature-completion-20261021/native-chat*.png`.
+
+### Fresh packaged-pair validation (2026-10-21)
+
+A release binary built from the current source was run with a freshly built
+PyInstaller onedir, isolated `%APPDATA%`/`%LOCALAPPDATA%`/`%TEMP%` and a fresh
+WebView2 profile. The same audit passed: every route, DPR 1.545, 800px/DPR2
+drawer with ESC focus restore, 1280px/DPR2 desktop, Settings dialog semantics,
+and **zero console warnings/errors**. A real Qwen3.5-4B launch through the
+packaged UI reached `running`, Chat loaded the real WebUI, logs streamed, and
+history recorded the launch.
+
+That fresh environment exposed a packaged-only defect: `backend.spec` excluded
+PyYAML even though `model_manifest._load_yaml` imports it lazily and it is a
+locked runtime dependency. In the frozen backend every `model.yaml` silently
+became "not found", so manifest grouping and the manifest card were dead —
+source-mode tests could not see it. The spec now collects `yaml` submodules and
+no longer excludes PyYAML; a new `test_packaging_contracts.py` pins it. After
+rebuilding the onedir, a real `model.yaml` beside hardlinked Qwen files produced
+the group `demo-org/qwen-demo`, the detail manifest card, and history identity
+`demo-org/qwen-demo · qwen-a`. The repo-root pair was still not overwritten.
 
 ## Post-takeover hardening (2026-10-18, deployed)
 
@@ -48,7 +486,7 @@ tested red-green and rebuilt into the deployed pair:
   `taskkill.exe`/`nvidia-smi.exe` from the real system directory
   (`GetSystemDirectoryW` in Rust) and disable the helper when it cannot be
   resolved; `which_on_path` skips relative `PATH` entries. Tests:
-  `test_system_tools_are_disabled_without_systemroot`,
+  `test_system_tools_are_disabled_when_the_system_dir_is_unavailable`,
   `test_which_on_path_ignores_relative_path_entries`,
   `system_tools_are_resolved_inside_system32`, and the missing-tool Rust test.
 - **Capability probes cannot execute CWD files.** `probe_server` resolves
@@ -817,9 +1255,11 @@ tests (76.67% coverage) and an actual launcher start/close check with no
 residual process or listener.
 
 Later on 2026-08-23, backend-crash resilience was added end to end: the Tauri
-shell supervises the sidecar and restarts it with the same session token
-(reclaiming the crashed generation's llama-server children via its Job
-Object); the frontend refreshes the session and retries once on 401/network
+shell supervises the sidecar and restarts it (reclaiming the crashed
+generation's llama-server children via its Job Object). This historical entry
+used the same token; the current supervisor rotates session ID and token each
+generation, and the frontend reacquires it after the readiness HMAC check. The
+frontend refreshes the session and retries once on 401/network
 failure, reconnects both WebSockets with exponential backoff, de-duplicates
 replayed log history, and shows an explicit "backend disconnected" header
 state; instance lifecycle transitions are now written to the backend file log,

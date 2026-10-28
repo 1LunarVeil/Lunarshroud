@@ -1,0 +1,87 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { mkdir } from 'node:fs/promises';
+import { BASE_URL, launchPage, runAxe, SCREENSHOT_DIR } from './helpers.mjs';
+
+async function gotoPage(page, label) {
+  await page.click(`.sidebar-item[data-page="${label}"]`);
+  await page.waitForFunction((id) => document.body.dataset.activePage === id, label, { timeout: 5000 })
+    .catch(async () => {
+      // app.js does not expose the active page as a data attribute; fall back to
+      // the sidebar's aria-current marker.
+      await page.waitForSelector(`.sidebar-item[data-page="${label}"][aria-current="page"]`, { timeout: 5000 });
+    });
+}
+
+test('core navigation, knowledge modal and chat controls stay error-free', async () => {
+  await mkdir(SCREENSHOT_DIR, { recursive: true });
+  const { browser, page, consoleErrors } = await launchPage();
+  try {
+    await page.goto(BASE_URL, { waitUntil: 'networkidle' });
+    await page.waitForSelector('.sidebar-item');
+    const sidebar = await page.locator('.sidebar-item').allTextContents();
+    assert.equal(sidebar.filter(Boolean).length, 8, `unexpected navigation: ${sidebar.join(',')}`);
+
+    await gotoPage(page, 'workspace');
+    await page.click('[data-workspace-tab="runtimes"]');
+    await page.waitForSelector('#observability-tab-logs, [data-workspace-tab="presets"]');
+    await page.click('[data-workspace-tab="models"]');
+    await page.waitForSelector('.segmented-btn.active');
+    assert.equal((await page.locator('.segmented-btn.active').textContent()).trim(), '卡片');
+
+    await gotoPage(page, 'knowledge');
+    await page.click('#kb-new');
+    await page.waitForSelector('#kb-new-name');
+    await page.click('.modal-footer .btn-secondary');
+    await page.waitForSelector('.modal-overlay', { state: 'detached' });
+
+    await gotoPage(page, 'chat');
+    await page.waitForSelector('#chat-instance-select');
+    await page.waitForSelector('#chat-kb-select');
+
+    await gotoPage(page, 'observability');
+    await page.waitForSelector('[data-observability-tab="monitor"]');
+
+    await gotoPage(page, 'dashboard');
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/dashboard.png`, fullPage: true });
+    assert.deepEqual(consoleErrors, [], `console errors: ${consoleErrors.join('\n')}`);
+  } finally {
+    await browser.close();
+  }
+});
+
+test('dashboard and knowledge pages meet the accessibility gate', async () => {
+  const { browser, page } = await launchPage();
+  try {
+    for (const route of ['dashboard', 'knowledge']) {
+      await page.goto(BASE_URL, { waitUntil: 'networkidle' });
+      await gotoPage(page, route);
+      const results = await runAxe(page);
+      const violations = results.violations.map(
+        (item) => `${item.id}: ${item.nodes.length} node(s)`
+      );
+      assert.deepEqual(violations, [], `${route} accessibility violations: ${violations.join(', ')}`);
+    }
+  } finally {
+    await browser.close();
+  }
+});
+
+test('first render stays under the performance budget', async () => {
+  const { browser, page } = await launchPage();
+  try {
+    await page.goto(BASE_URL, { waitUntil: 'networkidle' });
+    const metrics = await page.evaluate(() => {
+      const paint = performance.getEntriesByType('paint').find((entry) => entry.name === 'first-contentful-paint');
+      const navigation = performance.getEntriesByType('navigation')[0];
+      return {
+        fcp: paint ? paint.startTime : 0,
+        domContentLoaded: navigation ? navigation.domContentLoadedEventEnd : 0,
+      };
+    });
+    assert.ok(metrics.fcp > 0 && metrics.fcp < 3000, `FCP ${metrics.fcp}ms`);
+    assert.ok(metrics.domContentLoaded < 5000, `DOMContentLoaded ${metrics.domContentLoaded}ms`);
+  } finally {
+    await browser.close();
+  }
+});

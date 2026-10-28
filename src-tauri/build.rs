@@ -46,7 +46,23 @@ fn main() {
         staging_dir.join("backend.exe").display()
     );
 
+    let packaged_internal = packaged_dir.join("_internal");
     if packaged_backend.is_file() {
+        // backend.exe and _internal/ are one runtime. Checking only the exe
+        // allowed a release build to ship a sidecar that exits immediately with
+        // a missing-Python error.
+        if profile == "release" {
+            let has_internal_files = packaged_internal.is_dir()
+                && std::fs::read_dir(&packaged_internal)
+                    .map(|mut entries| entries.next().is_some())
+                    .unwrap_or(false);
+            if !has_internal_files {
+                panic!(
+                    "release build requires a non-empty {} (run PyInstaller backend.spec first)",
+                    packaged_internal.display()
+                );
+            }
+        }
         // tauri.conf.json 将 backend/backend.exe 与 backend/_internal/** 作为
         // bundle resource，先刷新 staging 副本，确保 NSIS 读取的文件与本次
         // PyInstaller 产物一致。

@@ -17,7 +17,9 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::{Manager, WebviewWindowBuilder};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::TrayIconBuilder;
+use tauri::{AppHandle, Manager, WebviewWindowBuilder};
 
 // Windows 平台：阻止子进程弹出控制台窗口
 #[cfg(windows)]
@@ -76,18 +78,40 @@ fn acquire_single_instance() -> SingleInstance {
 /// 二次启动时把已有窗口拉到前台；找不到窗口才弹提示。
 #[cfg(windows)]
 fn focus_existing_window() -> bool {
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+        EnumWindows, GetWindowTextW, SetForegroundWindow, ShowWindow, SW_RESTORE,
     };
-    let title: Vec<u16> = "LunarShroud\0".encode_utf16().collect();
-    let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
-    if hwnd.is_null() {
+
+    // FindWindowW proved unreliable in this environment even for a visible
+    // Tauri window (returns 0 while EnumWindows sees it). Enumerate top-level
+    // windows and match the stable product title instead.
+    unsafe extern "system" fn find_main(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let mut buffer = [0u16; 128];
+        let length = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+        if length > 0 {
+            let title = String::from_utf16_lossy(&buffer[..length as usize]);
+            if title == "LunarShroud" {
+                *(lparam as *mut HWND) = hwnd;
+                return 0; // stop enumeration
+            }
+        }
+        1
+    }
+
+    let mut found: HWND = std::ptr::null_mut();
+    unsafe {
+        EnumWindows(Some(find_main), &mut found as *mut HWND as LPARAM);
+    }
+    if found.is_null() {
+        append_launcher_log("second instance: existing main window not found");
         return false;
     }
     unsafe {
-        ShowWindow(hwnd, SW_RESTORE);
-        SetForegroundWindow(hwnd);
+        ShowWindow(found, SW_RESTORE);
+        SetForegroundWindow(found);
     }
+    append_launcher_log("second instance: existing main window restored");
     true
 }
 
@@ -197,6 +221,28 @@ struct SupervisorShared {
 
 /// 后端监管器：跟踪当前存活的 backend 子进程，窗口关闭时终止它。
 /// Job Object 句柄的唯一所有者是这里的共享状态，避免双重 CloseHandle。
+/// Desktop lifecycle state shared by the tray menu and the close handler.
+///
+/// `close_to_tray` is opt-in through the backend config / Settings page: an
+/// existing user who closes the window still exits exactly as before unless
+/// they enable it. `tray_ready` is false when Tauri could not create the tray,
+/// so a close request falls back to the normal shutdown path.
+struct TrayState {
+    close_to_tray: AtomicBool,
+    tray_ready: AtomicBool,
+    quitting: AtomicBool,
+}
+
+impl TrayState {
+    fn new(close_to_tray: bool) -> Self {
+        Self {
+            close_to_tray: AtomicBool::new(close_to_tray),
+            tray_ready: AtomicBool::new(false),
+            quitting: AtomicBool::new(false),
+        }
+    }
+}
+
 struct BackendSupervisor {
     port: u16,
     /// `None` = 当前没有**已通过就绪验证**的后端。`get_backend_session` 只在
@@ -408,6 +454,7 @@ pub fn run() {
     // 与后端读取同一份持久化配置，保证用户修改 launcher_port 后，
     // Tauri 仍能在重启时探测到正确的 sidecar 端口。
     let port = configured_backend_port();
+    let close_to_tray = configured_close_to_tray();
     // 后端以"外壳探测的同一端口"启动：backend/config.py 让该 env 优先于
     // config.json（仅内存生效、不落盘）。子进程继承本进程环境，监督器的
     // 重启代次同样生效 —— 外壳探测端口与后端监听端口永远来自同一个决策点，
@@ -497,8 +544,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(supervisor.clone())
+        .manage(TrayState::new(close_to_tray))
         .invoke_handler(tauri::generate_handler![
             get_backend_session,
+            set_close_to_tray,
+            quit_app,
             open_file_dialog,
             open_directory_dialog
         ])
@@ -614,10 +664,45 @@ pub fn run() {
             }
             apply_taskbar_icon(&main_window);
 
+            match create_tray(app) {
+                Some(tray) => {
+                    app.manage(tray);
+                    if let Some(state) = app.try_state::<TrayState>() {
+                        state.tray_ready.store(true, Ordering::Relaxed);
+                    }
+                }
+                None => {
+                    append_launcher_log(
+                        "warning: tray unavailable; close-to-tray disabled for this run",
+                    );
+                }
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let state = window.app_handle().try_state::<TrayState>();
+                let (tray_ready, close_to_tray, quitting) = state
+                    .as_ref()
+                    .map(|state| {
+                        (
+                            state.tray_ready.load(Ordering::Relaxed),
+                            state.close_to_tray.load(Ordering::Relaxed),
+                            state.quitting.load(Ordering::Relaxed),
+                        )
+                    })
+                    .unwrap_or((false, false, false));
+                append_launcher_log(&format!(
+                    "close requested: tray_ready={tray_ready} close_to_tray={close_to_tray} quitting={quitting}"
+                ));
+                let hide_to_tray = tray_ready && close_to_tray && !quitting;
+                if hide_to_tray {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    append_launcher_log("main window hidden to tray");
+                    return;
+                }
                 if let Some(supervisor) = window.app_handle().try_state::<Arc<BackendSupervisor>>()
                 {
                     supervisor.request_shutdown();
@@ -915,6 +1000,47 @@ fn parse_backend_port(contents: &str) -> Option<u16> {
     let value: serde_json::Value = serde_json::from_str(contents).ok()?;
     let port = value.get("launcher_port")?.as_u64()?;
     (1..=65535).contains(&port).then_some(port as u16)
+}
+
+/// Read the opt-in "close window hides to tray" preference.
+///
+/// Missing or malformed values deliberately mean false: upgrading users keep
+/// the historical close-exits behavior.
+fn parse_close_to_tray(contents: &str) -> Option<bool> {
+    let contents = contents.trim_start_matches('\u{feff}');
+    let value: serde_json::Value = serde_json::from_str(contents).ok()?;
+    value.get("close_to_tray")?.as_bool()
+}
+
+fn read_close_to_tray_from(dir: &Path) -> Option<bool> {
+    std::fs::read_to_string(dir.join("config.json"))
+        .ok()
+        .and_then(|contents| parse_close_to_tray(&contents))
+}
+
+/// Same candidate order as `configured_backend_port`, so a user who edits the
+/// fallback data directory gets the same value as the backend.
+fn configured_close_to_tray() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            let mut current = exe.parent().map(Path::to_path_buf);
+            while let Some(dir) = current {
+                if dir.join("backend").join("main.py").is_file() {
+                    return read_close_to_tray_from(&dir.join("data")).unwrap_or(false);
+                }
+                current = dir.parent().map(Path::to_path_buf);
+            }
+        }
+    }
+    for dir in data_dir_candidates() {
+        if dir_is_writable(&dir) {
+            if let Some(value) = read_close_to_tray_from(&dir) {
+                return value;
+            }
+        }
+    }
+    false
 }
 
 /// 能否在目录中创建/写入探针文件（与 backend/config.py 的选择口径一致）。
@@ -1486,7 +1612,7 @@ fn append_launcher_log_at(path: &Path, timestamp_secs: u64, message: &str) -> st
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // 简单轮转（审计 R7）：超过上限就把现文件挪成 .1（覆盖上一份）再开新文件。
+    // 简单轮转：超过上限就把现文件挪成 .1（覆盖上一份）再开新文件。
     // 启动器日志一天最多几十行，单备份足够；不为此引入日志库。
     if std::fs::metadata(path)
         .map(|meta| meta.len() >= LAUNCHER_LOG_MAX_BYTES)
@@ -1501,8 +1627,46 @@ fn append_launcher_log_at(path: &Path, timestamp_secs: u64, message: &str) -> st
     writeln!(file, "[{timestamp_secs}] {message}")
 }
 
+/// 测试进程专用的启动器日志路径：放在测试二进制旁边（Cargo 刚写过它，保证可写），
+/// 不依赖 %APPDATA% 也不依赖继承的 %TEMP%。整个测试进程共用一份，由 `OnceLock`
+/// 保证只算一次；测试之间并行写同一份日志不影响任何断言（没人断言它的内容）。
+#[cfg(test)]
+fn test_launcher_log_path() -> PathBuf {
+    static ONCE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let base = std::env::current_exe()
+            .expect("test executable path")
+            .parent()
+            .expect("test executable parent")
+            .to_path_buf();
+        base.join(format!(
+            "lunarshroud-test-launcher-log-{}",
+            std::process::id()
+        ))
+        .join("launcher.log")
+    })
+    .clone()
+}
+
 fn append_launcher_log(message: &str) {
     let timestamp = now_secs();
+    #[cfg(test)]
+    {
+        // 测试绝不能写真实 %APPDATA%。`request_shutdown()` 会记关闭证据，
+        // 而候选路径的首选就是 ``%APPDATA%\LunarShroud\logs\launcher.log``：
+        // 一是污染用户目录，二是在受限令牌/沙箱下那个位置常常不可写，
+        // 于是 `cargo test` 在不同机器上结果不一致（AGENTS §6.5）。
+        // 生产路径（下面的候选链）不受影响。
+        let path = test_launcher_log_path();
+        if let Err(error) = append_launcher_log_at(&path, timestamp, message) {
+            eprintln!(
+                "warning: test launcher log {} is not writable: {error}",
+                path.display()
+            );
+        }
+        return;
+    }
+    #[cfg(not(test))]
     for path in launcher_log_candidates() {
         if append_launcher_log_at(&path, timestamp, message).is_ok() {
             return;
@@ -1529,6 +1693,94 @@ fn write_boot_log(exe_dir: &Path) {
         std::env::var_os("USERNAME"),
     );
     let _ = append_launcher_log_at(&exe_dir.join("launcher-boot.log"), now_secs(), &message);
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn quit_from_tray(app: &AppHandle) {
+    if let Some(state) = app.try_state::<TrayState>() {
+        state.quitting.store(true, Ordering::Relaxed);
+    }
+    if let Some(supervisor) = app.try_state::<Arc<BackendSupervisor>>() {
+        supervisor.request_shutdown();
+    }
+    app.exit(0);
+}
+
+/// Build the tray menu. A missing icon or menu must not prevent the app from
+/// starting; the caller marks `tray_ready=false` and close falls back to the
+/// normal shutdown path.
+fn create_tray(app: &mut tauri::App) -> Option<tauri::tray::TrayIcon> {
+    let Some(icon) = app.default_window_icon().cloned() else {
+        append_launcher_log("warning: tray icon missing; tray unavailable");
+        return None;
+    };
+    let show = match MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>) {
+        Ok(item) => item,
+        Err(error) => {
+            append_launcher_log(&format!("warning: tray show menu failed: {error}"));
+            return None;
+        }
+    };
+    let quit = match MenuItem::with_id(app, "quit", "退出 LunarShroud", true, None::<&str>) {
+        Ok(item) => item,
+        Err(error) => {
+            append_launcher_log(&format!("warning: tray quit menu failed: {error}"));
+            return None;
+        }
+    };
+    let menu = match Menu::with_items(app, &[&show, &quit]) {
+        Ok(menu) => menu,
+        Err(error) => {
+            append_launcher_log(&format!("warning: tray menu build failed: {error}"));
+            return None;
+        }
+    };
+    match TrayIconBuilder::with_id("lunarshroud-tray")
+        .icon(icon)
+        .tooltip("LunarShroud")
+        .menu(&menu)
+        .show_menu_on_left_click(true)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_main_window(app),
+            "quit" => quit_from_tray(app),
+            _ => {}
+        })
+        .build(app)
+    {
+        Ok(tray) => {
+            append_launcher_log("tray created");
+            Some(tray)
+        }
+        Err(error) => {
+            append_launcher_log(&format!("warning: tray creation failed: {error}"));
+            None
+        }
+    }
+}
+
+/// Tauri command: enable/disable hide-on-close immediately (the next launch
+/// reads the persisted backend config). Returns the effective value.
+#[tauri::command]
+fn set_close_to_tray(state: tauri::State<TrayState>, enabled: bool) -> bool {
+    if !state.tray_ready.load(Ordering::Relaxed) {
+        return false;
+    }
+    state.close_to_tray.store(enabled, Ordering::Relaxed);
+    enabled
+}
+
+/// Tauri command: explicit quit, also used by the command palette. Needed
+/// because with close-to-tray enabled the window close button only hides.
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    quit_from_tray(&app);
 }
 
 #[tauri::command]
@@ -1586,8 +1838,9 @@ mod tests {
     use super::{
         append_launcher_log_at, backend_readiness_is_authentic, backend_runtime_temp,
         dir_is_writable, external_url_is_allowed, next_generation_failures, parse_backend_port,
-        random_session_secret, readiness_proof, ready_probe_url, supervision_backoff, system_tool,
-        wait_for_process_exit, webview2_data_dir, BackendSupervisor, LAUNCHER_LOG_MAX_BYTES,
+        parse_close_to_tray, random_session_secret, readiness_proof, ready_probe_url,
+        supervision_backoff, system_tool, wait_for_process_exit, webview2_data_dir,
+        BackendSupervisor, LAUNCHER_LOG_MAX_BYTES,
     };
     use std::path::Path;
     use std::time::Duration;
@@ -1652,6 +1905,22 @@ mod tests {
             parse_backend_port("\u{feff}{\"launcher_port\":17620}"),
             Some(17620)
         );
+    }
+
+    #[test]
+    fn close_to_tray_is_opt_in_and_rejects_bad_values() {
+        assert_eq!(parse_close_to_tray(r#"{"close_to_tray":true}"#), Some(true));
+        assert_eq!(
+            parse_close_to_tray(r#"{"close_to_tray":false}"#),
+            Some(false)
+        );
+        assert_eq!(
+            parse_close_to_tray("\u{feff}{\"close_to_tray\":true}"),
+            Some(true)
+        );
+        assert_eq!(parse_close_to_tray(r#"{"theme":"dark"}"#), None);
+        assert_eq!(parse_close_to_tray(r#"{"close_to_tray":"yes"}"#), None);
+        assert_eq!(parse_close_to_tray("not-json"), None);
     }
 
     #[test]

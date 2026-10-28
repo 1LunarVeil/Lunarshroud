@@ -125,6 +125,8 @@ else:
 # 数据子目录（运行时自动创建）
 PRESETS_DIR = DATA_DIR / "presets"
 HISTORY_DB = DATA_DIR / "history.db"
+CHATS_DB = DATA_DIR / "chats.db"
+KNOWLEDGE_DB = DATA_DIR / "knowledge.db"
 CONFIG_FILE = DATA_DIR / "config.json"
 
 
@@ -160,8 +162,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "history_max_records": 1000,
     # 是否将实例日志持久化到 data/logs/instances/
     "persist_instance_logs": True,
-    # 主题：light / dark
+    # 启动前检查策略：off 只弹错误；warn 弹错误与警告（警告可继续）；
+    # strict 把警告也当阻断项。错误永远阻断，三种策略都不能绕过。
+    "launch_guardrail": "warn",
+    # 主题：light / dark / system
     "theme": "dark",
+    # 关闭窗口时隐藏到托盘（托盘不可用时外壳会忽略）；默认关闭保持旧行为
+    "close_to_tray": False,
+    # 原生 Chat 里"模型思考过程"面板的默认开合：
+    #   auto     流式生成时展开、结束后收起（默认）
+    #   expand   始终展开
+    #   collapse 始终折叠
+    # 用户手动点过某一条之后，那一条以他的选择为准，不再被这个偏好覆盖。
+    "chat_reasoning": "auto",
 }
 
 
@@ -288,9 +301,24 @@ def validate_config(cfg: dict[str, Any], *, repair: bool = False) -> dict[str, A
         "persist_instance_logs must be a boolean",
     )
     check(
+        "launch_guardrail",
+        candidate.get("launch_guardrail") in {"off", "warn", "strict"},
+        "launch_guardrail must be 'off', 'warn' or 'strict'",
+    )
+    check(
         "theme",
-        candidate.get("theme") in {"light", "dark"},
-        "theme must be 'light' or 'dark'",
+        candidate.get("theme") in {"light", "dark", "system"},
+        "theme must be 'light', 'dark' or 'system'",
+    )
+    check(
+        "close_to_tray",
+        isinstance(candidate.get("close_to_tray"), bool),
+        "close_to_tray must be a boolean",
+    )
+    check(
+        "chat_reasoning",
+        candidate.get("chat_reasoning") in {"auto", "expand", "collapse"},
+        "chat_reasoning must be 'auto', 'expand' or 'collapse'",
     )
 
     if errors:
@@ -343,10 +371,59 @@ def _env_port_override() -> int | None:
     return port
 
 
+def _quarantine_unparsable_config(reason: str) -> dict[str, Any]:
+    """把读不懂的 config.json 改名为 .corrupt 保留取证，再用默认值继续启动。
+
+    重建本身写不了盘也不能抛：lifespan 之外，``main`` 在**导入期**就会调
+    ``get_config()``（算 LISTENING_PORT / 可信来源表），异常穿透就是
+    "后端启动失败"，而用户连日志都看不到（AGENTS §2.12 / §2.16）。
+    """
+    backup = CONFIG_FILE.with_name(CONFIG_FILE.name + ".corrupt")
+    try:
+        os.replace(CONFIG_FILE, backup)
+    except OSError:
+        LOGGER.exception(
+            "config.json 无法解析（%s）且隔离失败，使用内存默认配置", reason
+        )
+        return DEFAULT_CONFIG.copy()
+    LOGGER.warning(
+        "config.json 无法解析（%s），已备份为 %s 并重建默认配置", reason, backup.name
+    )
+    try:
+        save_config(DEFAULT_CONFIG)
+    except OSError:
+        LOGGER.exception("默认配置写盘失败；本次仅使用内存默认值")
+    return DEFAULT_CONFIG.copy()
+
+
+def _read_config_text() -> str | None:
+    """解出 config.json 的文本；解不出返回 ``None``（调用方按损坏处理）。
+
+    ``UnicodeDecodeError`` 既不是 ``json.JSONDecodeError`` 也不是 ``OSError``，
+    所以只捕获那两者的旧版本会让它直接穿透到模块导入 —— 记事本用 ANSI(GBK)
+    或 Unicode 保存过含中文路径的配置，就足以让整个后端起不来。
+    UTF-16 只在**带 BOM**时才尝试：无 BOM 时任意偶数字节的 GBK 内容也能"解成功"，
+    得到一串乱码，那比明确失败更糟。
+    """
+    raw = CONFIG_FILE.read_bytes()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            return raw.decode("utf-16")
+        except UnicodeDecodeError:
+            return None
+    try:
+        # utf-8-sig：记事本/Set-Content -Encoding utf8 会写 BOM，带 BOM 的配置
+        # 曾是"整个文件被当损坏、静默重建默认值"的根因。
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return None
+
+
 def _load_config_from_file() -> dict[str, Any]:
     """加载 config.json，不存在则用默认值创建（不含环境变量覆盖逻辑）。"""
+    global _config_load_failed
     ensure_dirs()
-    # 启动时清扫中断遗留的 .tmp 写入件（审计 R5）：放在这里而不是 lifespan，
+    # 启动时清扫中断遗留的 .tmp 写入件：放在这里而不是 lifespan，
     # 因为所有入口（后端进程、工具脚本）都必经这一次配置加载。
     cleanup_orphan_tmp_files(DATA_DIR)
     cleanup_orphan_tmp_files(PRESETS_DIR)
@@ -354,10 +431,24 @@ def _load_config_from_file() -> dict[str, Any]:
         save_config(DEFAULT_CONFIG)
         return DEFAULT_CONFIG.copy()
     try:
-        # utf-8-sig：记事本/Set-Content -Encoding utf8 会写 BOM，带 BOM 的配置
-        # 曾是"整个文件被当损坏、静默重建默认值"的根因（独立审计 L2）。
-        with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
-            cfg = json.load(f)
+        text = _read_config_text()
+    except OSError as exc:
+        # 读不了不等于损坏：可能是 AV/共享锁、ACL 或路径被替换成目录。
+        # 绝不能在后续保存时用默认值覆盖真实配置 —— 标记后 update_config 拒绝落盘。
+        _config_load_failed = True
+        LOGGER.warning(
+            "无法读取配置文件 %s（%s）；本次使用默认值，且不会覆盖原文件",
+            CONFIG_FILE,
+            exc,
+        )
+        return DEFAULT_CONFIG.copy()
+    if text is None:
+        return _quarantine_unparsable_config("不是 UTF-8/UTF-16 编码")
+    try:
+        cfg = json.loads(text)
+    except json.JSONDecodeError:
+        return _quarantine_unparsable_config("JSON 语法错误")
+    try:
         # 合并默认值（新增的默认键也能生效），只保留已知键，
         # 避免历史遗留的未知键被继续持久化；并修复旧配置中的坏值
         merged = DEFAULT_CONFIG.copy()
@@ -367,33 +458,18 @@ def _load_config_from_file() -> dict[str, Any]:
         if repaired != cfg:
             save_config(repaired)
         return repaired
-    except json.JSONDecodeError:
-        # 配置损坏：备份原文件后用默认值重建，
-        # 否则每次启动都会静默回退默认值，用户的自定义配置无从恢复
-        backup = CONFIG_FILE.with_name(CONFIG_FILE.name + ".corrupt")
-        try:
-            os.replace(CONFIG_FILE, backup)
-        except OSError:
-            LOGGER.exception(
-                "config.json 解析失败且备份失败，使用内存默认配置", exc_info=True
-            )
-            return DEFAULT_CONFIG.copy()
-        LOGGER.warning(
-            "config.json 解析失败，已备份为 %s 并重建默认配置", backup.name
-        )
-        save_config(DEFAULT_CONFIG)
-        return DEFAULT_CONFIG.copy()
     except OSError as exc:
-        # 读不了不等于损坏：可能是 AV/共享锁、ACL 或路径被替换成目录。
-        # 绝不能在后续保存时用默认值覆盖真实配置 —— 标记后 update_config 拒绝落盘。
-        global _config_load_failed
+        # 回写修复结果失败同样不等于损坏：不能覆盖原文件，但**必须使用已修复的
+        # 值**。旧实现返回 merged（未经 validate_config 的原始字典），于是只读
+        # 配置里的 startup_timeout="not-a-number" 会进入监控线程、非法
+        # launcher_host 会进入 uvicorn 的 bind。修复结果只在磁盘上缺失，内存里
+        # 没有任何理由继续使用已知非法的值。
         _config_load_failed = True
         LOGGER.warning(
-            "无法读取配置文件 %s（%s）；本次使用默认值，且不会覆盖原文件",
-            CONFIG_FILE,
+            "配置文件回写失败（%s）；本次使用已修复的内存配置，且不会覆盖原文件",
             exc,
         )
-        return DEFAULT_CONFIG.copy()
+        return repaired
 
 
 def save_config(cfg: dict[str, Any]) -> None:
@@ -410,7 +486,7 @@ _config: dict[str, Any] | None = None
 _config_load_failed = False
 
 # update_config 的"读-改-写-重绑"必须整体串行：并发 PUT 各自基于旧快照
-# 计算 candidate，后落盘者会把先落盘者的键覆盖回去（R4 静默丢更新）。
+# 计算 candidate，后落盘者会把先落盘者的键覆盖回去，静默丢更新。
 _update_lock = threading.Lock()
 
 
@@ -420,6 +496,19 @@ def get_config() -> dict[str, Any]:
     if _config is None:
         _config = load_config()
     return _config
+
+
+def reload_config() -> dict[str, Any]:
+    """Re-read config.json after an out-of-band restore.
+
+    A restore that changed config.json must not leave the previous in-memory
+    singleton (port/theme/close_to_tray) active until the next restart.
+    """
+    global _config, _config_load_failed
+    with _update_lock:
+        _config_load_failed = False
+        _config = _load_config_from_file()
+        return _config
 
 
 def update_config(updates: dict[str, Any]) -> dict[str, Any]:
@@ -435,7 +524,7 @@ def update_config(updates: dict[str, Any]) -> dict[str, Any]:
         )
     global _config
     # 读-改-写-重绑整体持锁：否则并发 PUT 各自基于旧快照算 candidate，
-    # 后落盘者会把先落盘者的键覆盖回去 —— 静默丢更新（审计 R4）。
+    # 后落盘者会把先落盘者的键覆盖回去 —— 静默丢更新。
     with _update_lock:
         candidate = dict(get_config())
         candidate.update(updates)

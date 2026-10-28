@@ -9,6 +9,7 @@
 // 列表若去付详情的代价，一个几百模型的目录会卡几十秒。
 
 import { t, localizeBackendError } from './i18n.mjs';
+import { groupModelsByKey, instanceNameFromFilename } from './runtime.mjs';
 import { confirmLaunch } from './preflight.mjs';
 import { renderList, emptyStateHtml } from './panel_views.mjs';
 
@@ -29,11 +30,42 @@ const detailCache = new Map();
 // mmproj / 推测解码头**不是能加载的模型**，与可加载模型并列会误导，
 // 而且它们的标签会把 252px 的面板挤成三行。默认收起，可切换显示。
 const SHOW_ALL_KEY = 'lunarshroud_models_show_all';
+const GROUP_MODELS_KEY = 'lunarshroud_models_group_by_model';
 let showAll = readShowAll();
+let groupByModel = readGroupByModel();
+let viewMode = readViewMode();
+let recentPaths = new Set();
+let viewButtons = [];
 
 function readShowAll() {
   try {
     return localStorage.getItem(SHOW_ALL_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+const VIEW_KEY = 'lunarshroud_models_view';
+
+function readViewMode() {
+  try {
+    return localStorage.getItem(VIEW_KEY) === 'list' ? 'list' : 'cards';
+  } catch {
+    return 'cards';
+  }
+}
+
+function writeViewMode(value) {
+  try {
+    localStorage.setItem(VIEW_KEY, value);
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+function readGroupByModel() {
+  try {
+    return localStorage.getItem(GROUP_MODELS_KEY) === '1';
   } catch {
     return false;
   }
@@ -47,6 +79,73 @@ function writeShowAll(value) {
   }
 }
 
+function writeGroupByModel(value) {
+  try {
+    localStorage.setItem(GROUP_MODELS_KEY, value ? '1' : '0');
+  } catch {
+    // 忽略持久化失败
+  }
+}
+
+function manifestKey(model) {
+  const manifest = model && model.manifest;
+  return manifest && manifest.found && manifest.model_key ? String(manifest.model_key) : '';
+}
+
+const DIR_GROUP_PREFIX = 'dir:';
+
+function relativeDirectory(modelPath) {
+  const normalized = String(modelPath || '').replace(/\\/g, '/');
+  const scanRoot = String(directory || '').replace(/\\/g, '/').replace(/\/+$/, '');
+  let relative = normalized;
+  if (scanRoot && normalized.toLowerCase().startsWith(`${scanRoot.toLowerCase()}/`)) {
+    relative = normalized.slice(scanRoot.length + 1);
+  }
+  const parts = relative.split('/');
+  parts.pop();
+  return parts.join('/') || '.';
+}
+
+/**
+ * Real model folders often contain several quants (or an unkeyed mmproj)
+ * without a model.yaml. Group those by their folder so the toggle still has
+ * value; a flat directory of one-file models stays flat.
+ */
+function groupKeyFactory(list) {
+  const dirCounts = new Map();
+  for (const model of list) {
+    if (manifestKey(model)) continue;
+    const dir = relativeDirectory(model.path);
+    dirCounts.set(dir, (dirCounts.get(dir) || 0) + 1);
+  }
+  return (model) => {
+    const key = manifestKey(model);
+    if (key) return key;
+    const dir = relativeDirectory(model.path);
+    return (dirCounts.get(dir) || 0) > 1 ? `${DIR_GROUP_PREFIX}${dir}` : '';
+  };
+}
+
+function hasGroupableModels(list) {
+  if (list.some((model) => manifestKey(model))) return true;
+  const dirCounts = new Map();
+  for (const model of list) {
+    if (manifestKey(model)) continue;
+    const dir = relativeDirectory(model.path);
+    dirCounts.set(dir, (dirCounts.get(dir) || 0) + 1);
+    if ((dirCounts.get(dir) || 0) > 1) return true;
+  }
+  return false;
+}
+
+function groupLabel(key) {
+  if (!key) return t('models.groupUngrouped');
+  if (key.startsWith(DIR_GROUP_PREFIX)) {
+    return t('models.groupDirectory', { name: key.slice(DIR_GROUP_PREFIX.length) });
+  }
+  return key;
+}
+
 function isLoadable(model) {
   const caps = model.capabilities || {};
   return !(caps.is_mmproj || caps.is_assistant_model);
@@ -58,16 +157,48 @@ export function init(el, appCtx) {
   root.innerHTML = `
     <div class="page-header">
       <div>
-        <div class="page-title">${ctx.escapeHtml(t('models.title'))}</div>
+        <h1 class="page-title">${ctx.escapeHtml(t('models.title'))}</h1>
         <div class="page-subtitle" id="models-subtitle">${ctx.escapeHtml(t('models.subtitle'))}</div>
       </div>
       <div class="page-actions">
+        <div class="segmented-control" role="group" aria-label="${ctx.escapeHtml(t('models.viewLabel'))}">
+          <button type="button" class="segmented-btn" data-model-view="cards" aria-pressed="true">${ctx.escapeHtml(t('models.viewCards'))}</button>
+          <button type="button" class="segmented-btn" data-model-view="list" aria-pressed="false">${ctx.escapeHtml(t('models.viewList'))}</button>
+        </div>
         <button class="btn btn-secondary" id="btn-models-rescan">${ctx.escapeHtml(t('models.rescan'))}</button>
       </div>
     </div>
+    <div id="model-cards" class="model-card-grid"></div>
     <div id="model-detail"></div>
   `;
   root.querySelector('#btn-models-rescan').addEventListener('click', () => refresh());
+  // workspace.js 会把 .page-actions 整块搬进共享工具栏，节点因此脱离本模块的
+  // root 子树：委托在 root 上永远收不到点击，也不再用 root 去查它们。
+  viewButtons = [...root.querySelectorAll('[data-model-view]')];
+  const viewGroup = root.querySelector('.segmented-control');
+  viewGroup.addEventListener('click', (event) => {
+    const view = event.target.closest('[data-model-view]');
+    if (!view) return;
+    viewMode = view.dataset.modelView;
+    writeViewMode(viewMode);
+    renderCards();
+  });
+  root.addEventListener('click', (event) => {
+    // 快速启动 的按钮嵌在带 data-open-model 的卡片里：先匹配卡片就会把它吞掉，
+    // 所以更具体的动作必须排在前面。
+    const quick = event.target.closest('[data-quick-launch]');
+    if (quick) {
+      quickLaunch(quick.dataset.quickLaunch, quick);
+      return;
+    }
+    const card = event.target.closest('[data-open-model]');
+    if (card) {
+      selectedPath = card.dataset.openModel;
+      ctx.refreshPanel();
+      renderDetail();
+    }
+  });
+  syncViewControls();
 }
 
 export function onShow() {
@@ -82,10 +213,14 @@ async function refresh() {
   if (loading) return;
   loading = true;
   try {
-    const data = await ctx.Api.scanModels(undefined, true);
+    const [data, recent] = await Promise.all([
+      ctx.Api.scanModels(undefined, true, true),
+      ctx.Api.listHistory(30).catch(() => []),
+    ]);
     models = Array.isArray(data.models) ? data.models : [];
     directory = data.directory || '';
-    truncated = !!data.capabilities_truncated;
+    recentPaths = new Set((Array.isArray(recent) ? recent : []).map((item) => item.model_path).filter(Boolean));
+    truncated = !!(data.capabilities_truncated || data.manifests_truncated);
 
     const subtitle = root.querySelector('#models-subtitle');
     if (subtitle) {
@@ -99,6 +234,8 @@ async function refresh() {
       selectedPath = models.length ? models[0].path : null;
     }
     ctx.refreshPanel();
+    syncViewControls();
+    renderCards();
     await renderDetail();
   } catch (e) {
     ctx.showToast(`${t('models.scanFailed')}: ${localizeBackendError(e.message)}`, 'error');
@@ -111,6 +248,7 @@ async function refresh() {
 
 export function renderPanel(el) {
   const hiddenCount = models.filter((m) => !isLoadable(m)).length;
+  const groupable = hasGroupableModels(showAll ? models : models.filter(isLoadable));
   el.innerHTML = `
     <div class="panel-search">
       <input type="search" id="model-search" class="input" placeholder="${ctx.escapeHtml(
@@ -118,12 +256,24 @@ export function renderPanel(el) {
       )}" value="${ctx.escapeHtml(searchKeyword)}" autocomplete="off"/>
     </div>
     ${
-      hiddenCount
+      hiddenCount || groupable
         ? `<div class="panel-filter">
-             <label class="panel-toggle">
+             ${
+               hiddenCount
+                 ? `<label class="panel-toggle">
                <input type="checkbox" id="model-show-all" ${showAll ? 'checked' : ''}/>
                <span>${ctx.escapeHtml(t('models.showCompanions', { count: hiddenCount }))}</span>
-             </label>
+             </label>`
+                 : ''
+             }
+             ${
+               groupable
+                 ? `<label class="panel-toggle">
+               <input type="checkbox" id="model-group-toggle" ${groupByModel ? 'checked' : ''}/>
+               <span>${ctx.escapeHtml(t('models.groupBy'))}</span>
+             </label>`
+                 : ''
+             }
            </div>`
         : ''
     }
@@ -137,13 +287,145 @@ export function renderPanel(el) {
       renderPanel(el);
     });
   }
+  const groupToggle = el.querySelector('#model-group-toggle');
+  if (groupToggle) {
+    groupToggle.addEventListener('change', (e) => {
+      groupByModel = e.target.checked;
+      writeGroupByModel(groupByModel);
+      renderListInto(el.querySelector('#model-list-body'));
+    });
+  }
   const input = el.querySelector('#model-search');
   // 只重绘列表本身，输入框不动 —— 否则每敲一个字都会丢焦点
   input.addEventListener('input', () => {
     searchKeyword = input.value.trim().toLowerCase();
     renderListInto(el.querySelector('#model-list-body'));
+    renderCards();
   });
   renderListInto(el.querySelector('#model-list-body'));
+}
+
+function visibleModels() {
+  const keyword = searchKeyword;
+  const base = showAll ? models : models.filter(isLoadable);
+  return keyword
+    ? base.filter(
+        (m) =>
+          m.filename.toLowerCase().includes(keyword) ||
+          String((m.capabilities && m.capabilities.architecture) || '').toLowerCase().includes(keyword)
+      )
+    : base;
+}
+
+function syncViewControls() {
+  viewButtons.forEach((button) => {
+    const selected = button.dataset.modelView === viewMode;
+    button.setAttribute('aria-pressed', String(selected));
+    button.classList.toggle('active', selected);
+  });
+}
+
+function renderCards() {
+  syncViewControls();
+  const container = root.querySelector('#model-cards');
+  if (!container) return;
+  const visible = visibleModels();
+  container.hidden = false;
+  if (!visible.length) {
+    container.className = 'model-card-grid';
+    container.innerHTML = emptyStateHtml(ctx, {
+      icon: 'layers',
+      title: t(directory ? 'models.empty' : 'models.noDir'),
+      sub: t(directory ? 'models.emptySub' : 'models.noDirSub'),
+    });
+    return;
+  }
+  if (viewMode !== 'cards') {
+    container.className = 'table-wrap';
+    container.innerHTML = modelTableHtml(visible);
+    return;
+  }
+  container.className = 'model-card-grid';
+  container.innerHTML = visible.map((model) => {
+    const caps = model.capabilities || {};
+    const loadable = isLoadable(model);
+    const meta = [model.quant, model.size_human, caps.architecture].filter(Boolean);
+    if (caps.probed && caps.context_length) meta.push(`${ctx.escapeHtml(t('models.contextLabel'))} ${caps.context_length}`);
+    return `
+      <article class="model-card ${selectedPath === model.path ? 'selected' : ''}" data-open-model="${ctx.escapeHtml(model.path)}" tabindex="0" role="button" aria-label="${ctx.escapeHtml(model.filename)}">
+        <div class="model-card-head">
+          <div class="model-card-title" title="${ctx.escapeHtml(model.path)}">${ctx.escapeHtml(model.filename)}</div>
+          ${recentPaths.has(model.path) ? `<span class="tag">${ctx.escapeHtml(t('models.recent'))}</span>` : ''}
+        </div>
+        <div class="model-card-meta">${meta.map((item) => `<span>${ctx.escapeHtml(String(item))}</span>`).join('')}</div>
+        <div class="model-card-tags">${badgeHtml(caps)}</div>
+        <div class="model-card-actions">
+          <button class="btn btn-sm btn-secondary" data-open-model="${ctx.escapeHtml(model.path)}">${ctx.escapeHtml(t('models.details'))}</button>
+          ${loadable ? `<button class="btn btn-sm btn-primary" data-quick-launch="${ctx.escapeHtml(model.path)}">${ctx.escapeHtml(t('models.quickLaunch'))}</button>` : ''}
+        </div>
+      </article>`;
+  }).join('');
+}
+
+// 列表视图：一个目录里几十个 GGUF 时，卡片要把文件名截断到认不出来，
+// 表格能按列对齐比较量化/大小/上下文，所以保留它而不是删掉开关。
+function modelTableHtml(list) {
+  const rows = list
+    .map((model) => {
+      const caps = model.capabilities || {};
+      const loadable = isLoadable(model);
+      return `<tr${selectedPath === model.path ? ' class="selected"' : ''}>
+        <td class="models-name" title="${ctx.escapeHtml(model.path)}">${ctx.escapeHtml(model.filename)}${
+          recentPaths.has(model.path) ? ` <span class="tag">${ctx.escapeHtml(t('models.recent'))}</span>` : ''
+        }</td>
+        <td>${ctx.escapeHtml(String(model.quant || '-'))}</td>
+        <td>${ctx.escapeHtml(model.size_human || '-')}</td>
+        <td>${ctx.escapeHtml(String(caps.architecture || '-'))}</td>
+        <td>${caps.probed && caps.context_length ? ctx.escapeHtml(String(caps.context_length)) : '-'}</td>
+        <td class="models-actions">
+          <button class="btn btn-sm btn-secondary" data-open-model="${ctx.escapeHtml(model.path)}">${ctx.escapeHtml(t('models.details'))}</button>
+          ${loadable ? `<button class="btn btn-sm btn-primary" data-quick-launch="${ctx.escapeHtml(model.path)}">${ctx.escapeHtml(t('models.quickLaunch'))}</button>` : ''}
+        </td>
+      </tr>`;
+    })
+    .join('');
+  return `<table class="table">
+    <thead><tr>
+      <th scope="col">${ctx.escapeHtml(t('models.colFile'))}</th>
+      <th scope="col">${ctx.escapeHtml(t('models.colQuant'))}</th>
+      <th scope="col">${ctx.escapeHtml(t('models.colSize'))}</th>
+      <th scope="col">${ctx.escapeHtml(t('models.colArch'))}</th>
+      <th scope="col">${ctx.escapeHtml(t('models.colContext'))}</th>
+      <th scope="col">${ctx.escapeHtml(t('models.colActions'))}</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+async function quickLaunch(path, button) {
+  const model = models.find((item) => item.path === path);
+  if (!model || !isLoadable(model)) return;
+  button.disabled = true;
+  const original = button.textContent;
+  button.textContent = t('models.preparing');
+  try {
+    const payload = await ctx.Api.getCapabilities(path);
+    const caps = (payload && payload.model) || model.capabilities || {};
+    if (selectedPath !== path) {
+      selectedPath = path;
+      ctx.refreshPanel();
+      renderCards();
+      await renderDetail();
+    }
+    await launch(model, caps.probed ? caps : null, button);
+  } catch (error) {
+    ctx.showToast(`${t('models.capabilityFailed')}: ${localizeBackendError(error.message)}`, 'error');
+  } finally {
+    if (button.isConnected) {
+      button.disabled = false;
+      button.textContent = original;
+    }
+  }
 }
 
 function renderListInto(container) {
@@ -157,28 +439,43 @@ function renderListInto(container) {
     });
     return;
   }
-  const keyword = searchKeyword;
-  const base = showAll ? models : models.filter(isLoadable);
-  const visible = keyword
-    ? base.filter(
-        (m) =>
-          m.filename.toLowerCase().includes(keyword) ||
-          String((m.capabilities && m.capabilities.architecture) || '').toLowerCase().includes(keyword)
-      )
-    : base;
+  const visible = visibleModels();
+
+  const listItem = (m) => {
+    const caps = m.capabilities || {};
+    return {
+      key: m.path,
+      label: m.filename,
+      // 徽标放在元信息行：标签行被长文件名挤占后，徽标在那里会折行
+      metaHtml: `${badgeHtml(caps)}<span class="panel-list-meta-text">${ctx.escapeHtml(
+        summaryLine(m, caps)
+      )}</span>`,
+    };
+  };
+
+  let items = visible.map(listItem);
+  const keyOf = groupKeyFactory(visible);
+  if (groupByModel && visible.some((model) => keyOf(model))) {
+    const groups = groupModelsByKey(visible, keyOf);
+    // Manifest groups first, then folder groups, unkeyed files last.
+    groups.sort((a, b) => {
+      const aDir = a.key.startsWith(DIR_GROUP_PREFIX);
+      const bDir = b.key.startsWith(DIR_GROUP_PREFIX);
+      if (aDir !== bDir) return aDir ? 1 : -1;
+      if (!a.key !== !b.key) return a.key ? -1 : 1;
+      return groupLabel(a.key).localeCompare(groupLabel(b.key));
+    });
+    items = groups.flatMap((group) =>
+      group.models.map((m) => ({
+        ...listItem(m),
+        group: group.key,
+        groupLabel: groupLabel(group.key),
+      }))
+    );
+  }
 
   renderList(container, ctx, {
-    items: visible.map((m) => {
-      const caps = m.capabilities || {};
-      return {
-        key: m.path,
-        label: m.filename,
-        // 徽标放在元信息行：标签行被长文件名挤占后，徽标在那里会折行
-        metaHtml: `${badgeHtml(caps)}<span class="panel-list-meta-text">${ctx.escapeHtml(
-          summaryLine(m, caps)
-        )}</span>`,
-      };
-    }),
+    items,
     activeKey: selectedPath,
     onSelect: (key) => {
       selectedPath = key;
@@ -235,13 +532,30 @@ async function renderDetail() {
   }
 
   const caps = model.capabilities || {};
-  el.innerHTML = headerCard(model, caps) + `<div id="model-caps-body"><div class="empty-state"><span class="loading"></span> ${ctx.escapeHtml(
-    t('models.loadingCaps')
-  )}</div></div>`;
+  el.innerHTML =
+    headerCard(model, caps) +
+    `<div id="model-caps-body"><div class="empty-state"><span class="loading"></span> ${ctx.escapeHtml(
+      t('models.loadingCaps')
+    )}</div></div>` +
+    `<div id="model-manifest-body"></div>`;
 
   el.querySelector('#btn-copy-model-path').addEventListener('click', () => {
     ctx.copyToClipboard(model.path);
   });
+
+  // 清单是可选叠加信息，不能阻塞能力详情；异步渲染，失败按“未找到”展示。
+  ctx.Api.getModelManifest(model.path)
+    .then((payload) => (payload && payload.manifest) || { found: false })
+    .catch(() => ({ found: false, error: t('models.manifestFailed') }))
+    .then((manifest) => {
+      if (selectedPath !== model.path) return;
+      const slot = el.querySelector('#model-manifest-body');
+      if (!slot) return;
+      slot.innerHTML = manifestCardHtml(manifest);
+      slot
+        .querySelector('[data-edit-manifest]')
+        ?.addEventListener('click', () => openManifestEditor(model));
+    });
 
   // 行为**先绑、数据后取**：header 卡片是同步渲染的，而精确能力要等一次异步
   // 请求（冷启动时后端要跑一次 llama-server --help，约 0.7s）。等请求回来才绑
@@ -260,7 +574,7 @@ async function renderDetail() {
         const payload = await ctx.Api.getCapabilities(model.path);
         precise = (payload && payload.model) || null;
         if (precise) {
-          // 上限防止长会话无界增长（审计 R7）
+          // 上限防止长会话无界增长
           if (detailCache.size >= 64) detailCache.clear();
           detailCache.set(model.path, precise);
         }
@@ -279,7 +593,7 @@ async function renderDetail() {
   const body = el.querySelector('#model-caps-body');
   if (!body) return;
   // probed=false（探测失败）与 null 都走"不可解析"分支：把未探测结果当能力卡
-  // 渲染会显示误导性的空能力（审计 R6）。
+  // 渲染会显示误导性的空能力。
   body.innerHTML = precise && precise.probed ? capabilitiesHtml(precise) : unparsableHtml(caps);
 }
 
@@ -295,12 +609,12 @@ function headerCard(model, caps) {
           )}</button>
         </div>
       </div>
-      <div class="text-mono text-sm" style="word-break:break-all; color: var(--color-text-tertiary);">${ctx.escapeHtml(
+      <div class="text-mono text-sm" break-all text-tertiary>${ctx.escapeHtml(
         model.path
       )}</div>
       ${
         canLaunch
-          ? `<div class="page-actions" style="margin-top:12px;">
+          ? `<div class="page-actions" mt-3>
                <button class="btn btn-secondary" id="btn-use-in-editor">${ctx.escapeHtml(
                  t('models.useInEditor')
                )}</button>
@@ -308,7 +622,7 @@ function headerCard(model, caps) {
                  t('models.launchNow')
                )}</button>
              </div>`
-          : `<div class="form-help" style="margin-top:12px;">${ctx.escapeHtml(
+          : `<div class="form-help" mt-3>${ctx.escapeHtml(
               caps.is_mmproj ? t('models.mmprojNotLaunchable') : t('models.assistantNotLaunchable')
             )}</div>`
       }
@@ -372,6 +686,287 @@ function capabilitiesHtml(caps) {
     ${companionsHtml(caps)}
     ${specModesHtml(caps)}
   `;
+}
+
+function manifestCardHtml(manifest) {
+  const title = t('models.manifestTitle');
+  if (!manifest || !manifest.found) {
+    const detail = manifest && manifest.error ? manifest.error : t('models.manifestNone');
+    return `<div class="card">
+      <div class="card-header">
+        <span class="card-title">${ctx.escapeHtml(title)}</span>
+        <div class="card-actions">
+          <button type="button" class="btn btn-sm btn-secondary" data-edit-manifest>${ctx.escapeHtml(
+            t('models.manifestEdit')
+          )}</button>
+          <span class="tag tag-default">${ctx.escapeHtml(t('models.manifestNoneBadge'))}</span>
+        </div>
+      </div>
+      <div class="form-help">${ctx.escapeHtml(detail)}</div>
+    </div>`;
+  }
+  const meta = manifest.metadata_overrides || {};
+  const requires = manifest.requires || {};
+  const companions = manifest.companions || {};
+  const warnings = Array.isArray(manifest.warnings) ? manifest.warnings : [];
+  const companionRows = Object.entries(companions).flatMap(([kind, files]) =>
+    (Array.isArray(files) ? files : []).map(
+      (file) => `<tr><td class="text-muted">${ctx.escapeHtml(kind)}</td><td class="text-mono">${ctx.escapeHtml(file)}</td></tr>`
+    )
+  );
+  const requireRows = Object.entries(requires)
+    .filter(([, value]) => value !== null && value !== undefined && value !== '')
+    .map(
+      ([key, value]) =>
+        `<tr><td class="text-muted">${ctx.escapeHtml(key)}</td><td class="text-mono">${ctx.escapeHtml(
+          Array.isArray(value) ? value.join(', ') : String(value)
+        )}</td></tr>`
+    );
+  const rows = [
+    [t('models.manifestKey'), manifest.model_key || '-'],
+    [t('models.manifestSource'), manifest.source || '-'],
+    [t('models.arch'), (meta.architectures || []).join(', ') || '-'],
+    [t('models.ctx'), (meta.contextLengths || []).join(', ') || '-'],
+    [t('models.manifestParams'), (meta.paramsStrings || []).join(', ') || '-'],
+    [t('models.manifestVision'), meta.vision === undefined ? '-' : String(meta.vision)],
+    [t('models.manifestToolUse'), meta.trainedForToolUse === undefined ? '-' : String(meta.trainedForToolUse)],
+    [t('models.manifestMinMemory'), meta.minMemoryUsageBytes ? ctx.formatBytes(meta.minMemoryUsageBytes) : '-'],
+  ];
+  return `<div class="card">
+    <div class="card-header">
+      <span class="card-title">${ctx.escapeHtml(title)}</span>
+      <div class="card-actions">
+        <button type="button" class="btn btn-sm btn-secondary" data-edit-manifest>${ctx.escapeHtml(
+          t('models.manifestEdit')
+        )}</button>
+        <span class="tag">${ctx.escapeHtml(manifest.source || 'manifest')}</span>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table class="table"><tbody>
+        ${rows
+          .map(
+            ([label, value]) =>
+              `<tr><td class="text-muted">${ctx.escapeHtml(label)}</td><td class="text-mono">${ctx.escapeHtml(
+                String(value)
+              )}</td></tr>`
+          )
+          .join('')}
+      </tbody></table>
+    </div>
+    ${companionRows.length ? `<div class="mt-2 text-sm"><strong>${ctx.escapeHtml(t('models.manifestCompanions'))}</strong></div><div class="table-wrap mt-2"><table class="table"><tbody>${companionRows.join('')}</tbody></table></div>` : ''}
+    ${requireRows.length ? `<div class="mt-2 text-sm"><strong>${ctx.escapeHtml(t('models.manifestRequires'))}</strong></div><div class="table-wrap mt-2"><table class="table"><tbody>${requireRows.join('')}</tbody></table></div>` : ''}
+    ${warnings.length ? `<div class="param-field-warn mt-2">${warnings.map((w) => ctx.escapeHtml(w)).join('<br/>')}</div>` : ''}
+    <div class="form-help mt-2">${ctx.escapeHtml(t('models.manifestOverlayHint'))}</div>
+  </div>`;
+}
+
+function manifestTemplate(model, format) {
+  const stem = String(model.filename || model.path || 'model')
+    .replace(/\.gguf$/i, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'model';
+  const key = `local/${stem}`;
+  if (format === 'json') {
+    return JSON.stringify({ model: key }, null, 2) + '\n';
+  }
+  return `model: ${key}\n# 可选项：\n# metadataOverrides:\n#   architectures: [qwen35]\n#   contextLengths: [32768]\n# x-lunarshroud:\n#   companions:\n#     draft: draft.gguf\n#   requires:\n#     min_llama_cpp_build: 1\n`;
+}
+
+function askManifest(message, title) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    ctx.showModal(
+      title || t('models.manifestEditor'),
+      `<div class="diag-intro">${ctx.escapeHtml(message)}</div>`,
+      [
+        { label: t('app.cancel'), class: 'btn-secondary', onClick: () => done(false) },
+        { label: t('app.ok'), class: 'btn-primary', onClick: () => done(true) },
+      ],
+      { stack: true, onClose: () => done(false) }
+    );
+  });
+}
+
+function manifestPreviewHtml(validation) {
+  const warnings = Array.isArray(validation?.warnings) ? validation.warnings : [];
+  const manifest = validation?.manifest || {};
+  return `
+    <div class="manifest-preview ${validation?.found ? 'ok' : 'bad'}">
+      <div><strong>${ctx.escapeHtml(t('models.manifestTarget'))}</strong>
+        <span class="text-mono">${ctx.escapeHtml(validation?.name || '')}</span></div>
+      <div><strong>${ctx.escapeHtml(t('models.manifestKey'))}</strong>
+        <span class="text-mono">${ctx.escapeHtml(manifest.model_key || '-')}</span></div>
+      ${
+        warnings.length
+          ? `<div class="manifest-preview-warnings"><strong>${ctx.escapeHtml(
+              t('models.manifestWarnings')
+            )}</strong><ul>${warnings
+              .map((item) => `<li>${ctx.escapeHtml(item)}</li>`)
+              .join('')}</ul></div>`
+          : ''
+      }
+      <div class="form-help">${ctx.escapeHtml(t('models.manifestEditorHint'))}</div>
+    </div>`;
+}
+
+async function openManifestEditor(model) {
+  let raw = { found: false, format: 'yaml', content: '' };
+  try {
+    raw = await ctx.Api.getModelManifestRaw(model.path);
+  } catch (error) {
+    ctx.showToast(`${t('models.manifestReadFailed')}: ${localizeBackendError(error.message)}`, 'error');
+    return;
+  }
+  const format = raw.found && raw.format === 'json' ? 'json' : 'yaml';
+  const content = raw.found ? raw.content : manifestTemplate(model, format);
+  const body = document.createElement('div');
+  body.className = 'manifest-editor';
+  body.innerHTML = `
+    <div class="manifest-editor-toolbar">
+      <label class="manifest-format">
+        <span>${ctx.escapeHtml(t('models.manifestFormat'))}</span>
+        <select id="manifest-format" class="select" ${raw.found ? 'disabled' : ''}>
+          <option value="yaml" ${format === 'yaml' ? 'selected' : ''}>YAML</option>
+          <option value="json" ${format === 'json' ? 'selected' : ''}>JSON</option>
+        </select>
+      </label>
+      <span class="manifest-target text-mono" id="manifest-target">${ctx.escapeHtml(
+        raw.name || (format === 'json' ? 'manifest.json' : 'model.yaml')
+      )}</span>
+      <button type="button" class="btn btn-sm btn-secondary" id="btn-manifest-template">${ctx.escapeHtml(
+        t('models.manifestTemplate')
+      )}</button>
+      <button type="button" class="btn btn-sm btn-secondary" id="btn-manifest-validate">${ctx.escapeHtml(
+        t('models.manifestValidate')
+      )}</button>
+    </div>
+    <textarea id="manifest-text" class="input manifest-text" spellcheck="false">${ctx.escapeHtml(
+      content
+    )}</textarea>
+    <div id="manifest-preview"></div>
+    <div class="form-help">${ctx.escapeHtml(t('models.manifestNote'))}${
+      raw.found ? ` ${ctx.escapeHtml(t('models.manifestExistingFormat'))}` : ''
+    }</div>
+  `;
+
+  const overlay = ctx.showModal(
+    t('models.manifestEditor'),
+    body,
+    [
+      { label: t('app.cancel'), class: 'btn-secondary' },
+      ...(raw.found
+        ? [
+            {
+              label: t('models.manifestDelete'),
+              class: 'btn-danger',
+              keepOpen: true,
+              onClick: async () => {
+                const confirmed = await askManifest(
+                  t('models.manifestDeleteConfirm', { name: raw.name || 'model.yaml' }),
+                  t('models.manifestDelete')
+                );
+                if (!confirmed) return false;
+                try {
+                  await ctx.Api.deleteModelManifest(model.path, raw.format || format);
+                  ctx.showToast(t('models.manifestDeleted'), 'success');
+                  ctx.closeModal();
+                  await refresh();
+                } catch (error) {
+                  ctx.showToast(
+                    `${t('models.manifestSaveFailed')}: ${localizeBackendError(error.message)}`,
+                    'error'
+                  );
+                }
+                return false;
+              },
+            },
+          ]
+        : []),
+      {
+        label: t('app.save'),
+        class: 'btn-primary',
+        size: 'lg',
+        keepOpen: true,
+        onClick: async () => {
+          const text = overlay.querySelector('#manifest-text').value;
+          const fmt = overlay.querySelector('#manifest-format').value;
+          try {
+            const validation = await ctx.Api.validateModelManifest({
+              model: model.path,
+              content: text,
+              format: fmt,
+            });
+            overlay.querySelector('#manifest-preview').innerHTML = manifestPreviewHtml(validation);
+            if (!validation.found) {
+              ctx.showToast(t('models.manifestInvalid'), 'error');
+              return false;
+            }
+            const saved = await ctx.Api.saveModelManifest({
+              model: model.path,
+              content: text,
+              format: fmt,
+              overwrite: Boolean(raw.found),
+            });
+            const warnings = saved.manifest?.warnings || [];
+            ctx.showToast(
+              warnings.length ? t('models.manifestSavedWarnings') : t('models.manifestSaved'),
+              warnings.length ? 'warning' : 'success'
+            );
+            ctx.closeModal();
+            await refresh();
+          } catch (error) {
+            ctx.showToast(
+              `${t('models.manifestSaveFailed')}: ${localizeBackendError(error.message)}`,
+              'error'
+            );
+          }
+          return false;
+        },
+      },
+    ]
+  );
+  overlay.querySelector('.modal').classList.add('manifest-modal');
+
+  const textarea = body.querySelector('#manifest-text');
+  const select = body.querySelector('#manifest-format');
+  const target = body.querySelector('#manifest-target');
+  const preview = body.querySelector('#manifest-preview');
+  const validate = async () => {
+    const button = body.querySelector('#btn-manifest-validate');
+    button.disabled = true;
+    try {
+      const result = await ctx.Api.validateModelManifest({
+        model: model.path,
+        content: textarea.value,
+        format: select.value,
+      });
+      preview.innerHTML = manifestPreviewHtml(result);
+    } catch (error) {
+      preview.innerHTML = `<div class="manifest-preview bad">${ctx.escapeHtml(
+        localizeBackendError(error.message)
+      )}</div>`;
+    } finally {
+      button.disabled = false;
+    }
+  };
+  body.querySelector('#btn-manifest-validate').addEventListener('click', validate);
+  body.querySelector('#btn-manifest-template').addEventListener('click', () => {
+    textarea.value = manifestTemplate(model, select.value);
+    preview.innerHTML = '';
+  });
+  select.addEventListener('change', () => {
+    target.textContent = select.value === 'json' ? 'manifest.json' : 'model.yaml';
+    preview.innerHTML = '';
+  });
+  textarea.focus();
+  await validate();
 }
 
 function companionsHtml(caps) {
@@ -499,7 +1094,7 @@ async function launch(model, caps, button) {
     const body = {
       params: defaults,
       param_overrides: overrides,
-      name: model.filename,
+      name: instanceNameFromFilename(model.filename),
     };
     if (!(await confirmLaunch(ctx, body))) return;
     const instance = await ctx.Api.createInstance(body);

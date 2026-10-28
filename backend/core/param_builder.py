@@ -62,19 +62,50 @@ SECURITY_CONTROLLED_PARAM_KEYS = frozenset({
     "port",       # 实例身份：健康探测 / Chat iframe / 端口预留全读它
     "path",       # --path 让 llama-server 把任意目录当静态文件服务出去
     "log_file",   # --log-file 是任意路径写入
+    # 下面这组是"面板值 ≠ 实际生效值"的身份/默认策略类参数。
+    # 同一个 last-wins 机制：预检、_validate_start、历史记录、显存预估读的都是
+    # params["model"]，而 extra_args 落在命令行末尾 —— 于是校验通过、界面显示 A、
+    # 实际加载 B。cors_origins 更直接：本机构建的 --help 写着
+    # ``--cors-origins ORIGINS (default: *)``，面板把它收紧成 localhost，
+    # 末尾一条 `--cors-origins *` 就原样退回"任意站点可跨源读本地模型 API"。
+    #
+    # 这一组的边界取 ``config_resolver.MANAGED_KEYS``，不是自己另起一套：那份
+    # 清单已经回答了"哪些键不许被模型作用域的默认值重定向"，而 extra_args 是
+    # 同一条防线的最后一个缺口。mmproj / chat_template 刻意**不在**这里 ——
+    # 它们不在 MANAGED_KEYS 里，且 test_extra_args 明确允许高级用户经附加参数
+    # 挂多模态投影；要收紧得先改那份清单，而不是在这里单方面扩大黑名单。
+    "model",
+    "cors_origins",
 })
+
+# schema 只声明**启动器自己写出来**的那种拼写（model → `-m`），而 extra_args 是
+# 自由文本、上游还认长别名。黑名单少了任何一个拼写都等于没拦。
+# 逐条对照本机 llama-server --help 的选项名列（tmp 里的真实样本，不是凭印象）：
+#   -m,   --model FNAME
+#   -mu,  --model-url MODEL_URL
+#   --cors-origins ORIGINS
+# ``--model-url`` 一并拦：它同样让"实际加载的模型"偏离面板里那个已通过存在性
+# 与 GGUF 校验的路径，还顺带把一次远程拉取伪装成本地启动。
+_EXTRA_CLI_ALIASES: dict[str, tuple[str, ...]] = {
+    "model": ("--model", "-mu", "--model-url"),
+}
 
 
 def security_controlled_flags() -> frozenset[str]:
-    """受管控参数的全部 CLI 拼写（正向名 + 反向名），从 schema 派生以免漂移。"""
+    """受管控参数的全部 CLI 拼写（正向名 + 反向名 + 上游别名），从 schema 派生以免漂移。"""
     flags: set[str] = set()
-    for meta in PARAM_DEFINITIONS:
-        if meta.key not in SECURITY_CONTROLLED_PARAM_KEYS:
+    by_key = {meta.key: meta for meta in PARAM_DEFINITIONS}
+    for key in SECURITY_CONTROLLED_PARAM_KEYS:
+        meta = by_key.get(key)
+        aliases = _EXTRA_CLI_ALIASES.get(key, ())
+        if meta is None:
+            flags.update(aliases)
             continue
         if meta.cli:
             flags.add(meta.cli)
             if meta.cli_reverse and meta.cli.startswith("--"):
                 flags.add("--no-" + meta.cli[2:])
+        flags.update(aliases)
     return frozenset(flags)
 
 
@@ -87,7 +118,7 @@ def find_forbidden_extra_args(tokens: list[str]) -> list[str]:
 def effective_host_and_key(params: dict[str, Any], extra_tokens: list[str]) -> tuple[str, str]:
     """按**命令行实际顺序**求出最终生效的 host 与 api_key。
 
-    这是 S2 的真正防线：不看 params 声明了什么，只看 argv 上最后一次赋值是
+    真正的防线在这里：不看 params 声明了什么，只看 argv 上最后一次赋值是
     什么 —— llama-server 自己就是这么解析的。即便将来出现某个我们没列进
     黑名单的别名，只要它写的是 `--host`，这里就会看见。
     """
@@ -216,6 +247,19 @@ class DefaultGate:
         self._support: dict[str, bool] = {}
         # 因"本机构建不支持"而被丢弃的参数（供调用方提示，见 suppressed_params）
         self.dropped: list[str] = []
+
+    def is_openvino(self) -> bool:
+        """这份构建是不是 OpenVINO 后端（决定设备怎么传给后端）。
+
+        判据是同级的 ``ggml-openvino.dll``：OpenVINO 后端不认 ``--device``，
+        设备只经 ``GGML_OPENVINO_DEVICE`` 环境变量传入（实测 b11929）。
+        """
+        try:
+            from pathlib import Path as _Path
+
+            return (_Path(self._path).parent / "ggml-openvino.dll").is_file()
+        except (OSError, TypeError, ValueError):
+            return False
 
     @property
     def probe(self) -> ServerProbe | None:
@@ -371,6 +415,38 @@ def _is_param_active(meta: ParamMeta, params: dict[str, Any]) -> bool:
     return True
 
 
+def _prefer_load_mode(
+    params: dict[str, Any], probe: ServerProbe | None
+) -> tuple[dict[str, Any], frozenset[str]]:
+    """Translate the deprecated --mmap switch on builds that have --load-mode.
+
+    Newer llama.cpp prints ``DEPRECATED: --mmap ... use --load-mode``. When the
+    selected build supports ``--load-mode`` and the user left load_mode=auto,
+    the default (mmap=true, mlock=false) becomes ``--load-mode mmap`` instead.
+    Non-default mmap/mlock combinations are left untouched so this is a narrow
+    compatibility rewrite, not a second interpretation layer.
+
+    Returns the rewritten params plus keys that must be skipped entirely. A
+    key cannot simply be deleted: ``_build_argv`` falls back to ``meta.default``
+    for missing keys, which would re-emit ``--mmap``.
+    """
+    if probe is None or not probe.complete or not probe.supports("--load-mode"):
+        return params, frozenset()
+    if "mmap" not in params and "mlock" not in params:
+        return params, frozenset()
+    mode = str(params.get("load_mode") or "auto")
+    if mode != "auto":
+        # An explicit load_mode wins; legacy switches would contradict it.
+        return params, frozenset({"mmap", "mlock"})
+    mmap = bool(params.get("mmap", True))
+    mlock = bool(params.get("mlock", False))
+    if mmap and not mlock:
+        rewritten = dict(params)
+        rewritten["load_mode"] = "mmap"
+        return rewritten, frozenset({"mmap", "mlock"})
+    return params, frozenset()
+
+
 def build_argv(
     params: dict[str, Any],
     llama_server_path: str,
@@ -387,7 +463,14 @@ def build_argv(
     Returns:
         argv 列表，可直接传给 subprocess.Popen
     """
-    return _build_argv(params, llama_server_path, DefaultGate(llama_server_path, probe))
+    effective_probe = probe if probe is not None else _cached_probe(llama_server_path)
+    params, skip_keys = _prefer_load_mode(params, effective_probe)
+    return _build_argv(
+        params,
+        llama_server_path,
+        DefaultGate(llama_server_path, probe),
+        skip_keys=skip_keys,
+    )
 
 
 def suppressed_params(
@@ -414,6 +497,13 @@ def _emit(argv: list[str], gate: DefaultGate, meta: ParamMeta, *tokens: str) -> 
     ``--mlock`` 与 ``--mmap``），写下去必然 ``invalid argument``。
     丢弃必须留痕，见 :func:`suppressed_params`。
     """
+    # OpenVINO 的 `--device` 由启动器翻译成 GGML_OPENVINO_DEVICE 环境变量
+    # （该后端不认 -dev，实测传了会直接报错退出）。写进 argv 必然启动失败，
+    # 所以这里静默跳过；翻译与校验在 ProcessManager._launch_process 之前完成，
+    # 用户仍然会看到"设备不存在"之类的明确错误。**不记入 dropped**：它不是
+    # "本机构建不支持"，而是"换了一条传递通道"。
+    if meta.key == "device" and gate.is_openvino():
+        return
     if gate.supported(meta):
         argv.extend(tokens)
     else:
@@ -473,11 +563,19 @@ def _ensure_opposite(argv: list[str], gate: DefaultGate, meta: ParamMeta) -> Non
     argv.extend([reverse])
 
 
-def _build_argv(params: dict[str, Any], llama_server_path: str, gate: DefaultGate) -> list[str]:
+def _build_argv(
+    params: dict[str, Any],
+    llama_server_path: str,
+    gate: DefaultGate,
+    *,
+    skip_keys: frozenset[str] = frozenset(),
+) -> list[str]:
     argv: list[str] = [llama_server_path]
 
     # 按 schema 顺序处理每个参数
     for meta in PARAM_DEFINITIONS:
+        if meta.key in skip_keys:
+            continue
         # 原样追加的自由文本参数（如 extra_args）：按声明顺序落在命令行末尾，
         # 因此用户手填的 flag 可以覆盖前面面板写出来的值。
         if meta.append_raw:

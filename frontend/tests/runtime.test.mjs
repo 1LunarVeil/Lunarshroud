@@ -4,11 +4,23 @@ import assert from 'node:assert/strict';
 import {
   boundedAppend,
   createReconnectDelays,
+  createRequestGate,
   createSingleFlight,
+  diffModelDefaults,
+  formatApiErrorPayload,
+  groupModelsByKey,
+  instanceNameFromFilename,
   isLoopbackHost,
   mergeUpstreamOptions,
   normalizeHttpUrl,
+  parseNumericInput,
+  scheduleObjectUrlRevoke,
+  setButtonBusy,
 } from '../js/runtime.mjs';
+import { classifyLogFrame } from '../js/log_stream.mjs';
+import { settleModalAction, shouldCloseAfterAction } from '../js/modal.mjs';
+import { escapeHtml } from '../js/html.mjs';
+import { createParamView, isWideField } from '../js/param_editor_view.mjs';
 
 test('mergeUpstreamOptions keeps schema order and appends new upstream values', () => {
   // 上游新增了 draft-dspark（实测 llama.cpp build 10960）——必须能被选到
@@ -158,7 +170,7 @@ test('inside Tauri, a missing verified session never falls back to a hardcoded p
 test('tauri.localhost never hijacks the backend-URL fallback (F24)', async () => {
   // Tauri webview 的地址也是 http(s)://tauri.localhost，它满足
   // protocol.startsWith('http') 却不是后端 —— 不排除的话默认端口兜底永远
-  // 不可达（审计 F24）。用 stub fetch 观察真实请求 URL，而不是测内部函数。
+  // 不可达。用 stub fetch 观察真实请求 URL，而不是测内部函数。
   const calls = [];
   globalThis.window = {
     location: {
@@ -230,4 +242,206 @@ test('a failed non-idempotent request is not retried automatically', async () =>
     delete globalThis.window;
     delete globalThis.fetch;
   }
+});
+
+test('createParamView escapes values and marks unsupported/wide controls', () => {
+  const view = createParamView({
+    escapeHtml,
+    t: (key) => key,
+    locale: 'en-US',
+    getValues: () => ({ model: 'a"<b', ctx_size: 4096 }),
+  });
+  const text = view.paramHtml({
+    key: 'model',
+    label: '模型文件路径',
+    label_en: 'Model file',
+    type: 'text',
+    supported: true,
+    cli: '-m',
+  });
+  assert.match(text, /Model file/);
+  assert.match(text, /a&quot;&lt;b/);
+  assert.match(text, /param-field-wide/);
+  assert.match(text, /data-key="model"/);
+
+  const broken = view.paramHtml({
+    key: 'broken',
+    label: 'Broken',
+    type: 'text',
+    supported: false,
+  });
+  assert.match(broken, /param-field-unsupported/);
+  assert.match(broken, /disabled/);
+
+  const multiple = view.controlHtml({
+    key: 'spec_type',
+    label: 'Spec',
+    type: 'select',
+    multiple: true,
+    options: ['a', 'b'],
+    option_labels: { a: 'A（desc）' },
+    supported: true,
+  });
+  assert.match(multiple, /option-card/);
+  assert.match(multiple, /data-opt="a"/);
+  assert.match(multiple, /A/);
+});
+
+test('isWideField reserves full rows for path/text/multi controls', () => {
+  assert.equal(isWideField({ type: 'text' }), true);
+  assert.equal(isWideField({ type: 'file' }), true);
+  assert.equal(isWideField({ type: 'select', multiple: true }), true);
+  assert.equal(isWideField({ type: 'number' }), false);
+  assert.equal(isWideField({ type: 'switch' }), false);
+});
+
+test('groupModelsByKey keeps groups in first-seen order and buckets unkeyed files', () => {
+  const models = [
+    { path: 'a', manifest: { model_key: 'org/a' } },
+    { path: 'b', manifest: { model_key: 'org/a' } },
+    { path: 'c', manifest: null },
+    { path: 'd', manifest: { model_key: 'org/d' } },
+  ];
+  const groups = groupModelsByKey(models, (m) => m.manifest && m.manifest.model_key);
+  assert.deepEqual(
+    groups.map((g) => [g.key, g.models.map((m) => m.path)]),
+    [
+      ['org/a', ['a', 'b']],
+      ['', ['c']],
+      ['org/d', ['d']],
+    ]
+  );
+});
+
+test('diffModelDefaults stores only explicit changes and never managed keys', () => {
+  const defaults = { ctx_size: 8192, temperature: 0.8, threads: -1, port: 8080 };
+  const current = { ctx_size: 16384, temperature: 0.8, threads: -1, port: 9000, model: 'x.gguf' };
+
+  const changed = diffModelDefaults(current, defaults, ['port', 'model']);
+
+  assert.deepEqual(changed, { ctx_size: 16384 });
+});
+
+test('parseNumericInput keeps intermediate typing states out of the value model', () => {
+  // 关键回归：参数编辑器不能把 "-" / "0." 这类输入中间态规范化后再写回输入框，
+  // 否则键入 0.75 会变成 750，键入 -1 会变成 1。
+  assert.deepEqual(parseNumericInput('', 'number'), { value: null, valid: true });
+  assert.deepEqual(parseNumericInput('0.75', 'float'), { value: 0.75, valid: true });
+  assert.deepEqual(parseNumericInput('0.', 'float'), { value: 0, valid: true });
+  assert.deepEqual(parseNumericInput('-', 'number'), { value: null, valid: false });
+  assert.deepEqual(parseNumericInput('-1', 'number'), { value: -1, valid: true });
+  assert.deepEqual(parseNumericInput('1e', 'number'), { value: null, valid: false });
+  assert.deepEqual(parseNumericInput(' 8192 ', 'number'), { value: 8192, valid: true });
+});
+
+test('hasUsableServer accepts a registered runtime when the global path is empty', async () => {
+  const { hasUsableServer } = await import('../js/configured_state.mjs');
+  // 全局路径填了 → 已配置，不必再看注册表
+  assert.equal(hasUsableServer({ serverPath: 'D:/llama/llama-server.exe', runtimes: [] }), true);
+  // 全局路径空、但注册过构建 → 也算已配置（这正是 4.1 的坑）
+  assert.equal(
+    hasUsableServer({ serverPath: '', runtimes: [{ executable_path: 'D:/a/llama-server.exe' }] }),
+    true
+  );
+  // 探测失败的 profile 仍然算：探测只回答"支持哪些 flag"，不影响能否启动
+  assert.equal(
+    hasUsableServer({
+      serverPath: '  ',
+      runtimes: [{ executable_path: 'D:/a/x.exe', probe: { probed: false } }],
+    }),
+    true
+  );
+  // 两者都没有 → 才该提示未配置
+  assert.equal(hasUsableServer({ serverPath: '', runtimes: [] }), false);
+  assert.equal(hasUsableServer({ serverPath: undefined, runtimes: undefined }), false);
+  // 列表里有空壳记录不算已配置
+  assert.equal(hasUsableServer({ serverPath: '', runtimes: [{ executable_path: '' }] }), false);
+});
+
+
+test('createRequestGate only accepts the latest request', () => {
+  const gate = createRequestGate();
+  const first = gate.begin();
+  const second = gate.begin();
+  assert.equal(gate.isCurrent(first), false);
+  assert.equal(gate.isCurrent(second), true);
+  gate.cancel();
+  assert.equal(gate.isCurrent(second), false);
+});
+
+test('formatApiErrorPayload turns FastAPI detail arrays into actionable text', () => {
+  assert.equal(formatApiErrorPayload(null, 'fallback'), 'fallback');
+  assert.equal(formatApiErrorPayload('plain', 'fallback'), 'plain');
+  assert.equal(formatApiErrorPayload({ error: 'boom' }, 'fallback'), 'boom');
+  assert.equal(formatApiErrorPayload({ detail: 'simple detail' }, 'fallback'), 'simple detail');
+  assert.equal(
+    formatApiErrorPayload(
+      { detail: [{ loc: ['query', 'q'], msg: 'too long' }, { msg: 'second' }] },
+      'fallback'
+    ),
+    'q: too long; second'
+  );
+});
+
+test('instanceNameFromFilename is bounded and never empty for a filename', () => {
+  assert.equal(instanceNameFromFilename('a'.repeat(120)).length, 100);
+  assert.equal(instanceNameFromFilename('  model.gguf  '), 'model.gguf');
+  assert.equal(instanceNameFromFilename(''), '');
+});
+
+test('scheduleObjectUrlRevoke defers revocation for WebView2 downloads', async () => {
+  let revoked = '';
+  scheduleObjectUrlRevoke('blob:x', (url) => { revoked = url; }, 0);
+  assert.equal(revoked, '');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(revoked, 'blob:x');
+});
+
+test('classifyLogFrame keeps control frames out of the log buffer', () => {
+  assert.deepEqual(classifyLogFrame(null), { kind: 'ignore' });
+  assert.deepEqual(classifyLogFrame({ type: 'ping' }), { kind: 'heartbeat' });
+  assert.deepEqual(classifyLogFrame({ type: 'logs_dropped', count: 3 }), {
+    kind: 'dropped',
+    count: 3,
+  });
+  assert.deepEqual(classifyLogFrame({ type: 'logs_dropped', count: -2 }), {
+    kind: 'dropped',
+    count: 0,
+  });
+  assert.deepEqual(classifyLogFrame({ timestamp: 1, line: 'hello' }), { kind: 'line' });
+});
+
+
+test('modal actions await asynchronous results before deciding to close', async () => {
+  let finished = false;
+  const result = await settleModalAction({
+    onClick: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      finished = true;
+      return false;
+    },
+  });
+  assert.equal(finished, true);
+  assert.equal(result, false);
+  assert.equal(shouldCloseAfterAction(result, false), false);
+  assert.equal(shouldCloseAfterAction(true, false), true);
+  assert.equal(shouldCloseAfterAction(undefined, false), true);
+  assert.equal(shouldCloseAfterAction(true, true), false);
+});
+
+
+test('setButtonBusy disables a control and exposes aria-busy', () => {
+  const attrs = new Map();
+  const button = {
+    disabled: false,
+    setAttribute(name, value) { attrs.set(name, String(value)); },
+    removeAttribute(name) { attrs.delete(name); },
+  };
+  setButtonBusy(button, true);
+  assert.equal(button.disabled, true);
+  assert.equal(attrs.get('aria-busy'), 'true');
+  setButtonBusy(button, false);
+  assert.equal(button.disabled, false);
+  assert.equal(attrs.has('aria-busy'), false);
+  assert.doesNotThrow(() => setButtonBusy(null, true));
 });

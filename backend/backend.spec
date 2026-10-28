@@ -15,14 +15,12 @@
 #   部署脚本/安装包必须把 backend.exe 和 _internal 一起复制，见
 #   tools/Publish-PortableRuntime.ps1 与 src-tauri/build.rs。
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
 a = Analysis(
     ['main.py'],
     # pathex 使用相对路径，clone 仓库后可直接在本目录执行 pyinstaller backend.spec
     pathex=['.'],
-    binaries=[],
-    datas=[],
     hiddenimports=(
         # uvicorn 及其子模块
         collect_submodules('uvicorn')
@@ -43,14 +41,24 @@ a = Analysis(
         + collect_submodules('h11')
         # pynvml（GPU 监控可选依赖，try/except 导入需显式收集）
         + collect_submodules('pynvml')
+        # PyYAML is imported lazily inside model_manifest._load_yaml, so the
+        # analyzer cannot see it. It is a locked runtime dependency and the
+        # packaged build must be able to parse model.yaml.
+        + collect_submodules('yaml')
+        # Knowledge-base extraction imports these lazily (and pypdfium2 loads
+        # a native PDFium binary), so the analyzer cannot see them either.
+        + collect_submodules('pypdf')
+        + collect_submodules('pypdfium2')
     ),
+    binaries=collect_dynamic_libs('pypdfium2'),
+    datas=collect_data_files('pypdfium2'),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
         'tkinter', 'test', 'unittest', 'pytest',
         'setuptools', 'pip', 'wheel',
-        'numpy', 'matplotlib', 'scipy', 'pandas',
+        'matplotlib', 'scipy', 'pandas',
         'PIL', 'Pillow', 'cv2', 'opencv',
         'tensorflow', 'torch', 'keras',
         'IPython', 'jupyter', 'notebook',
@@ -61,7 +69,6 @@ a = Analysis(
         'celery', 'redis',
         'flask', 'django',
         'lxml', 'beautifulsoup4',
-        'yaml', 'PyYAML',
         'Crypto', 'Cryptodome',
         'socks', 'PySocks',
         'pywin32', 'win32com',
@@ -86,7 +93,7 @@ exe = EXE(
     runtime_tmpdir=None,
     console=False,       # 无控制台窗口（后台服务）
     # 窗口化进程抛异常时不要弹模态对话框拖住 sidecar；崩溃详情由后端
-    # rotating log（backend.log）与崩溃翻译承接（审计 W4 / F23）。
+    # rotating log（backend.log）与崩溃翻译承接。
     disable_windowed_traceback=True,
     argv_emulation=False,
     target_arch=None,

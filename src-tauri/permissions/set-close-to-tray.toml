@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "set-close-to-tray"
+description = "Allow the main window to toggle hide-on-close to tray immediately"
+commands.allow = ["set_close_to_tray"]

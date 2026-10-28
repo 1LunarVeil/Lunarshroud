@@ -4,33 +4,42 @@
 
 import Api from './api.js?v=1';
 import { createSingleFlight } from './runtime.mjs';
+import { initTooltips } from './tooltip.mjs';
 import { getLocale, setLocale, t, LOCALE_NAMES } from './i18n.mjs';
 import { open as openModelPicker } from './model_picker.mjs';
+import { openCommandPalette } from './command_palette.mjs';
+import { escapeHtml } from './html.mjs';
+import { closeModal, showConfirm, showModal } from './modal.mjs';
+
+export { escapeHtml };
 
 // 导入所有页面模块
 import * as dashboard from './dashboard.js?v=1';
-import * as models from './models.js?v=1';
 import * as chat from './chat.js?v=1';
+import * as workspace from './workspace.js?v=1';
+import * as knowledge from './knowledge.js?v=1';
+import * as observability from './observability.js?v=1';
 import * as paramEditor from './param_editor.js?v=1';
-import * as presets from './presets.js?v=1';
-import * as logs from './logs.js?v=1';
-import * as monitor from './monitor.js?v=1';
-import * as history from './history.js?v=1';
 import * as help from './help.js?v=1';
 import * as settings from './settings.js?v=1';
 
-// 页面注册表（顺序 = 侧边栏顺序）
+// 页面注册表（顺序 = 初始化顺序；侧栏显示顺序由 NAV_GROUPS 决定）
 const PAGES = [
   dashboard,
-  models,
   chat,
+  workspace,
+  knowledge,
+  observability,
   paramEditor,
-  presets,
-  logs,
-  monitor,
-  history,
   help,
   settings,
+];
+
+// 侧栏分组：目的地与动作分开；参数编辑器/设置是模态动作，不是路由页面。
+const NAV_GROUPS = [
+  { key: 'run', labelKey: 'nav.groupRun', pages: ['dashboard', 'chat'] },
+  { key: 'resources', labelKey: 'nav.groupResources', pages: ['workspace', 'knowledge', 'observability'] },
+  { key: 'tools', labelKey: 'nav.groupTools', pages: ['param_editor', 'help', 'settings'] },
 ];
 
 // 当前激活页面
@@ -42,144 +51,42 @@ let appCtx = null; // 见 buildAppContext()：页面 init() 与 renderPanel() �
 
 const toastContainer = () => document.getElementById('toast-container');
 
-export function showToast(message, type = 'info', duration = 3000) {
+export function showToast(message, type = 'info', duration) {
+  const container = toastContainer();
+  if (!container) return;
+  // 最多同时保留 4 条，避免批量错误把屏幕堆满。
+  while (container.children.length >= 4) container.firstElementChild.remove();
   const el = document.createElement('div');
   el.className = `toast toast-${type}`;
+  el.setAttribute('role', type === 'error' ? 'alert' : 'status');
   const icons = {
     success: '✓',
     error: '✕',
     warning: '!',
     info: 'i',
   };
-  el.innerHTML = `<span class="toast-icon">${icons[type] || 'i'}</span><span class="toast-msg"></span>`;
+  el.innerHTML = `<span class="toast-icon" aria-hidden="true">${icons[type] || 'i'}</span><span class="toast-msg"></span>`;
   el.querySelector('.toast-msg').textContent = message;
-  toastContainer().appendChild(el);
-  setTimeout(() => {
+  container.appendChild(el);
+  const timeout = duration ?? (type === 'error' ? 7000 : type === 'warning' ? 5000 : 3000);
+  let timer = setTimeout(remove, timeout);
+  function remove() {
+    clearTimeout(timer);
     el.classList.add('fade-out');
     setTimeout(() => el.remove(), 250);
-  }, duration);
+  }
+  // 悬停阅读时暂停倒计时，移开后留 1.5s 再消失。
+  el.addEventListener('mouseenter', () => clearTimeout(timer));
+  el.addEventListener('mouseleave', () => {
+    clearTimeout(timer);
+    timer = setTimeout(remove, 1500);
+  });
   // 同时输出到控制台便于调试
   if (type === 'error') console.error('[Toast]', message);
   else console.log('[Toast]', message);
 }
 
-// ========== 全局 Modal ==========
-
-// 关闭回调：某些调用方（启动前检查）需要知道用户是"点了按钮"还是"按了 X /
-// 点了遮罩"关闭的，否则 Promise 永远不 resolve。showModal 的第四个参数是可选的，
-// 既有三参数调用完全不受影响。
-let _modalCloseHook = null;
-
-export function showModal(title, contentHtml, actions = [], options = {}) {
-  closeModal();
-  _modalCloseHook = typeof options.onClose === 'function' ? options.onClose : null;
-  const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  overlay.id = 'app-modal-overlay';
-
-  const actionsHtml = actions
-    .map(
-      (a, i) => `<button class="btn ${a.class || 'btn-secondary'}" data-idx="${i}">${a.label}</button>`
-    )
-    .join('');
-
-  overlay.innerHTML = `
-    <div class="modal ${modalSizeClass(actions)}">
-      <div class="modal-header">
-        <div class="modal-title"></div>
-        <button class="modal-close" data-close>&times;</button>
-      </div>
-      <div class="modal-body"></div>
-      <div class="modal-footer">${actionsHtml}</div>
-    </div>
-  `;
-  overlay.querySelector('.modal-title').textContent = title;
-  const body = overlay.querySelector('.modal-body');
-  if (typeof contentHtml === 'string') {
-    body.innerHTML = contentHtml;
-  } else if (contentHtml instanceof Node) {
-    body.appendChild(contentHtml);
-  }
-
-  // 关闭事件
-  overlay.querySelector('[data-close]').addEventListener('click', closeModal);
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) closeModal();
-  });
-
-  // 动作按钮
-  overlay.querySelectorAll('[data-idx]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const idx = parseInt(btn.dataset.idx, 10);
-      const action = actions[idx];
-      if (!action) return;
-      if (typeof action.onClick === 'function') {
-        const ret = action.onClick(overlay, body);
-        // 若 onClick 返回 false 则不关闭
-        if (ret === false) return;
-      }
-      if (action.keepOpen) return;
-      closeModal();
-    });
-  });
-
-  document.body.appendChild(overlay);
-  return overlay;
-}
-
-function modalSizeClass(actions) {
-  if (actions.some((a) => a.size === 'lg')) return 'modal-lg';
-  if (actions.some((a) => a.size === 'sm')) return 'modal-sm';
-  return '';
-}
-
-export function closeModal() {
-  const hook = _modalCloseHook;
-  _modalCloseHook = null;
-  if (hook) {
-    try {
-      hook();
-    } catch (e) {
-      console.error('[modal onClose]', e);
-    }
-  }
-  const existing = document.getElementById('app-modal-overlay');
-  if (existing) existing.remove();
-  // 浮层整体销毁后，模块作用域上的防抖计时器必须有机会自清 ——
-  // 否则关窗后仍会触发一次请求（审计 R6 的 param_editor 条目）。
-  document.dispatchEvent(new CustomEvent('modal-closed'));
-}
-
-// ========== Confirm（基于 Modal） ==========
-
-export function showConfirm(message, title) {
-  return new Promise((resolve) => {
-    showModal(title || t('app.confirmTitle'), `<div style="font-size:14px;line-height:1.6;">${escapeHtml(message)}</div>`, [
-      {
-        label: t('app.cancel'),
-        class: 'btn-secondary',
-        onClick: () => resolve(false),
-      },
-      {
-        label: t('app.ok'),
-        class: 'btn-primary',
-        onClick: () => resolve(true),
-      },
-    ]);
-  });
-}
-
 // ========== 工具函数 ==========
-
-export function escapeHtml(str) {
-  if (str === null || str === undefined) return '';
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
 
 export function formatDuration(seconds) {
   // 用 == null 而不是 !seconds：0 是合法的"刚启动"，不该显示成 '-'
@@ -269,25 +176,65 @@ export async function copyToClipboard(text) {
 
 // ========== 主题切换 ==========
 
-export function getTheme() {
+const THEME_STORAGE_KEY = 'lunarshroud_theme';
+const THEME_QUERY = '(prefers-color-scheme: dark)';
+
+const SUN_ICON =
+  '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="6.34" y2="6.34"/><line x1="17.66" y1="17.66" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="6.34" y2="17.66"/><line x1="17.66" y1="6.34" x2="19.07" y2="4.93"/></svg>';
+const MOON_ICON =
+  '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+
+export function getThemePreference() {
   try {
-    return localStorage.getItem('lunarshroud_theme') || 'dark';
+    const value = localStorage.getItem(THEME_STORAGE_KEY);
+    return value === 'light' || value === 'dark' || value === 'system' ? value : 'system';
   } catch {
-    // 存储不可用（隐私模式/策略限制）时退回默认，不能因此白屏（审计 R6）
+    // 存储不可用（隐私模式/策略限制）时退回系统偏好，不能因此白屏
+    return 'system';
+  }
+}
+
+export function resolveTheme(preference) {
+  if (preference === 'light' || preference === 'dark') return preference;
+  try {
+    return window.matchMedia(THEME_QUERY).matches ? 'dark' : 'light';
+  } catch {
     return 'dark';
   }
 }
 
+/** 解析后的实际主题（light/dark），供需要按主题重绘的页面使用。 */
+export function getTheme() {
+  return resolveTheme(getThemePreference());
+}
+
+function updateThemeButton(resolved) {
+  const btn = document.getElementById('btn-theme');
+  if (!btn) return;
+  const current = t(resolved === 'dark' ? 'settings.themeDark' : 'settings.themeLight');
+  const label = t('app.themeToggle', { current });
+  btn.title = label;
+  btn.setAttribute('aria-label', label);
+  btn.innerHTML = `${resolved === 'dark' ? SUN_ICON : MOON_ICON}<span class="btn-label">${escapeHtml(current)}</span>`;
+}
+
 export function setTheme(theme) {
+  const preference =
+    theme === 'light' || theme === 'dark' || theme === 'system' ? theme : 'system';
+  const resolved = resolveTheme(preference);
   document.body.classList.remove('theme-dark', 'theme-light');
-  document.body.classList.add(theme === 'dark' ? 'theme-dark' : 'theme-light');
+  document.body.classList.add(resolved === 'dark' ? 'theme-dark' : 'theme-light');
+  document.documentElement.style.colorScheme = resolved;
   try {
-    localStorage.setItem('lunarshroud_theme', theme);
+    localStorage.setItem(THEME_STORAGE_KEY, preference);
   } catch {
     // 持久化失败只影响下次启动的初始主题，本次会话照常生效
   }
+  updateThemeButton(resolved);
   // 通知 monitor 等需要重绘的页面
-  document.dispatchEvent(new CustomEvent('theme-changed', { detail: { theme } }));
+  document.dispatchEvent(
+    new CustomEvent('theme-changed', { detail: { theme: resolved, preference } })
+  );
 }
 
 function toggleTheme() {
@@ -336,9 +283,12 @@ async function pollInstances() {
   try {
     const list = await Api.listInstances();
     emitInstances(list);
+    setBackendBanner('connected');
   } catch (e) {
-    // 后端失联：顶栏由 renderHeaderStatus 的 catch 分支呈现
+    // 后端失联：顶栏由 renderHeaderStatus 的 catch 分支呈现，
+    // 但顶栏的小圆点不足以解释"为什么所有按钮都没反应"，所以补一条横幅。
     renderHeaderStatus(null, e);
+    setBackendBanner('offline');
   }
 }
 
@@ -367,8 +317,10 @@ function startInstanceFeed() {
     onStatus: (state) => {
       if (state === 'connected') {
         stopInstancesPolling();
+        setBackendBanner('connected');
       } else if (state === 'reconnecting' || state === 'closed') {
         startInstancesPolling();
+        setBackendBanner('reconnecting');
       }
     },
   });
@@ -376,9 +328,29 @@ function startInstanceFeed() {
   pollInstancesOnce();
 }
 
+let backendState = 'connected';
+
+function setBackendBanner(state) {
+  backendState = state;
+  renderSidebarStatus(lastInstances);
+  const banner = document.getElementById('backend-banner');
+  if (!banner) return;
+  if (state === 'connected') {
+    banner.hidden = true;
+    banner.textContent = '';
+    return;
+  }
+  banner.hidden = false;
+  banner.className = `backend-banner backend-banner-${state}`;
+  banner.textContent = t(state === 'offline' ? 'app.backendOffline' : 'app.backendReconnecting');
+}
+
 // ========== 顶栏状态指示器 ==========
 
+let lastInstances = [];
+
 function renderHeaderStatus(instances) {
+  lastInstances = Array.isArray(instances) ? instances : [];
   const dot = document.getElementById('header-status-dot');
   const text = document.getElementById('header-status-text');
   if (!dot || !text) return;
@@ -404,6 +376,28 @@ function renderHeaderStatus(instances) {
     dot.className = 'status-dot';
     text.textContent = t('app.statusNone');
   }
+  renderSidebarStatus(instances);
+}
+
+// 侧栏底部状态块：把"收起导航"下面那片纯留白换成真正有用的常驻信息。
+// 只写界面已经知道的事实 —— 应用版本目前没有任何前端可读的来源，所以不显示。
+function renderSidebarStatus(instances) {
+  const el = document.getElementById('sidebar-status');
+  if (!el) return;
+  const list = Array.isArray(instances) ? instances : [];
+  const running = list.filter((i) => i.status === 'running').length;
+  const stateKey = backendState === 'offline'
+    ? 'app.backendOffline'
+    : backendState === 'reconnecting' ? 'app.backendReconnecting' : 'app.statusConnected';
+  el.innerHTML = `
+    <div class="sidebar-status-row">
+      <span class="sidebar-status-key">${escapeHtml(t('app.statusBackend'))}</span>
+      <span class="sidebar-status-value is-${escapeHtml(backendState)}">${escapeHtml(t(stateKey))}</span>
+    </div>
+    <div class="sidebar-status-row">
+      <span class="sidebar-status-key">${escapeHtml(t('app.statusInstances'))}</span>
+      <span class="sidebar-status-value">${running} / ${list.length}</span>
+    </div>`;
 }
 
 // ========== 上下文面板（二级左栏） ==========
@@ -414,6 +408,11 @@ function renderHeaderStatus(instances) {
 // 主动重绘面板（例如参数 schema 异步加载完成后）。
 
 const PANEL_STATE_KEY = 'lunarshroud_panel_collapsed';
+const PANEL_DRAWER_QUERY = '(max-width: 900px)';
+
+function isPanelDrawerMode() {
+  return window.matchMedia(PANEL_DRAWER_QUERY).matches;
+}
 
 function getPanelCollapsed() {
   try {
@@ -425,7 +424,8 @@ function getPanelCollapsed() {
 
 function pageHasPanel(pageId) {
   const entry = pageId ? pageInstances.get(pageId) : null;
-  return !!(entry && typeof entry.module.renderPanel === 'function');
+  if (!entry || typeof entry.module.renderPanel !== 'function') return false;
+  return entry.module.hasPanel ? entry.module.hasPanel() : true;
 }
 
 function renderContextPanel(pageId) {
@@ -435,7 +435,9 @@ function renderContextPanel(pageId) {
   if (!panel || !body) return;
 
   const entry = pageId ? pageInstances.get(pageId) : null;
-  const usable = pageHasPanel(pageId) && !getPanelCollapsed();
+  // 窄屏下面板是抽屉：桌面端的"收起"偏好不应让页面列表彻底消失，
+  // 否则模型库/预设/日志在窄窗口里没有切换入口。
+  const usable = pageHasPanel(pageId) && (isPanelDrawerMode() || !getPanelCollapsed());
 
   if (!usable) {
     panel.hidden = true;
@@ -459,11 +461,18 @@ function syncPanelToggles() {
   const toggle = document.getElementById('btn-panel-toggle');
   const collapse = document.getElementById('btn-panel-collapse');
   const visible = !!panel && !panel.hidden;
+  const drawerMode = isPanelDrawerMode();
+  const drawerOpen = document.body.classList.contains('panel-drawer-open');
+  if (panel) {
+    // 抽屉关闭时移出可访问树与 Tab 顺序；宽屏下面板始终可访问。
+    panel.inert = drawerMode && !drawerOpen;
+  }
   if (toggle) {
     // 当前页没有面板时置灰而不是隐藏：隐藏会让顶栏按钮左右跳动
     const available = pageHasPanel(activePage);
     toggle.disabled = !available;
-    toggle.setAttribute('aria-pressed', String(available && visible));
+    const open = drawerMode ? drawerOpen : visible;
+    toggle.setAttribute('aria-pressed', String(available && open));
     toggle.title = available ? t('panel.toggle') : t('panel.unavailable');
   }
   if (collapse) {
@@ -471,7 +480,37 @@ function syncPanelToggles() {
   }
 }
 
+function closePanelDrawer({ restoreFocus = false } = {}) {
+  if (!document.body.classList.contains('panel-drawer-open')) return;
+  document.body.classList.remove('panel-drawer-open');
+  const backdrop = document.getElementById('sidebar-backdrop');
+  const sidebar = document.getElementById('sidebar');
+  if (backdrop && !(sidebar && sidebar.classList.contains('show'))) {
+    backdrop.classList.remove('show');
+  }
+  syncPanelToggles();
+  if (restoreFocus) {
+    const toggle = document.getElementById('btn-panel-toggle');
+    if (toggle && toggle.isConnected) toggle.focus({ preventScroll: true });
+  }
+}
+
+function openPanelDrawer() {
+  if (!isPanelDrawerMode()) return;
+  closeMobileSidebar();
+  document.body.classList.add('panel-drawer-open');
+  const backdrop = document.getElementById('sidebar-backdrop');
+  if (backdrop) backdrop.classList.add('show');
+  syncPanelToggles();
+  const collapse = document.getElementById('btn-panel-collapse');
+  if (collapse && collapse.isConnected) collapse.focus({ preventScroll: true });
+}
+
 function setPanelCollapsed(collapsed) {
+  if (isPanelDrawerMode()) {
+    if (collapsed) closePanelDrawer({ restoreFocus: true });
+    return;
+  }
   try {
     localStorage.setItem(PANEL_STATE_KEY, collapsed ? '1' : '0');
   } catch {
@@ -481,6 +520,14 @@ function setPanelCollapsed(collapsed) {
 }
 
 function togglePanel() {
+  if (isPanelDrawerMode()) {
+    if (document.body.classList.contains('panel-drawer-open')) {
+      closePanelDrawer({ restoreFocus: true });
+    } else {
+      openPanelDrawer();
+    }
+    return;
+  }
   setPanelCollapsed(!getPanelCollapsed());
 }
 
@@ -491,8 +538,11 @@ function renderSidebar() {
     dashboard: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>',
     models: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>',
     chat: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
-    param_editor: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
+    param_editor: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>',
     presets: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>',
+    knowledge: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/><line x1="9" y1="7" x2="15" y2="7"/><line x1="9" y1="11" x2="15" y2="11"/></svg>',
+    workspace: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>',
+    observability: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>',
     logs: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/></svg>',
     monitor: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>',
     history: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
@@ -500,28 +550,96 @@ function renderSidebar() {
     settings: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>',
   };
   const sidebar = document.getElementById('sidebar');
-  sidebar.innerHTML = PAGES.map(
-    (p) => `
-      <div class="sidebar-item" data-page="${p.id}" title="${escapeHtml(t('nav.' + p.id))}">
-        <span class="icon">${icons[p.id] || ''}</span>
-        <span class="label">${escapeHtml(t('nav.' + p.id))}</span>
-      </div>
+  const pageById = new Map(PAGES.map((p) => [p.id, p]));
+  sidebar.innerHTML =
+    NAV_GROUPS.map((group, index) => {
+      const items = group.pages
+        .map((id) => {
+          const p = pageById.get(id);
+          if (!p) return '';
+          const label = t('nav.' + id);
+          const modal = isModalPage(p);
+          return `
+        <button type="button" class="sidebar-item" data-page="${escapeHtml(id)}"
+          title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}"
+          ${modal ? 'aria-haspopup="dialog"' : ''}>
+          <span class="icon" aria-hidden="true">${icons[id] || ''}</span>
+          <span class="label">${escapeHtml(label)}</span>
+        </button>`;
+        })
+        .join('');
+      return `${index === NAV_GROUPS.length - 1 ? '<div class="sidebar-spacer"></div>' : ''}
+      <div class="sidebar-group" data-group="${escapeHtml(group.key)}">
+        <div class="sidebar-group-label">${escapeHtml(t(group.labelKey))}</div>
+        ${items}
+      </div>`;
+    })
+    .join('') +
     `
-  ).join('');
+    <div class="sidebar-footer">
+      <div class="sidebar-status" id="sidebar-status" role="status"></div>
+      <button type="button" class="sidebar-collapse" id="btn-sidebar-collapse">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="11 17 6 12 11 7"/><polyline points="18 17 13 12 18 7"/></svg>
+        <span class="label">${escapeHtml(t('sidebar.collapse'))}</span>
+      </button>
+    </div>`;
+  sidebar.setAttribute('aria-label', t('nav.label'));
   sidebar.querySelectorAll('.sidebar-item').forEach((el) => {
-    el.addEventListener('click', () => {
-      const id = el.dataset.page;
-      navigateTo(id);
-    });
+    el.addEventListener('click', () => navigateTo(el.dataset.page));
   });
+  const collapseBtn = sidebar.querySelector('#btn-sidebar-collapse');
+  if (collapseBtn) {
+    collapseBtn.addEventListener('click', () => setSidebarCollapsed(!getSidebarCollapsed()));
+  }
+  applySidebarState();
+}
+
+// 侧栏展开/收起是用户选择，跨会话保持；默认展开（图标 + 文字）。
+const SIDEBAR_STATE_KEY = 'lunarshroud_sidebar_collapsed';
+
+function getSidebarCollapsed() {
+  try {
+    return localStorage.getItem(SIDEBAR_STATE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function setSidebarCollapsed(collapsed) {
+  try {
+    localStorage.setItem(SIDEBAR_STATE_KEY, collapsed ? '1' : '0');
+  } catch {
+    // 持久化失败只影响下次启动的初始状态
+  }
+  applySidebarState();
+}
+
+function applySidebarState() {
+  const sidebar = document.getElementById('sidebar');
+  if (!sidebar) return;
+  const collapsed = getSidebarCollapsed();
+  sidebar.classList.toggle('collapsed', collapsed);
+  const btn = document.getElementById('btn-sidebar-collapse');
+  if (btn) {
+    const label = t(collapsed ? 'sidebar.expand' : 'sidebar.collapse');
+    btn.title = label;
+    btn.setAttribute('aria-label', label);
+    btn.setAttribute('aria-pressed', String(collapsed));
+    const svg = btn.querySelector('svg');
+    if (svg) svg.classList.toggle('flipped', collapsed);
+  }
 }
 
 function closeMobileSidebar() {
   document.getElementById('sidebar').classList.remove('show');
-  document.getElementById('sidebar-backdrop').classList.remove('show');
+  const backdrop = document.getElementById('sidebar-backdrop');
+  if (backdrop && !document.body.classList.contains('panel-drawer-open')) {
+    backdrop.classList.remove('show');
+  }
 }
 
 function openMobileSidebar() {
+  closePanelDrawer();
   document.getElementById('sidebar').classList.add('show');
   document.getElementById('sidebar-backdrop').classList.add('show');
 }
@@ -554,6 +672,7 @@ function openModalPage(mod) {
 
 function navigateTo(pageId) {
   const target = PAGES.find((p) => p.id === pageId);
+  closePanelDrawer();
   if (isModalPage(target)) {
     closeMobileSidebar();
     openModalPage(target);
@@ -567,15 +686,19 @@ function navigateTo(pageId) {
     }
     prev.root.classList.remove('active');
   }
-  // 切换侧边栏激活
+  // 切换侧边栏激活（class 负责视觉，aria-current 负责读屏）
   document.querySelectorAll('.sidebar-item').forEach((el) => {
-    el.classList.toggle('active', el.dataset.page === pageId);
+    const isActive = el.dataset.page === pageId;
+    el.classList.toggle('active', isActive);
+    if (isActive) el.setAttribute('aria-current', 'page');
+    else el.removeAttribute('aria-current');
   });
 
   const entry = pageInstances.get(pageId);
   if (!entry) return;
   entry.root.classList.add('active');
   activePage = pageId;
+  document.title = `${t('nav.' + pageId)} · LunarShroud`;
   // 二级左栏内容随页面切换
   renderContextPanel(pageId);
   // 窄屏下点击导航后自动收起侧边栏
@@ -594,7 +717,16 @@ function navigateTo(pageId) {
 function initLayout() {
   // 应用顶层结构已在 index.html 中静态定义
   // 这里仅注入主题与事件
-  setTheme(getTheme());
+  setTheme(getThemePreference());
+  // 系统主题变化时，只有“跟随系统”需要实时重绘。
+  try {
+    const media = window.matchMedia(THEME_QUERY);
+    media.addEventListener('change', () => {
+      if (getThemePreference() === 'system') setTheme('system');
+    });
+  } catch {
+    // 旧 WebView 不支持 addEventListener 时忽略；用户仍可手动切换
+  }
   document.documentElement.lang = getLocale();
   // 首屏就给出正确的状态文案，而不是空着等第一次推送（index.html 静态留空）
   const statusText = document.getElementById('header-status-text');
@@ -602,6 +734,13 @@ function initLayout() {
 
   // 顶栏按钮
   document.getElementById('btn-theme').addEventListener('click', toggleTheme);
+  const aboutBtn = document.getElementById('btn-about');
+  if (aboutBtn) {
+    const aboutLabel = t('app.about');
+    aboutBtn.title = aboutLabel;
+    aboutBtn.setAttribute('aria-label', aboutLabel);
+    aboutBtn.innerHTML = `${aboutBtn.innerHTML}<span class="btn-label">${escapeHtml(aboutLabel)}</span>`;
+  }
   document.getElementById('btn-about').addEventListener('click', showAbout);
   const langBtn = document.getElementById('btn-lang');
   if (langBtn) {
@@ -620,13 +759,42 @@ function initLayout() {
     sidebarToggle.setAttribute('aria-label', label);
     sidebarToggle.addEventListener('click', toggleMobileSidebar);
   }
-  if (sidebarBackdrop) sidebarBackdrop.addEventListener('click', closeMobileSidebar);
+  if (sidebarBackdrop) {
+    sidebarBackdrop.addEventListener('click', () => {
+      closeMobileSidebar();
+      closePanelDrawer({ restoreFocus: true });
+    });
+  }
 
   // 二级左栏：顶栏按钮负责"收起/展开"，面板头部按钮负责"收起"
   const panelToggle = document.getElementById('btn-panel-toggle');
   const panelCollapse = document.getElementById('btn-panel-collapse');
   if (panelToggle) panelToggle.addEventListener('click', togglePanel);
-  if (panelCollapse) panelCollapse.addEventListener('click', () => setPanelCollapsed(true));
+  if (panelCollapse) {
+    panelCollapse.addEventListener('click', () => {
+      if (isPanelDrawerMode()) closePanelDrawer({ restoreFocus: true });
+      else setPanelCollapsed(true);
+    });
+  }
+  // 抽屉里选中模型/预设/实例后自动收起，避免遮住刚打开的内容。
+  const panelBody = document.getElementById('context-panel-body');
+  if (panelBody) {
+    panelBody.addEventListener('click', (event) => {
+      if (!isPanelDrawerMode()) return;
+      if (event.target.closest('button, a')) closePanelDrawer();
+    });
+  }
+  // 从窄屏拖宽后，抽屉状态与 inert 必须归零，否则面板会被永久隔离。
+  const panelModeMedia = window.matchMedia(PANEL_DRAWER_QUERY);
+  const onPanelModeChange = () => {
+    if (!panelModeMedia.matches) closePanelDrawer();
+    syncPanelToggles();
+  };
+  if (typeof panelModeMedia.addEventListener === 'function') {
+    panelModeMedia.addEventListener('change', onPanelModeChange);
+  } else if (typeof panelModeMedia.addListener === 'function') {
+    panelModeMedia.addListener(onPanelModeChange);
+  }
 
   // 居中模型选择器：按钮文案在这里注入（index.html 是静态的，写死中文会漏翻）
   const pickerBtn = document.getElementById('btn-model-picker');
@@ -640,10 +808,19 @@ function initLayout() {
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       closeModal();
+      closePanelDrawer({ restoreFocus: true });
       closeMobileSidebar();
       return;
     }
-    // Ctrl+L = 打开模型选择器。与 ESC 放在同一处，键盘处理只有一份。
+    // Ctrl+K = 命令面板；Ctrl+L = 模型选择器。与 ESC 放在同一处。
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {
+      e.preventDefault();
+      // A modal page (parameter editor / settings) may hold unsaved state.
+      // Do not replace it from the shell; close it first.
+      if (document.querySelector('#app-modal-overlay')) return;
+      openCommandPalette(appCtx);
+      return;
+    }
     if ((e.ctrlKey || e.metaKey) && (e.key === 'l' || e.key === 'L')) {
       e.preventDefault(); // 否则会选中浏览器地址栏
       openModelPicker(appCtx);
@@ -658,10 +835,10 @@ function showAbout() {
   showModal(
     t('app.aboutTitle'),
     `
-    <div style="font-size:14px;line-height:1.8;">
+    <div class="about-body">
       <p><strong>LunarShroud</strong> ${escapeHtml(t('app.aboutDesc1'))}</p>
       <p>${escapeHtml(t('app.aboutDesc2'))}</p>
-      <p style="color: var(--color-text-secondary); margin-top: 10px; font-size: 12px;">${escapeHtml(t('app.aboutStack'))}</p>
+      <p class="about-stack">${escapeHtml(t('app.aboutStack'))}</p>
     </div>
     `,
     [{ label: t('app.close'), class: 'btn-primary' }]
@@ -723,17 +900,20 @@ function buildAppContext() {
     copyToClipboard,
     setTheme,
     getTheme,
+    getThemePreference,
     subscribeInstances,
     t,
     // 页面间跳转。以前页面模块靠 document.querySelector('.sidebar-item[data-page=…]').click()
     // 模拟点击，既依赖 DOM 结构又会被复制到多处；统一走这里。
     navigate: navigateTo,
+    openModelPicker: () => openModelPicker(appCtx),
   };
 }
 
 // 启动
 function boot() {
   updateDebugBanner();
+  initTooltips(document);
   appCtx = buildAppContext();
   // 让页面能在自己的数据变化后重绘二级面板
   appCtx.refreshPanel = () => renderContextPanel(activePage);

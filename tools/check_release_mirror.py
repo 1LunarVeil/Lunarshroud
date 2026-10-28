@@ -6,7 +6,7 @@
 ``github/`` 是一份**手工维护**的公开源码镜像（见 ``docs/HANDOVER.md`` 的
 "Public-source workflow"）。手工 ``cp`` 的下场已经发生过一次：镜像停在 P1
 之前的状态，``backend/core`` 少了 5 个模块、整套 i18n 与测试夹具都没进去，
-而外界拿到的就是那份旧代码（见 ``独立代码审计报告.md`` §3.3）。
+而外界拿到的就是那份旧代码（2026-09 实测发生过）。
 
 本脚本把"镜像该长什么样"变成**可复跑的一条命令**：工作树里所有
 "该发布"的文件，镜像里必须逐一存在且内容逐字节一致；镜像里不允许出现
@@ -54,7 +54,7 @@ MIRROR = ROOT / "github"
 
 # 任意层级都不进镜像的目录名
 EXCLUDED_DIR_NAMES = frozenset({
-    ".git", ".claude", ".mimosa", ".idea", ".vscode", ".eggs",
+    ".git", ".claude", ".mimosa", ".zcode", ".idea", ".vscode", ".eggs",
     "__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache",
     "node_modules", ".venv", "venv", "env",
     "htmlcov", "shots", "wheelhouse",
@@ -75,11 +75,14 @@ EXCLUDED_DIR_PREFIXES = (
     "backend/_internal/",
     "src-tauri/target/",
     "src-tauri/gen/",
+    # 便携版打包产物（exe + _internal 的副本与 zip）：与 backend/dist 同类，
+    # 属于构建产物而非源码，整目录不参与镜像。
+    "release/",
     # build.rs 的 staging 目录：backend.exe + _internal，安装包资源来源。
     "src-tauri/backend/",
     # data/ 整目录排除，不逐个列名：SQLite WAL 会产生 history.db-wal/-shm，
     # 配置损坏时 config.py:284 会写 config.json.corrupt（内含本机模型目录绝对路径）。
-    # 这些派生名不可枚举，逐条列名必然漏 —— 审计已实证漏网并被 --apply 复制进镜像。
+    # 这些派生名不可枚举，逐条列名必然漏 —— 实测已证漏网并被 --apply 复制进镜像。
     "data/",
     # 应用在 exe 同目录创建的运行时目录。用户从源码树根直接运行便携版时，
     # 这些目录就落在仓库根：WebView2 缓存含本机路径/站点数据，launcher.log
@@ -91,6 +94,9 @@ EXCLUDED_DIR_PREFIXES = (
     # 外部 AI 工具导出的本地会话目录（dsh-session-*）：整段对话、附件与
     # 本机绝对路径都在里面，绝不能进公开镜像。
     "dsh-session-",
+    # LM Studio 学习资料：安装副本、.lmstudio 用户数据（会话/凭据/模型清单）
+    # 与截图。整目录排除，避免误入工作树扫描或公开镜像。
+    "study/",
 )
 
 # 构建产物/归档后缀（注意：.png/.ico 是源码资源，不能按后缀一刀切）
@@ -141,10 +147,18 @@ CURATED_EXCLUDES = {
     ".aiexclude": "AI 编码工具通用的排除文件，非项目配置",
     ".aiderignore": "AI 编码工具（Aider）的忽略文件，非项目配置",
     ".codeiumignore": "AI 编码工具（Codeium/Windsurf）的忽略文件，非项目配置",
-    "全面审计文档.md":
-        "含本机绝对路径与未修复漏洞的完整细节（内部审计件，不对外）",
+    # 2026-10-27 起各轮审计/整改/交接材料集中到根下 archive/，按目录整体排除。
+    # 下面这条按文件名的规则是**防御性的**：那份文件已移入 archive/，但若它
+    # 再度出现在仓库根（或任意未排除层级），仍必须被拦在镜像之外——
+    # test_release_mirror_gate.py 的 INTERNAL_DOCS 参数逐条钉住这条契约。
     "独立代码审计报告.md":
         "含本机用户名与工程绝对路径（内部审计件，不对外）",
+    "archive/":
+        "内部审计/整改/交接材料汇总目录：各轮独立审计报告、整改记录、RAG 实施"
+        "验收与旧会话存档均含本机绝对路径与内部测试证据，一律不对外",
+    "docs/EVOLUTION.md":
+        "内部演进总档：逐条列出各轮审计的缺陷编号、P1/P2 结论与整改轮次"
+        "（AGENTS §3 的『内部审计文档刻意不发布』）；公开树无任何文档引用它",
     "LunarShroud-演进规划.md":
         "含本机绝对路径（内部演进记录，不对外）",
     "docs/archive/":
@@ -169,7 +183,10 @@ MIRROR_ONLY_ALLOWED = ()
 # 规则 3：镜像里**绝不能出现**的路径（同样覆盖 CURATED_EXCLUDES 的反向保护）
 # --------------------------------------------------------------------------
 FORBIDDEN_GLOBS = (
-    ".claude/*", ".mimosa/*", "tmp/*", "github/*",
+    # 同时列根级与任意层级：_matches_any 用 fnmatch 逐个比对完整路径或文件名，
+    # `.claude/*` 匹配不到 `sub/.claude/x`，必须再给一条 `*/.claude/*`。
+    ".claude/*", "*/.claude/*", ".mimosa/*", "*/.mimosa/*",
+    ".zcode/*", "*/.zcode/*", "tmp/*", "github/*",
     "*__pycache__/*", "*.pytest_cache/*", "*.ruff_cache/*", "*.mypy_cache/*",
     "*.exe", "*.msi", "*.dll", "*.pyd", "*.so", "*.pyc", "*.pyo",
     "*.pdb", "*.lib", "*.exp",
@@ -233,7 +250,7 @@ def privacy_patterns() -> tuple[tuple[str, re.Pattern[str]], ...]:
         for label, marker in _local_markers()
     ) + (
         # 分隔符允许 1~2 个：JSON 里的绝对路径是转义过的（盘符 + 两个反斜杠 + Users），
-        # 只允许单个分隔符的正则会被它绕过（审计已实证）。
+        # 只允许单个分隔符的正则会被它绕过（实测已证）。
         ("userprofile", re.compile(r"[A-Za-z]:[\\/]{1,2}User[s][\\/]{1,2}", re.I)),
     )
 
@@ -340,7 +357,7 @@ def expected_tree(root: Path) -> dict[str, Path]:
 #   - .lnk 把目标存成 UTF-16LE
 #   - .pdb / .exe / .dll 里 ASCII 与 UTF-16LE 混排
 #   - 一个 latin-1 / GBK 字节就能让整份文件在 UTF-8 解码时失败
-# 原实现走 UnicodeDecodeError 分支整体 continue，于是上述全部隐身（审计已实证
+# 原实现走 UnicodeDecodeError 分支整体 continue，于是上述全部隐身（实测已证
 # UTF-16LE、UTF-16BE、gzip、latin-1、JSON 转义 5 种绕过）。改成读**原始字节**、
 # 对每种编码各解一次再匹配。latin-1 永不失败，所以每份文件至少有一个视图，
 # 二进制里的 ASCII 路径也能被抓到。
@@ -377,7 +394,7 @@ def privacy_hits(base: Path, files) -> list[list[str]]:
     """扫描每个文件的本机痕迹。**读不到 / 超限 也算命中**（fail closed）。
 
     刻意不按后缀白名单筛选：白名单会让 data/config.json.corrupt、history.db-wal
-    这类后缀不在名单里的文本整份逃过扫描（审计已实证）。
+    这类后缀不在名单里的文本整份逃过扫描（实测已证）。
 
     同样刻意**不静默跳过**任何文件：扫描不到就等于不能证明干净，而门禁的意义
     正是证明干净。原实现把 UnicodeDecodeError 与 OSError 一起 continue 掉，

@@ -2,7 +2,7 @@
 
 为什么需要穷举式测试
 --------------------
-audit §7 发现 `test_api_integration.py` 整个文件跑在 `INSECURE_DEV_MODE=True`
+一次历史实测发现 `test_api_integration.py` 整个文件跑在 `INSECURE_DEV_MODE=True`
 下 —— 认证中间件全程关闭，于是 15 个断言全都证明不了任何安全性质：把
 `session_auth_middleware` 整个删掉，它们依然全绿。那个文件现已改为启用认证，
 但"新增端点时忘了把它放到认证后面"这类回归仍然不会被任何测试拦住。
@@ -243,3 +243,41 @@ def test_websocket_routes_accept_the_token_subprotocol(app):
         ) as ws:
             message = ws.receive_json()
         assert "timestamp" in message, message
+
+
+def test_cross_origin_responses_expose_every_chat_contract_header(app):
+    """打包态（tauri.localhost 页面 → 127.0.0.1 后端）是跨源 fetch。
+
+    浏览器只允许 JS 读取 CORS 安全列表头 + ``Access-Control-Expose-Headers``
+    清单里的头。chat.js 从聊天响应上读三个 ``X-LunarShroud-*`` 头（引用来源、
+    知识命中、被裁轮次）；任何一个不在 expose 清单里，安装版就会**静默**丢掉
+    对应功能，而源码运行通道（同源）与 TestClient（无 CORS 过滤）全都看不见。
+    本测试带真实 Origin 走完整中间件链，把这三个头钉在清单里。
+    """
+    from fastapi.testclient import TestClient
+
+    required = {
+        "x-lunarshroud-dropped-turns",
+        "x-lunarshroud-sources",
+        "x-lunarshroud-knowledge",
+    }
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/system/health",
+            headers={
+                "X-LunarShroud-Token": AUTH_TOKEN,
+                "Origin": "http://tauri.localhost",
+            },
+        )
+    assert response.status_code == 200
+    assert response.headers.get("access-control-allow-origin") == "http://tauri.localhost"
+    exposed = {
+        value.strip().lower()
+        for value in response.headers.get("access-control-expose-headers", "").split(",")
+        if value.strip()
+    }
+    missing = required - exposed
+    assert not missing, (
+        "以下聊天契约头未被 CORS expose，安装版（跨源）里 JS 永远读不到："
+        f"{sorted(missing)}"
+    )

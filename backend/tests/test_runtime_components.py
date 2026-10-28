@@ -30,7 +30,9 @@ def _free_port() -> int:
         return probe.getsockname()[1]
 
 
-def test_process_manager_launch_log_subscribe_stop_and_remove(monkeypatch, tmp_path):
+def test_process_manager_launch_log_subscribe_stop_and_remove(
+    monkeypatch, tmp_path, stub_launch_probe
+):
     import core.process_manager as process_manager
     from core.process_manager import InstanceStatus, ProcessManager
 
@@ -331,7 +333,9 @@ def test_gpu_monitor_degrades_when_nvidia_smi_is_unavailable(monkeypatch):
     assert monitor.get_gpu_processes() == []
 
 
-def test_instance_lifecycle_is_written_to_the_log(monkeypatch, tmp_path, caplog):
+def test_instance_lifecycle_is_written_to_the_log(
+    monkeypatch, tmp_path, caplog, stub_launch_probe
+):
     """实例生命周期事件必须落到文件日志（backend.log），崩溃后可事后取证。"""
     import core.process_manager as process_manager
     from core.process_manager import ProcessManager
@@ -428,7 +432,7 @@ def test_nvidia_smi_calls_pin_utf8(monkeypatch):
         )
 
     # 强制走 nvidia-smi 兜底路径。源码里 NVML 判断的真实名字是 _nvml_try_init
-    # （审计稿写的 _has_nvml 在源码中不存在，按方案要求以源码为准）。
+    # （早期方案稿写的 _has_nvml 在源码中不存在，以源码为准）。
     monkeypatch.setattr(gpu_monitor, "_nvml_try_init", lambda: False)
     monkeypatch.setattr(gpu_monitor.subprocess, "run", fake_run)
 

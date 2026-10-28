@@ -12,6 +12,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
@@ -30,8 +32,34 @@ _SESSION_DATA = Path(tempfile.mkdtemp(prefix="lunarshroud-tests-"))
 _config.DATA_DIR = _SESSION_DATA
 _config.PRESETS_DIR = _SESSION_DATA / "presets"
 _config.HISTORY_DB = _SESSION_DATA / "history.db"
+_config.CHATS_DB = _SESSION_DATA / "chats.db"
+_config.KNOWLEDGE_DB = _SESSION_DATA / "knowledge.db"
 _config.CONFIG_FILE = _SESSION_DATA / "config.json"
 
 
 def pytest_sessionfinish(session, exitstatus) -> None:
     shutil.rmtree(_SESSION_DATA, ignore_errors=True)
+
+
+@pytest.fixture
+def stub_launch_probe(monkeypatch):
+    """把启动前的能力探测固定成"探测不到"。
+
+    用替身 Popen 模拟 llama-server 的用例都是**全局**替换
+    ``subprocess.Popen``（``monkeypatch.setattr(pm.subprocess, "Popen", Fake)``），
+    而 ``_validate_start`` 现在会真起一次 ``--help`` 探测（修复背景：
+    冷缓存不能让不支持的 flag 直接写进命令行）。那些替身只实现了启动需要的
+    ``poll/terminate/kill/wait``，没有 ``communicate`` —— 于是与探测无关的生命周期
+    用例会一起崩在这里。
+
+    显式降级比给替身补方法更诚实：这些用例测的是加锁顺序、状态机、历史落盘，
+    不是能力探测。要测探测本身请直接用 ``test_server_probe.py``。
+    """
+    import core.process_manager as _pm
+    from core.server_probe import ServerProbe
+
+    def _stub(path, **options):
+        return ServerProbe(path=str(path), probed=False, error="stubbed by test")
+
+    monkeypatch.setattr(_pm, "probe_server_cached", _stub)
+    return _stub

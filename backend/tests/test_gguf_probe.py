@@ -561,7 +561,7 @@ def test_hostile_gguf_cannot_500_the_capabilities_endpoint(tmp_path):
 
 
 def test_find_companion_files_stops_consuming_the_directory_at_max_entries(tmp_path, monkeypatch):
-    """扫描必须在 max_entries 处停止消费目录迭代器（审计 R3）。
+    """扫描必须在 max_entries 处停止消费目录迭代器。
 
     list(iterdir()) 会先物化全部条目再切片；本函数按模型逐个调用，
     大目录下是 O(n²)。这里通过计数包装 Path.iterdir 的产出钉住"提前停止"。

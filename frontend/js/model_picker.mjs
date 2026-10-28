@@ -43,9 +43,12 @@ export async function open(ctx) {
   wrap.className = 'model-picker';
   wrap.innerHTML = `
     <input type="text" class="input model-picker-search" id="picker-search"
+           role="combobox" aria-expanded="true" aria-controls="picker-list"
+           aria-autocomplete="list" aria-label="${ctx.escapeHtml(t('picker.title'))}"
            placeholder="${ctx.escapeHtml(t('picker.searchHint'))}" />
-    <div class="model-picker-list" id="picker-list"></div>
-    <div class="model-picker-foot" id="picker-foot"></div>
+    <div class="model-picker-list" id="picker-list" role="listbox"
+         aria-label="${ctx.escapeHtml(t('picker.title'))}"></div>
+    <div class="model-picker-foot" id="picker-foot" aria-live="polite"></div>
   `;
 
   const overlay = ctx.showModal(t('picker.title'), wrap, [
@@ -76,22 +79,34 @@ export async function open(ctx) {
       listEl.innerHTML = `<div class="model-picker-empty">${ctx.escapeHtml(
         state.models.length ? t('picker.noMatch') : t('picker.empty')
       )}</div>`;
+      searchEl.removeAttribute('aria-activedescendant');
     } else {
-      listEl.innerHTML = state.rows.map(rowHtml).join('');
-      // 选中态视觉（state.selected 已定，行渲染后同步类；键盘 ↑↓ 与 Enter 都读它）
-      listEl.querySelectorAll('.model-picker-row').forEach((el) => {
-        el.classList.toggle('selected', el.dataset.path === state.selected);
-      });
+      listEl.innerHTML = state.rows.map((model, index) => rowHtml(model, index)).join('');
+      syncSelection();
       listEl.querySelectorAll('.model-picker-row').forEach((el) => {
         // 单击 = 选中并直接切换到编辑器浮层（选择器选完模型的目标只有一个：
         // 配参数，中间的"再点一次打开"是纯损耗）。取消按钮保留退出路径。
         el.addEventListener('click', () => useInEditor(ctx, el.dataset.path));
       });
-      // 键盘导航后的选中行要滚进视野
-      const active = listEl.querySelector('.model-picker-row.selected');
-      if (active) active.scrollIntoView({ block: 'nearest' });
     }
     paintFoot();
+    syncPrimary();
+  }
+
+  function syncSelection() {
+    listEl.querySelectorAll('.model-picker-row').forEach((el) => {
+      const selected = el.dataset.path === state.selected;
+      el.classList.toggle('selected', selected);
+      el.setAttribute('aria-selected', String(selected));
+      if (selected) searchEl.setAttribute('aria-activedescendant', el.id);
+    });
+    const active = listEl.querySelector('.model-picker-row.selected');
+    if (active) active.scrollIntoView({ block: 'nearest' });
+  }
+
+  function syncPrimary() {
+    const primary = overlay.querySelector('.modal-footer .btn-primary');
+    if (primary) primary.disabled = !state.selected;
   }
 
   function moveSelection(delta) {
@@ -100,12 +115,8 @@ export async function open(ctx) {
     const next = Math.min(Math.max(idx + delta, 0), state.rows.length - 1);
     if (next === idx) return;
     state.selected = state.rows[next].path;
-    // 只更新选中类，不重渲染列表（避免丢失滚动位置之外的整页重建）
-    listEl.querySelectorAll('.model-picker-row').forEach((el) => {
-      el.classList.toggle('selected', el.dataset.path === state.selected);
-    });
-    const active = listEl.querySelector('.model-picker-row.selected');
-    if (active) active.scrollIntoView({ block: 'nearest' });
+    // 只更新选中态，不重渲染列表（保留滚动位置）
+    syncSelection();
   }
 
   function paintFoot() {
@@ -141,6 +152,8 @@ export async function open(ctx) {
   });
 
   searchEl.focus();
+  // 加载/空结果时主按钮不可用：点击它只会无声地 return false。
+  syncPrimary();
   listEl.innerHTML = `<div class="model-picker-empty">${ctx.escapeHtml(t('picker.loading'))}</div>`;
 
   let payload = null;
@@ -160,7 +173,7 @@ export async function open(ctx) {
   }
 }
 
-function rowHtml(model) {
+function rowHtml(model, index) {
   const caps = model.capabilities || {};
   const badges = [];
   if (caps.provides_builtin_mtp) badges.push(t('models.badgeBuiltinMtp'));
@@ -174,7 +187,8 @@ function rowHtml(model) {
   ].filter(Boolean);
 
   return `
-    <div class="model-picker-row" data-path="${escapeAttr(model.path)}">
+    <div class="model-picker-row" role="option" aria-selected="false"
+         id="picker-opt-${index}" data-path="${escapeAttr(model.path)}">
       <div class="model-picker-main">
         <div class="model-picker-name">${escapeText(model.filename)}</div>
         <div class="model-picker-facts">${escapeText(facts.join(' · '))}</div>

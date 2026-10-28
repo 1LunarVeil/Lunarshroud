@@ -1,11 +1,12 @@
 # Maintainer handover
 
-Last updated: 2026-10-17 (Asia/Shanghai)
+Last updated: 2026-10-23 (Asia/Shanghai)
 
 ## Read this first
 
 LunarShroud is a Windows desktop launcher for `llama-server.exe`: Tauri shell,
-FastAPI management backend, and static JavaScript frontend. The verified
+FastAPI management backend, static JavaScript frontend, and local knowledge-base/RAG
+services built on the same process manager. The verified
 candidate is `0.9.0-beta.2`, still beta because real model/hardware soak
 coverage is incomplete. [STATUS.md](STATUS.md) owns current facts and blockers;
 this file owns maintenance and recovery steps.
@@ -43,8 +44,13 @@ Run the release checks from the project root:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest --cov=backend --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=75
-node --test frontend\tests\runtime.test.mjs frontend\tests\i18n.test.mjs
-Get-ChildItem frontend\js -File | Where-Object Extension -in '.js', '.mjs' | ForEach-Object { node --check $_.FullName }
+Push-Location frontend
+node --test tests\*.test.mjs
+Get-ChildItem js -File | Where-Object Extension -in '.js', '.mjs' | ForEach-Object { node --check $_.FullName }
+# Start the source backend with LUNARSHROUD_ALLOW_INSECURE_DEV=1 first.
+npm ci
+npm run test:browser
+Pop-Location
 cargo fmt --manifest-path src-tauri\Cargo.toml -- --check
 cargo clippy --manifest-path src-tauri\Cargo.toml --locked -- -D warnings -A linker-messages
 cargo test --manifest-path src-tauri\Cargo.toml --locked
@@ -105,9 +111,11 @@ Post-mortem logs live in `%APPDATA%/LunarShroud/logs/`: `backend.log` records
 backend startup plus every instance lifecycle transition (launch, ready, stop,
 timeout, abnormal exit), and `launcher.log` records shell-side supervision
 events (backend ready, exit, restart, readiness failure, shutdown). The shell
-restarts a crashed backend automatically with the same session token; the
-frontend recovers by refreshing its session and reconnecting, so a single
-restart pair in `launcher.log` with no matching frontend complaint is normal.
+restarts a crashed backend automatically with a **new session ID and token**
+for each generation; `get_backend_session` publishes the new token only after
+the readiness HMAC check succeeds, and the frontend reacquires it before
+reconnecting. A single restart pair in `launcher.log` with no matching frontend
+complaint is normal.
 
 ## Security invariants
 

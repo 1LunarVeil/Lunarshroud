@@ -61,6 +61,10 @@ export async function confirmLaunch(ctx, body) {
     (check) => check.severity === 'error' || check.severity === 'warning'
   );
   if (!notable.length) return true;
+  // off = 只有错误才打断；警告直接放行，不弹“仍然启动”的确认。
+  // strict 由后端把 warning 也算进 blocking，前端不再自行解释策略。
+  const guardrail = result && result.guardrail;
+  if (guardrail === 'off' && blocking.length === 0) return true;
 
   return new Promise((resolve) => {
     let settled = false;
@@ -70,7 +74,8 @@ export async function confirmLaunch(ctx, body) {
         resolve(value);
       }
     };
-    const blocked = blocking.length > 0;
+    const blocked =
+      blocking.length > 0 || (result && result.blocking === true);
     const intro = blocked ? t('preflight.blockedIntro') : t('preflight.warnIntro');
     const actions = blocked
       ? [
@@ -92,11 +97,13 @@ export async function confirmLaunch(ctx, body) {
             onClick: () => done(true),
           },
         ];
+    // 叠加在宿主表单之上：blocked/取消后表单仍然存在，输入不会丢失。
+    // 关闭 X/遮罩同样走 onClose → done(false)，调用方不会永远挂着。
     ctx.showModal(
       t(blocked ? 'preflight.blockedTitle' : 'preflight.warnTitle'),
       `<div class="diag-intro">${ctx.escapeHtml(intro)}</div>${checksHtml(ctx, checks)}`,
       actions,
-      { onClose: () => done(false) }
+      { stack: true, onClose: () => done(false) }
     );
   });
 }
@@ -128,7 +135,8 @@ export async function showDiagnosisModal(ctx, instance, checks) {
         class: 'btn-secondary',
         onClick: () => {
           window.__pendingLogsInstanceId = instance.id;
-          ctx.navigate('logs');
+          window.__pendingObservabilityTab = 'logs';
+  ctx.navigate('observability');
         },
       },
       {

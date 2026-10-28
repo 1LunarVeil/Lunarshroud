@@ -38,7 +38,7 @@ def _is_link_entry(entry: os.DirEntry) -> bool:
     """符号链接或重解析点（junction）—— 扫描与浏览都不得穿越。
 
     Windows 上 os.walk(followlinks=False) 管不住 junction（把它当普通目录下钻，
-    审计 W2 已实证）；可靠判据是 follow_symlinks=False 的 stat 上的
+    已实证）；可靠判据是 follow_symlinks=False 的 stat 上的
     FILE_ATTRIBUTE_REPARSE_POINT。取不到属性时按链接处理（fail closed）。
     """
     try:
@@ -60,7 +60,7 @@ def scan_models(
     """递归扫描目录下的 .gguf 文件。
 
     不会穿过 junction / 符号链接（Windows 上 followlinks=False 管不住 junction，
-    审计 W2 已实证），改为手动遍历以便逐目录判型。
+    已实证），改为手动遍历以便逐目录判型。
 
     Args:
         directory: 扫描根目录

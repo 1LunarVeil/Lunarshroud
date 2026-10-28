@@ -47,7 +47,7 @@ def cleanup_orphan_tmp_files(
     """删除中断遗留的写入临时件（形如 ``.<目标名>.<随机>.tmp``），返回删除数。
 
     atomic_write_json 在 mkstemp 与 os.replace 之间崩溃会留下孤儿 .tmp；
-    启动时顺手清理，防止 data/ 里的残留无限积攒（审计 F19 / R5）。
+    启动时顺手清理，防止 data/ 里的残留无限积攒。
     只清够旧的：新的 tmp 可能属于另一个正在写入的进程。
     """
     removed = 0

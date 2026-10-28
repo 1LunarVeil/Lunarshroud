@@ -10,6 +10,8 @@ guess which file is authoritative.
 | Remaining risk register and release judgement | [RISK_ASSESSMENT.md](RISK_ASSESSMENT.md) | Probability/impact/evidence/residual risk |
 | Take over development, run, test, or recover deployment | [HANDOVER.md](HANDOVER.md) | Operational handover |
 | Design and component boundaries | [ARCHITECTURE.md](ARCHITECTURE.md) | System map |
+| Model manifests and runtime profiles | [MANIFEST_AND_RUNTIME_MODEL.md](MANIFEST_AND_RUNTIME_MODEL.md) | Optional model.yaml/manifest.json and lunarshroud-runtime.json; runtime selection, defaults precedence/source tags, API and security budgets |
+| Offline contract | [OFFLINE.md](OFFLINE.md) | No remote runtime assets or telemetry; Tauri CSP and loopback-only policy; automated guard |
 | Build a Windows package | [BUILDING.md](BUILDING.md) | Build procedure |
 | Decide whether a release can publish | [RELEASE.md](RELEASE.md) | Release gate |
 | Trust boundaries and residual risk | [SECURITY_MODEL.md](SECURITY_MODEL.md) | Security design |

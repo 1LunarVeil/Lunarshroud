@@ -3,6 +3,7 @@
 // 新建/编辑/克隆/删除/导入/导出/Diff
 
 import { t, localizeBackendError } from './i18n.mjs';
+import { createRequestGate, scheduleObjectUrlRevoke, setButtonBusy } from './runtime.mjs';
 import { renderList, emptyStateHtml } from './panel_views.mjs';
 
 export const id = 'presets';
@@ -12,6 +13,7 @@ let ctx = null;
 let root = null;
 let presets = [];
 let selectedId = null;
+const detailGate = createRequestGate();
 let locale = 'zh-CN';
 
 export function init(el, appCtx) {
@@ -21,7 +23,7 @@ export function init(el, appCtx) {
   root.innerHTML = `
     <div class="page-header">
       <div>
-        <div class="page-title">${ctx.escapeHtml(t('presets.title'))}</div>
+        <h1 class="page-title">${ctx.escapeHtml(t('presets.title'))}</h1>
         <div class="page-subtitle">${ctx.escapeHtml(t('presets.subtitle'))}</div>
       </div>
       <div class="page-actions">
@@ -39,12 +41,14 @@ export function init(el, appCtx) {
   // 避免每次 renderDetail() 都重新绑定一遍
   root.querySelector('#preset-detail').addEventListener('click', (e) => {
     const btn = e.target.closest('[data-action]');
-    if (btn) handleAction(btn.dataset.action, btn.dataset.id);
+    if (btn) handleAction(btn.dataset.action, btn.dataset.id, btn);
   });
 }
 
 export function onShow() { refresh(); }
-export function onHide() {}
+export function onHide() {
+  detailGate.cancel();
+}
 
 function displayName(p) {
   return (locale === 'en-US' && p.name_en) ? p.name_en : p.name;
@@ -100,22 +104,29 @@ export function renderPanel(el) {
 async function renderDetail() {
   const el = root.querySelector('#preset-detail');
   if (!selectedId) {
+    detailGate.cancel();
     el.innerHTML = `<div class="card">${emptyStateHtml(ctx, { icon: 'bookmark', title: t('presets.selectHint'), sub: t('presets.selectHintSub') })}</div>`;
     return;
   }
   const p = presets.find((x) => x.id === selectedId);
   if (!p) {
+    detailGate.cancel();
     el.innerHTML = '';
     return;
   }
-  // 获取完整预设（含 params）
+  // 获取完整预设（含 params）。请求代次防止快速点击 A→B 时 A 的慢响应
+  // 覆盖 B 的正文与操作按钮。
+  const requestedId = selectedId;
+  const request = detailGate.begin();
   let full;
   try {
-    full = await ctx.Api.getPreset(selectedId);
+    full = await ctx.Api.getPreset(requestedId);
   } catch (e) {
+    if (!detailGate.isCurrent(request) || selectedId !== requestedId) return;
     el.innerHTML = `<div class="card">${ctx.escapeHtml(t('presets.loadFailed'))}: ${ctx.escapeHtml(localizeBackendError(e.message))}</div>`;
     return;
   }
+  if (!detailGate.isCurrent(request) || selectedId !== requestedId) return;
   const params = full.params || {};
   const keys = Object.keys(params);
   const tags = displayTags(full);
@@ -132,19 +143,19 @@ async function renderDetail() {
       </div>
       ${displayDescription(full) ? `<div class="text-muted mb-2">${ctx.escapeHtml(displayDescription(full))}</div>` : ''}
       ${tags.length ? `<div class="mb-2">${tags.map((tag) => `<span class="tag">${ctx.escapeHtml(tag)}</span>`).join('')}</div>` : ''}
-      <div class="text-sm text-muted">ID: <span class="text-mono">${ctx.escapeHtml(full.id)}</span> · ${ctx.escapeHtml(t('presets.createdAt'))} ${ctx.formatTime(full.created_at)}</div>
+      <div class="text-sm text-muted">ID: <span class="text-mono">${ctx.escapeHtml(full.id)}</span> · ${ctx.escapeHtml(t('presets.createdAt'))} ${ctx.formatTime(full.created_at)}${full.runtime_id ? ` · ${ctx.escapeHtml(t('dash.runtime'))}: <span class="text-mono">${ctx.escapeHtml(full.runtime_id)}</span>` : ''}</div>
     </div>
     <div class="card">
       <div class="card-header">
         <span class="card-title">${ctx.escapeHtml(t('presets.paramDetail', { count: keys.length }))}</span>
-        <button class="btn btn-sm btn-ghost" id="btn-copy-params" style="margin-left:auto;">${ctx.escapeHtml(t('presets.copyJson'))}</button>
+        <button class="btn btn-sm btn-ghost" id="btn-copy-params" ml-auto>${ctx.escapeHtml(t('presets.copyJson'))}</button>
       </div>
       <div class="table-wrap">
         <table class="table">
           <thead><tr><th>${ctx.escapeHtml(t('presets.param'))}</th><th>${ctx.escapeHtml(t('presets.value'))}</th></tr></thead>
           <tbody>
             ${keys.map((k) => `
-              <tr><td class="text-mono">${ctx.escapeHtml(k)}</td><td class="text-mono" style="word-break:break-all;">${ctx.escapeHtml(JSON.stringify(params[k]))}</td></tr>
+              <tr><td class="text-mono">${ctx.escapeHtml(k)}</td><td class="text-mono" break-all>${ctx.escapeHtml(JSON.stringify(params[k]))}</td></tr>
             `).join('')}
           </tbody>
         </table>
@@ -156,7 +167,17 @@ async function renderDetail() {
   });
 }
 
-async function handleAction(action, id) {
+async function handleAction(action, id, button) {
+  const mutating = action === 'clone' || action === 'delete';
+  if (mutating) setButtonBusy(button, true);
+  try {
+    await handleActionInner(action, id);
+  } finally {
+    if (mutating) setButtonBusy(button, false);
+  }
+}
+
+async function handleActionInner(action, id) {
   const p = presets.find((x) => x.id === id);
   if (!p) {
     // 列表刚刷新过，按钮携带的旧 id 已失效；刷新列表让 UI 与数据对齐
@@ -175,10 +196,11 @@ async function handleAction(action, id) {
       break;
     }
     case 'clone': {
-      const name = prompt(t('presets.clonePrompt'), `${displayName(p)} ${t('presets.copySuffix')}`);
+      const fallback = `${displayName(p)} ${t('presets.copySuffix')}`;
+      const name = await promptCloneName(fallback);
       if (name === null) return;
       try {
-        await ctx.Api.clonePreset(id, name || `${displayName(p)} ${t('presets.copySuffix')}`);
+        await ctx.Api.clonePreset(id, name || fallback);
         ctx.showToast(t('presets.cloned'), 'success');
         refresh();
       } catch (e) {
@@ -195,7 +217,7 @@ async function handleAction(action, id) {
         a.href = url;
         a.download = `${id}.json`;
         a.click();
-        URL.revokeObjectURL(url);
+        scheduleObjectUrlRevoke(url, (value) => URL.revokeObjectURL(value), 1000);
         ctx.showToast(t('presets.exported'), 'success', 1500);
       } catch (e) {
         ctx.showToast(`${t('presets.exportFailed')}: ${localizeBackendError(e.message)}`, 'error');
@@ -215,6 +237,37 @@ async function handleAction(action, id) {
       break;
     }
   }
+}
+
+/** 克隆预设名输入：用应用内浮层，避免原生 prompt 与主题/焦点体系脱节。 */
+function promptCloneName(defaultName) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    ctx.showModal(
+      t('presets.clone'),
+      `<div class="form-group">
+        <label class="form-label" for="clone-name">${ctx.escapeHtml(t('presets.clonePrompt'))}</label>
+        <input type="text" class="input" id="clone-name" value="${ctx.escapeHtml(defaultName)}"/>
+      </div>`,
+      [
+        { label: t('app.cancel'), class: 'btn-secondary', onClick: () => done(null) },
+        {
+          label: t('presets.clone'),
+          class: 'btn-primary',
+          onClick: () => {
+            const value = document.getElementById('clone-name')?.value.trim() || defaultName;
+            done(value);
+          },
+        },
+      ],
+      { onClose: () => done(null) }
+    );
+  });
 }
 
 // ========== 新建/编辑 Modal ==========
@@ -240,7 +293,7 @@ async function openEditModal(existing) {
     </div>
     <div class="form-group">
       <label class="form-label">${ctx.escapeHtml(t('presets.paramsJson'))}</label>
-      <textarea class="textarea" id="e-params" style="min-height:200px; font-family:var(--font-mono); font-size:12px;">${ctx.escapeHtml(init)}</textarea>
+      <textarea class="textarea" id="e-params" mono-editor>${ctx.escapeHtml(init)}</textarea>
       <div class="form-help">${ctx.escapeHtml(t('presets.jsonHint'))}</div>
     </div>
   `;
@@ -294,7 +347,7 @@ function openImportModal() {
   const body = `
     <div class="form-group">
       <label class="form-label">${ctx.escapeHtml(t('presets.pasteJson'))}</label>
-      <textarea class="textarea" id="i-json" style="min-height:200px; font-family:var(--font-mono); font-size:12px;" placeholder='{"name":"...","params":{...}}'></textarea>
+      <textarea class="textarea" id="i-json" mono-editor placeholder='{"name":"...","params":{...}}'></textarea>
     </div>
     <div class="form-group">
       <label class="form-label">${ctx.escapeHtml(t('presets.orUpload'))}</label>
@@ -330,6 +383,10 @@ async function doImport(bodyEl) {
     jsonStr = bodyEl.querySelector('#i-json').value.trim();
   }
   if (!jsonStr) { ctx.showToast(t('presets.noJson'), 'warning'); return; }
+  // 从记事本/PowerShell 复制粘贴进来的 JSON 常带前导 BOM：File.text() 会按
+  // 规范剥掉它，但 textarea 这条路不会，而 JSON.parse("\uFEFF{}") 是直接抛的。
+  // 剥一次两种来源都安全。
+  jsonStr = jsonStr.replace(/^\uFEFF/, '');
   if (new Blob([jsonStr]).size > maxBytes) {
     ctx.showToast(t('presets.fileTooLarge'), 'warning');
     return;
@@ -419,7 +476,7 @@ function renderDiff(container, diff) {
     <div class="text-sm text-muted mb-2">
       ${ctx.escapeHtml(t('presets.diffOf', { a: name1, b: name2 }))} · ${ctx.escapeHtml(t('presets.diffSummary', { total: summary.total_params ?? rows.length, changed: changedOnly.length }))}
     </div>
-    <div class="table-wrap" style="max-height:380px; overflow:auto;">
+    <div class="table-wrap" scroll-panel-380>
       <table class="table">
         <thead><tr><th>${ctx.escapeHtml(t('presets.param'))}</th><th>${ctx.escapeHtml(t('presets.presetA'))}</th><th>${ctx.escapeHtml(t('presets.presetB'))}</th></tr></thead>
         <tbody>
@@ -427,8 +484,8 @@ function renderDiff(container, diff) {
             const cls = r.changed ? 'changed' : '';
             return `<tr class="${cls}">
               <td class="text-mono">${ctx.escapeHtml(r.param)}<br/><span class="text-muted text-sm">${ctx.escapeHtml(r.label || '')}</span></td>
-              <td class="text-mono" style="word-break:break-all;">${ctx.escapeHtml(JSON.stringify(r.value1 ?? '—'))}</td>
-              <td class="text-mono" style="word-break:break-all;">${ctx.escapeHtml(JSON.stringify(r.value2 ?? '—'))}</td>
+              <td class="text-mono" break-all>${ctx.escapeHtml(JSON.stringify(r.value1 ?? '—'))}</td>
+              <td class="text-mono" break-all>${ctx.escapeHtml(JSON.stringify(r.value2 ?? '—'))}</td>
             </tr>`;
           }).join('')}
         </tbody>

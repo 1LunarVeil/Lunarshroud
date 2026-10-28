@@ -109,6 +109,10 @@ CLAUDE.md
 # .claude/settings.local.json 里记着本机用户名与绝对路径，不能进历史
 tmp/
 .claude/
+
+# LM Studio 学习资料（安装副本、.lmstudio 用户数据、截图）。整目录忽略：
+# 里面含会话、凭据、模型清单和第三方二进制，既不是源码也不能发布。
+study/
 # Mimosa 安全插件的会话状态（hook-state/*.json 记录本机绝对路径），同理不进历史、不进镜像
 .mimosa/
 
@@ -125,6 +129,7 @@ tmp/
 # git init 就会被提交（审计已用 git check-ignore 实证）。
 LunarShroud-演进规划.md
 独立代码审计报告.md
+全面审计文档.md
 docs/archive/
 
 # 仓库布局决策：公开仓库在 github/ 里 git init，github/ 本身就是仓库根，

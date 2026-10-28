@@ -99,8 +99,8 @@ instead of leaving a bare exit code.
 - No indexing, chunking, vector store or retrieval UI. That is client-side
   work; embedding a specific vector database here would age badly.
 - No model downloading. v0.7.0's Web UI model manager can download models, but
-  the Chat page embeds that UI in a sandboxed iframe (scripts, forms,
+  Chat's WebUI mode embeds that UI in a sandboxed iframe (scripts, forms,
   same-origin) which does not include downloads — use the external-browser
   button in the Chat toolbar for that, or the launcher's own model library page
-  to inspect what is already on disk.
+  to inspect what is already on disk. Native Chat is the default mode.
 - No built-in presets or tuned VRAM tiers, for the drift reason above.

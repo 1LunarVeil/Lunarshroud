@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "quit-app"
+description = "Allow the main window to request a complete application shutdown"
+commands.allow = ["quit_app"]

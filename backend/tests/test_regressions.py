@@ -312,7 +312,7 @@ def test_unconfigured_server_path_executes_nothing_even_from_the_app_dir(
 ):
     """未配置时**什么都不执行** —— 即使应用目录里躺着 llama-server.exe。
 
-    这条是 F3 的补漏（audit 第三轮 C 自检发现）。原先默认值是裸文件名
+    这条是对一个已知漏网的补漏。原先默认值是裸文件名
     "llama-server.exe"，而 resolve_server_path 的第一站是 BACKEND_DIR ——
     打包态下那就是用户可写的 <安装目录>\backend，于是 main.py 的预热线程会在
     每次启动、零交互地执行一个从未被用户选定的文件。
@@ -416,7 +416,7 @@ def test_non_loopback_llama_server_requires_api_key(monkeypatch, tmp_path):
 
 
 def test_whitespace_or_empty_host_is_normalized_before_any_consumer(monkeypatch, tmp_path):
-    """能过校验的 host 写法必须与消费点看到的一致（审计 W5 的实测形态）。
+    """能过校验的 host 写法必须与消费点看到的一致（实测形态）。
 
     `effective_host_and_key` 先 strip 再校验，而 `start_instance` 读 params 原样值：
     `" 127.0.0.1 "` 校验通过但 socket.getaddrinfo 直接失败；空串走的是"默认回环"
@@ -1309,7 +1309,7 @@ def test_config_write_failure_preserves_the_previous_file(monkeypatch, tmp_path)
 
 
 def test_concurrent_update_config_does_not_lose_updates(monkeypatch, tmp_path):
-    """并发调用 update_config 不能静默丢更新（审计 R4）。
+    """并发调用 update_config 不能静默丢更新。
 
     修复前：两个线程各自 read-modify-write，后落盘者基于同一份旧快照，
     把先落盘者的键覆盖回去。这里用 barrier 对齐起点 + 慢 save 放大窗口，
@@ -1348,7 +1348,7 @@ def test_concurrent_update_config_does_not_lose_updates(monkeypatch, tmp_path):
 
 
 def test_stale_atomic_tmp_files_are_swept_on_config_load(monkeypatch, tmp_path):
-    """中断遗留的 .tmp 写入件在配置加载时被清扫；新鲜的绝不误删（审计 R5）。"""
+    """中断遗留的 .tmp 写入件在配置加载时被清扫；新鲜的绝不误删。"""
     import config as backend_config
 
     stale = tmp_path / ".config.json.old123.tmp"
@@ -1415,6 +1415,10 @@ def test_restart_does_not_launch_a_replacement_when_stop_failed(monkeypatch):
     """A failed stop must not create a second process on the same model/port."""
     from core.process_manager import Instance, InstanceStatus, ProcessManager
 
+    class LiveProcess:
+        def poll(self):
+            return None
+
     instance = Instance(
         id="restart-safety",
         name="restart-safety",
@@ -1424,6 +1428,7 @@ def test_restart_does_not_launch_a_replacement_when_stop_failed(monkeypatch):
         argv=[],
         command_string="",
         status=InstanceStatus.RUNNING,
+        process=LiveProcess(),
     )
     pm = ProcessManager()
     pm._instances[instance.id] = instance
@@ -1481,7 +1486,7 @@ def test_failed_command_build_releases_the_reserved_port(monkeypatch, tmp_path):
     assert manager.list_instances() == []
 
 
-def test_launch_callback_runs_before_monitor_thread(monkeypatch, tmp_path):
+def test_launch_callback_runs_before_monitor_thread(monkeypatch, tmp_path, stub_launch_probe):
     """启动历史等回调必须先于监控线程执行，秒退实例才不会丢失状态同步。"""
     import core.process_manager as process_manager
     from core.process_manager import ProcessManager
@@ -1585,6 +1590,120 @@ def test_corrupt_config_is_backed_up_and_rebuilt(monkeypatch, tmp_path):
     assert json.loads(config_file.read_text(encoding="utf-8"))["launcher_port"] == 17520
 
 
+@pytest.mark.parametrize(
+    ("case", "suffix"),
+    [("ansi-gbk", "ansi"), ("invalid-utf8", "garbage")],
+)
+def test_non_utf8_config_is_quarantined_not_fatal(monkeypatch, tmp_path, case, suffix):
+    """编码不对的 config.json 必须走隔离重建，而不是把后端钉死在导入期。
+
+    ``UnicodeDecodeError`` 既不是 ``json.JSONDecodeError`` 也不是 ``OSError``，
+    所以只捕获那两者的旧实现会让它一路穿透：``main`` 在**导入期**就调用
+    ``get_config()`` 求 LISTENING_PORT / 可信来源表，于是 uvicorn 连监听都没
+    建立，用户只看到"后端进程启动失败"，配置也既没隔离也没恢复。
+    记事本以 ANSI(GBK) 保存过含中文路径的配置就能触发。
+
+    刻意不含 UTF-16：那是**可解**的，由下面的 salvaged 用例负责。
+    """
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    import config as backend_config
+
+    payload = backend_config.DEFAULT_CONFIG.copy()
+    payload["llama_server_path"] = "D:/工具/llama-server.exe"
+    payload["launcher_port"] = 18123
+    if case == "ansi-gbk":
+        raw = json.dumps(payload, ensure_ascii=False).encode("gbk")
+    else:
+        # 0xC0/0xC1 是 UTF-8 里永不出现的续字节，任何解码器都不可能误判成"可解"
+        raw = bytes([0xC0, 0xC1]) + json.dumps(payload).encode("utf-8")
+    config_file = tmp_path / "config.json"
+    config_file.write_bytes(raw)
+
+    monkeypatch.setattr(backend_config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(backend_config, "PRESETS_DIR", tmp_path / "presets")
+    monkeypatch.setattr(backend_config, "CONFIG_FILE", config_file)
+    monkeypatch.setattr(backend_config, "_config", None)
+
+    cfg = backend_config.get_config()
+
+    assert cfg["launcher_port"] == 17520, "隔离后应回到默认配置"
+    quarantined = tmp_path / "config.json.corrupt"
+    assert quarantined.exists(), f"{suffix} 编码的配置没有被隔离"
+    assert quarantined.read_bytes() == raw, "原件字节必须原样保留供用户找回配置"
+    assert json.loads(config_file.read_text(encoding="utf-8"))["launcher_port"] == 17520
+
+
+def test_utf16_config_is_salvaged_not_discarded(monkeypatch, tmp_path):
+    """带 BOM 的 UTF-16 配置里用户的设置必须**读出来**，不能当损坏丢弃。
+
+    隔离保留原件是对的，但能解出来就别丢 —— 否则"用记事本另存为 Unicode"
+    这种 innocuous 操作会静默清空端口/主题/模型目录。
+    """
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    import config as backend_config
+
+    payload = backend_config.DEFAULT_CONFIG.copy()
+    payload["llama_server_path"] = "D:/工具/llama-server.exe"
+    payload["launcher_port"] = 18123
+    config_file = tmp_path / "config.json"
+    config_file.write_bytes(json.dumps(payload, ensure_ascii=False).encode("utf-16"))
+
+    monkeypatch.setattr(backend_config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(backend_config, "PRESETS_DIR", tmp_path / "presets")
+    monkeypatch.setattr(backend_config, "CONFIG_FILE", config_file)
+    monkeypatch.setattr(backend_config, "_config", None)
+
+    cfg = backend_config.get_config()
+
+    assert cfg["llama_server_path"] == "D:/工具/llama-server.exe"
+    assert not (tmp_path / "config.json.corrupt").exists(), "可解的 UTF-16 被误判为损坏"
+
+
+def test_backend_import_survives_an_undecodable_config(monkeypatch, tmp_path):
+    """``import main`` 这条真实启动链不能被编码问题打断。
+
+    只测 ``_load_config_from_file`` 的纯函数不够 —— 必须证明导入期的
+    ``_configured_launcher_port()`` 拿到的是一个可用的值。
+    """
+    import subprocess
+    import sys
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    import config as backend_config
+
+    payload = backend_config.DEFAULT_CONFIG.copy()
+    payload["default_model_dir"] = "D:/模型库"
+    (tmp_path / "config.json").write_bytes(
+        json.dumps(payload, ensure_ascii=False).encode("gbk")
+    )
+    backend_dir = str(Path(__file__).resolve().parents[1])
+    script = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {backend_dir!r})\n"
+        "import config\n"
+        "config.DATA_DIR = Path(sys.argv[1])\n"
+        "config.PRESETS_DIR = config.DATA_DIR / 'presets'\n"
+        "config.CONFIG_FILE = config.DATA_DIR / 'config.json'\n"
+        "config._config = None\n"
+        "import main\n"
+        "assert 1 <= main.LISTENING_PORT <= 65535, main.LISTENING_PORT\n"
+        "print('IMPORT_OK', main.LISTENING_PORT)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+    )
+    assert "IMPORT_OK" in result.stdout, (
+        f"rc={result.returncode}\nSTDOUT:{result.stdout}\nSTDERR:{result.stderr}"
+    )
+    assert (tmp_path / "config.json.corrupt").exists()
+
+
 def test_update_config_never_exposes_empty_singleton(monkeypatch, tmp_path):
     """更新配置期间，并发读者不能看到空 dict。
 
@@ -1616,7 +1735,7 @@ def test_update_config_never_exposes_empty_singleton(monkeypatch, tmp_path):
                 return
             # 采样器必须显式让出 GIL：四个全速自旋的读者会把写者按进亚毫秒
             # 时间片 —— 实测 200 次更新从 0.34s 被拖到 109s，套件时长随之
-            # 出现 10 倍抖动（审计 §7）。1ms 采样对任何 ≥1ms 的暴露窗口仍是
+            # 出现 10 倍抖动。1ms 采样对任何 ≥1ms 的暴露窗口仍是
             # 必中；两行紧邻的微秒级窗口本来就无法被并发调度命中（GIL 下
             # 写者不释放解释器，读者根本没有插入机会），钉住长窗口即可
             # （例如 clear() 与 update() 之间插入了 I/O 的回归形态）。
@@ -1638,7 +1757,7 @@ def test_update_config_never_exposes_empty_singleton(monkeypatch, tmp_path):
 
 
 def test_restart_and_relaunch_wire_launch_history(monkeypatch):
-    """重启 / 历史重启必须写启动历史（独立审计 M1）。
+    """重启 / 历史重启必须写启动历史。
 
     两条端点此前都不传 on_launched：重启世代在历史页无迹可查，与页面承诺
     "记录每次启动的参数快照与状态"不符。这里钉住接线本身：端点把
@@ -1699,14 +1818,14 @@ def test_restart_and_relaunch_wire_launch_history(monkeypatch):
 
     restarted = client.post("/api/instances/gen-1/restart", headers=headers)
     assert restarted.status_code == 200
-    assert len(recorded) == 1, "restart 未写启动历史（审计 M1）"
+    assert len(recorded) == 1, "restart 未写启动历史"
     assert recorded[0]["instance_id"] == "gen-2"
     assert recorded[0]["status"] == "starting"
 
     relaunched = client.post("/api/history/7/relaunch", headers=headers)
     assert relaunched.status_code == 200
-    assert len(recorded) == 2, "relaunch 未写启动历史（审计 M1）"
-    # relaunch 语义 = "照这份记录再起一个"：不沿用记录里的端口（独立复核 N2），
+    assert len(recorded) == 2, "relaunch 未写启动历史"
+    # relaunch 语义 = "照这份记录再起一个"：不沿用记录里的端口，
     # 否则对仍在运行的世代点重启会撞 400「端口被占用」。
     assert seen_params and "port" not in seen_params[0], (
         f"relaunch 重放了记录端口: {seen_params}"
@@ -1715,7 +1834,7 @@ def test_restart_and_relaunch_wire_launch_history(monkeypatch):
 
 def test_bom_prefixed_config_is_read_not_reset(monkeypatch, tmp_path):
     """UTF-8 BOM 的 config.json（记事本 / Set-Content utf8 产物）必须能读，
-    而不是被当损坏整体重建默认值（独立审计 L2）。"""
+    而不是被当损坏整体重建默认值。"""
     import config as backend_config
 
     config_file = tmp_path / "config.json"
@@ -1734,7 +1853,7 @@ def test_bom_prefixed_config_is_read_not_reset(monkeypatch, tmp_path):
 
 
 def test_instance_log_files_rotate_and_die_with_the_instance(monkeypatch, tmp_path):
-    """实例日志必须有大小上限且随实例删除清理（独立审计 L1）。"""
+    """实例日志必须有大小上限且随实例删除清理。"""
     import core.process_manager as pm
     from core.process_manager import Instance, InstanceStatus, LogEntry
 
@@ -1766,7 +1885,7 @@ def test_instance_log_files_rotate_and_die_with_the_instance(monkeypatch, tmp_pa
 
 
 def test_pruning_terminal_instances_cleans_their_log_files(monkeypatch, tmp_path):
-    """终态剪枝掉的历史实例，其落盘日志一并清理（独立审计 L1）。"""
+    """终态剪枝掉的历史实例，其落盘日志一并清理。"""
     import core.process_manager as pm
     from core.process_manager import Instance, InstanceStatus
 
@@ -2110,7 +2229,9 @@ def test_switch_integer_values_behave_like_booleans():
         )
 
 
-def test_start_instance_holds_operation_lock_during_launch(monkeypatch, tmp_path):
+def test_start_instance_holds_operation_lock_during_launch(
+    monkeypatch, tmp_path, stub_launch_probe
+):
     """启动子进程期间必须持有 _operation_lock，与 stop 互斥。
 
     否则 stop 落在 _stop_event.clear() 与 Popen 之间时，会去 terminate 一个
@@ -2428,7 +2549,7 @@ def test_describe_probe_failure_points_at_the_right_suspect():
 def test_ws_instance_logs_streams_history_and_live_lines(monkeypatch):
     """/ws/instances/{id}/logs：先推历史，再推新日志；未知实例关 1008。
 
-    这条端点此前是 0% 覆盖（audit §7）：认证拒绝、关闭码、日志订阅全无测试。
+    这条端点此前是 0% 覆盖：认证拒绝、关闭码、日志订阅全无测试。
     """
     import main as backend_main
     from core.process_manager import Instance, LogEntry
@@ -2486,7 +2607,7 @@ def test_ws_instance_logs_streams_history_and_live_lines(monkeypatch):
 def test_scrub_legacy_secrets_removes_plaintext_keys_from_history(monkeypatch, tmp_path):
     """旧版把 api_key 明文写进 history.db；这条迁移是隐私回归的唯一防线。
 
-    它此前是 0% 覆盖（audit §7）—— 意味着改坏了也不会有人发现。
+    它此前是 0% 覆盖 —— 意味着改坏了也不会有人发现。
     """
     import json as _json
 
@@ -2890,8 +3011,42 @@ def test_nvidia_smi_is_resolved_to_an_absolute_path_or_disabled(monkeypatch):
     assert monitor.get_gpu_processes() == []
 
 
-def test_system_tools_are_disabled_without_systemroot(monkeypatch):
-    """SystemRoot 缺失时必须禁用系统工具，绝不退回裸名（AGENTS §2.1）。
+def test_system_tools_ignore_a_forged_systemroot(monkeypatch, tmp_path):
+    """伪造 ``SystemRoot`` 不能把系统工具指向用户可写目录。
+
+    旧实现 ``os.path.join(os.environ["SystemRoot"], "System32", name)`` 返回的
+    是一个**绝对路径**，所以"必须走绝对路径"的防线完全失效：绝对路径只在根
+    路径可信时才有意义。外壳侧用 GetSystemDirectoryW，后端必须对齐。
+    """
+    if os.name != "nt":
+        pytest.skip("Windows-specific invariant")
+
+    from core import gpu_monitor, server_probe
+
+    planted = tmp_path / "System32"
+    planted.mkdir()
+    (planted / "taskkill.exe").write_bytes(b"MZ planted")
+    (planted / "nvidia-smi.exe").write_bytes(b"MZ planted")
+    monkeypatch.setenv("SystemRoot", str(tmp_path))
+    monkeypatch.setenv("windir", str(tmp_path))
+
+    taskkill = server_probe.system_tool("taskkill.exe")
+    nvidia = gpu_monitor.system_tool("nvidia-smi.exe")
+
+    assert taskkill is not None and nvidia is not None
+    assert not str(taskkill).lower().startswith(str(tmp_path).lower()), (
+        f"taskkill 解析进了被伪造的 SystemRoot：{taskkill}"
+    )
+    assert not str(nvidia).lower().startswith(str(tmp_path).lower()), (
+        f"nvidia-smi 解析进了被伪造的 SystemRoot：{nvidia}"
+    )
+    assert os.path.normcase(os.path.dirname(str(taskkill))) == os.path.normcase(
+        server_probe._windows_system_dir() or ""
+    )
+
+
+def test_system_tools_are_disabled_when_the_system_dir_is_unavailable(monkeypatch):
+    """系统目录取不到时必须禁用系统工具，绝不退回裸名（AGENTS §2.1）。
 
     裸名会走 CreateProcess 搜索序，应用目录与 CWD 都排在 System32 之前，
     而这两个位置在便携/CurrentUser 安装下都是用户可写的。旧实现此时返回
@@ -2903,12 +3058,171 @@ def test_system_tools_are_disabled_without_systemroot(monkeypatch):
 
     from core import gpu_monitor, server_probe
 
-    monkeypatch.delenv("SystemRoot", raising=False)
-    monkeypatch.delenv("windir", raising=False)
+    monkeypatch.setattr(server_probe, "_windows_system_dir", lambda: None)
     assert server_probe.system_tool("taskkill.exe") is None
     assert gpu_monitor.system_tool("nvidia-smi.exe") is None
     monkeypatch.setattr(gpu_monitor, "which_on_path", lambda name: None)
     assert gpu_monitor._nvidia_smi() is None
+
+
+def test_non_windows_system_tools_stay_disabled():
+    """非 Windows 上系统工具恒为 None —— 没有 System32，也不能退到裸名搜索。"""
+    if os.name == "nt":
+        pytest.skip("non-Windows branch")
+
+    from core import server_probe
+
+    assert server_probe.system_tool("taskkill.exe") is None
+
+
+def test_bom_prefixed_preset_is_listed_and_readable(monkeypatch, tmp_path, caplog):
+    """带 BOM 的预设必须照常出现，且坏预设要留下日志。
+
+    预设读写用 ``utf-8`` 而配置/清单用 ``utf-8-sig``：用户用记事本"UTF-8"
+    另存过一次，``json.load`` 抛 JSONDecodeError，``list_presets`` 的 except
+    再把它静默跳过 —— 文件还在盘上，UI 里却凭空少一个预设，而且没有任何
+    线索指向真正的原因。
+    """
+    import logging
+
+    from core import preset_store
+
+    presets_dir = tmp_path / "presets"
+    presets_dir.mkdir()
+    monkeypatch.setattr(preset_store, "PRESETS_DIR", presets_dir)
+
+    payload = {"id": "bom_preset", "name": "带 BOM", "params": {"ctx_size": 4096}}
+    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    (presets_dir / "bom_preset.json").write_bytes(b"\xef\xbb\xbf" + raw)
+    (presets_dir / "good.json").write_bytes(
+        json.dumps({**payload, "id": "good"}).encode("utf-8")
+    )
+    (presets_dir / "broken.json").write_text("{not valid json", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="lunarshroud.presets"):
+        listed = preset_store.list_presets()
+
+    assert {p["id"] for p in listed} == {"bom_preset", "good"}, (
+        "带 BOM 的预设被静默丢弃，或坏预设连带拖垮了列表"
+    )
+    got = preset_store.get_preset("bom_preset")
+    assert got is not None, "get_preset 读不了带 BOM 的文件"
+    assert got["params"]["ctx_size"] == 4096
+    assert "broken.json" in caplog.text, "跳过的预设没有任何可见记录"
+
+
+def test_branching_at_the_conversation_cap_refuses_and_never_deletes_the_source(
+    monkeypatch, tmp_path
+):
+    """分支也是新建会话；达到上限时必须拒绝，而不是删掉任何旧会话。
+
+    旧实现会把最旧的会话（很可能正是用户正在分支的源）删掉来腾位。现在
+    分支在配额已满时返回可读错误，源会话及其消息保持不变。
+    """
+    from core import chat_store
+
+    monkeypatch.setattr(chat_store, "CHATS_DB", tmp_path / "chats.db")
+    chat_store._initialized_paths.clear()
+    chat_store.init_db()
+    monkeypatch.setattr(chat_store, "MAX_CONVERSATIONS", 6)
+
+    created = [chat_store.create_conversation(f"c{i}")["id"] for i in range(6)]
+    chat_store.append_message(created[0], "user", "要保住的那条思考")
+
+    with pytest.raises(ValueError, match="conversation limit"):
+        chat_store.branch_conversation(created[0], None, "分支")
+
+    source = chat_store.get_conversation(created[0])
+    assert len(source["messages"]) == 1, "源会话的消息被分支操作清掉了"
+    assert len(chat_store.list_conversations(limit=100)) == 6
+
+
+def test_launch_probes_a_cold_cache_so_unsupported_flags_never_reach_argv(tmp_path):
+    """冷缓存下点启动，必须先探测再决定写哪些 flag。
+
+    预检在缓存冷时只给一条 info，写着 "flag support will be verified at launch"，
+    而当时的启动路径**同样只读缓存**（``probe_server_cached_only``），
+    ``DefaultGate.supported`` 又对"未知"一律放行 —— 于是那句承诺是假的：
+    用户看到预检没有错误，点启动却在 llama-server 的参数解析阶段死掉，
+    日志只有 ``error: invalid argument: --xxx``，跟模型/显存/端口都不沾边。
+    从没打开过参数页、直接从仪表盘点预设的人最容易撞上。
+    """
+    from core import param_builder, process_manager, server_probe
+
+    # 造一个"本机支持除 --moe-cache-mib 以外的全部面板参数"的假 llama-server。
+    # 选项必须顶格：``parse_help`` 把缩进行当作上一项的续行（全缩进 = 0 个选项）。
+    # 数量也必须够：少于此 ``probe.complete`` 就是 False，
+    # ``DefaultGate.supported`` 会继续"没有依据就别拦"，测不出过滤。
+    from core.param_schema import PARAM_DEFINITIONS
+
+    supported = [
+        meta.cli for meta in PARAM_DEFINITIONS if meta.cli and meta.key != "moe_cache_mib"
+    ]
+    lines = ["common options:"]
+    for slot, flag in enumerate(supported):
+        lines.append(f"{flag} X".ljust(40) + f"supported option {slot}")
+    for index in range(40):
+        lines.append(f"--filler-{index} N".ljust(40) + f"padding {index}")
+    help_text = "\n".join(lines) + "\n"
+
+    impl = tmp_path / "fake_server.py"
+    impl.write_text(
+        "import sys\n"
+        f"if '--help' in sys.argv:\n    print({help_text!r})\n    sys.exit(0)\n"
+        "print('version 1.2.3')\n",
+        encoding="utf-8",
+    )
+    if os.name == "nt":
+        exe = tmp_path / "llama-server.bat"
+        exe.write_text(f'@"{sys.executable}" "{impl}" %*\r\n', encoding="utf-8")
+    else:
+        exe = tmp_path / "llama-server.sh"
+        exe.write_text(
+            f'#!/bin/sh\nexec "{sys.executable}" "{impl}" "$@"\n', encoding="utf-8"
+        )
+        exe.chmod(0o755)
+
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"model")
+    server_probe._CACHE.clear()
+    server_probe._FAILED_CACHE.clear()
+
+    params = {
+        "model": str(model),
+        "host": "127.0.0.1",
+        "port": 18777,
+        "moe_cache_mib": 1024,
+    }
+    assert "--moe-cache-mib" in param_builder.build_argv(params, str(exe)), (
+        "前置条件：冷缓存下这个不被支持的 flag 确实会被写出来"
+    )
+
+    process_manager.ProcessManager()._validate_start(dict(params), str(exe))
+
+    assert server_probe._CACHE, "启动前没有探测，缓存仍然是冷的"
+    argv = param_builder.build_argv(params, str(exe))
+    assert "--moe-cache-mib" not in argv, (
+        f"已探测到不支持，却仍然写进命令行: {argv}"
+    )
+    assert "-m" in argv and str(model) in argv, f"过滤把正常参数一起带走了: {argv}"
+
+
+def test_cold_probe_cache_preflight_is_not_reported_as_information(tmp_path):
+    """冷缓存不能报成 info：预检"没有错误"会被用户当成保证。"""
+    from core import diagnostics, server_probe
+
+    exe = tmp_path / "llama-server.exe"
+    exe.write_bytes(b"MZfake")
+    server_probe._CACHE.clear()
+    server_probe._FAILED_CACHE.clear()
+
+    report = diagnostics.preflight({"model": str(tmp_path / "m.gguf")}, server_path=str(exe))
+    cold = [c for c in report["checks"] if c["code"] == "server_not_probed"]
+    assert cold, f"冷缓存没有产生 server_not_probed 条目: {report['checks']}"
+    assert cold[0]["severity"] != "info", (
+        "冷缓存仍被报成 info —— 预检看起来'没有问题'，"
+        "而不支持的 flag 会一路写到命令行上让启动失败"
+    )
 
 
 def test_probe_server_never_executes_a_relative_name_from_cwd(monkeypatch, tmp_path):
@@ -2925,6 +3239,54 @@ def test_probe_server_never_executes_a_relative_name_from_cwd(monkeypatch, tmp_p
     probe = server_probe.probe_server("planted-probe.exe")
     assert probe.probed is False
     assert "不存在" in (probe.error or "")
+
+
+def test_theme_accepts_system_preference():
+    """前端支持“跟随系统”主题；后端校验必须接受 system，而不是只认 light/dark。"""
+    import config
+
+    candidate = dict(config.DEFAULT_CONFIG)
+    candidate["theme"] = "system"
+    assert config.validate_config(candidate)["theme"] == "system"
+
+    candidate["theme"] = "auto"
+    with pytest.raises(ValueError, match="theme must be"):
+        config.validate_config(candidate)
+
+
+def test_close_to_tray_is_boolean_and_defaults_off():
+    import config
+
+    assert config.DEFAULT_CONFIG["close_to_tray"] is False
+    candidate = dict(config.DEFAULT_CONFIG)
+    candidate["close_to_tray"] = True
+    assert config.validate_config(candidate)["close_to_tray"] is True
+
+    candidate["close_to_tray"] = "yes"
+    with pytest.raises(ValueError, match="close_to_tray must be"):
+        config.validate_config(candidate)
+
+
+def test_launch_guardrail_policy_validation_and_blocking():
+    import config
+    from core.diagnostics import guardrail_blocks
+
+    for policy in ("off", "warn", "strict"):
+        candidate = dict(config.DEFAULT_CONFIG)
+        candidate["launch_guardrail"] = policy
+        assert config.validate_config(candidate)["launch_guardrail"] == policy
+
+    candidate = dict(config.DEFAULT_CONFIG)
+    candidate["launch_guardrail"] = "block-everything"
+    with pytest.raises(ValueError, match="launch_guardrail must be"):
+        config.validate_config(candidate)
+
+    # Errors always block; policy only changes how warnings behave.
+    assert guardrail_blocks("off", 1, 0) is True
+    assert guardrail_blocks("warn", 0, 1) is False
+    assert guardrail_blocks("strict", 0, 1) is True
+    assert guardrail_blocks("off", 0, 1) is False
+    assert guardrail_blocks("unknown", 0, 1) is False
 
 
 def test_unreadable_config_is_not_overwritten_with_defaults(monkeypatch, tmp_path):
@@ -2992,7 +3354,7 @@ def test_nvml_unavailable_memory_sentinel_is_unknown():
 
 
 def test_release_version_is_consistent_across_manifests():
-    """版本号必须在所有发布入口一致（审计 RR6 的 CI 交叉校验）。
+    """版本号必须在所有发布入口一致。
 
     三处声明（tauri.conf.json / Cargo.toml / Cargo.lock）任一处漏改，产物名、
     安装包升级逻辑与文档就会各说各话；CHANGELOG 与 README 是用户看到的版本。
@@ -3020,3 +3382,354 @@ def test_release_version_is_consistent_across_manifests():
     assert f"## [{tauri}]" in changelog, f"CHANGELOG 缺少 {tauri} 小节"
     readme = (root / "README.md").read_text(encoding="utf-8")
     assert f"`{tauri}`" in readme, f"README 未声明当前版本 {tauri}"
+
+
+# ---------------------------------------------------------------------------
+# 思考过程（reasoning）作为一等列
+# ---------------------------------------------------------------------------
+
+
+def _isolated_chat_store(monkeypatch, tmp_path):
+    from core import chat_store
+
+    monkeypatch.setattr(chat_store, "CHATS_DB", tmp_path / "chats.db")
+    chat_store._initialized_paths.clear()
+    chat_store.init_db()
+    return chat_store
+
+
+def test_reasoning_is_stored_in_full_not_truncated_to_the_stats_budget(
+    monkeypatch, tmp_path
+):
+    """思考过程必须有自己的一等列，不能挤在 stats_json 里。
+
+    原先它被塞进 ``stats_json``，而整个 stats 只有 ``MAX_STATS_BYTES``（16 KiB）
+    预算，超了会让整条消息写不进去，所以前端在写入前把它截到 4000 字。后果不是
+    "显示不全"而是**存进去那一刻就永久少了**：流式时看得见全貌，重载后只剩前
+    4000 字，且没有任何提示。
+    """
+    chat_store = _isolated_chat_store(monkeypatch, tmp_path)
+    long_reasoning = "推" * 50_000  # 远超旧的 4000 字上限
+    conversation = chat_store.create_conversation("推理")
+    chat_store.append_message(
+        conversation["id"], "assistant", "结论", reasoning=long_reasoning
+    )
+
+    stored = chat_store.get_conversation(conversation["id"])["messages"][-1]
+    assert stored["reasoning"] == long_reasoning, "思考过程被截断了"
+    # stats 里不再存正文，避免同一个东西两份真相
+    assert "reasoning" not in stored["stats"]
+
+
+def test_reasoning_survives_branching(monkeypatch, tmp_path):
+    """分支必须把思考过程一起复制过去。
+
+    分支是"独立副本"语义（见 branch_conversation 的 docstring）。只复制正文的话，
+    分支出来的会话看不到推理过程，等于分支丢数据。
+    """
+    chat_store = _isolated_chat_store(monkeypatch, tmp_path)
+    conversation = chat_store.create_conversation("源")
+    chat_store.append_message(
+        conversation["id"], "assistant", "答", reasoning="完整的思路链条"
+    )
+
+    branch = chat_store.branch_conversation(conversation["id"], None, "分支")
+    assert branch["messages"][-1]["reasoning"] == "完整的思路链条"
+
+
+def test_editing_an_assistant_answer_clears_its_stale_reasoning(monkeypatch, tmp_path):
+    """改了助手回复的正文，旧思考过程必须能清掉。
+
+    留着的话用户会读到一段推导不出这个结论的思路——比没有更误导。
+    """
+    chat_store = _isolated_chat_store(monkeypatch, tmp_path)
+    conversation = chat_store.create_conversation("会话")
+    message = chat_store.append_message(
+        conversation["id"], "assistant", "原答案", reasoning="原来的思路"
+    )
+
+    chat_store.update_message(conversation["id"], message["id"], "改过的答案", True, "")
+    edited = [
+        m for m in chat_store.get_conversation(conversation["id"])["messages"]
+        if m["id"] == message["id"]
+    ][0]
+    assert edited["content"] == "改过的答案"
+    assert edited["reasoning"] == ""
+
+    # 不传 reasoning（None）时必须保留，否则普通编辑会顺手毁掉思考过程
+    chat_store.update_message(conversation["id"], message["id"], "再改一次")
+    kept = [
+        m for m in chat_store.get_conversation(conversation["id"])["messages"]
+        if m["id"] == message["id"]
+    ][0]
+    assert kept["reasoning"] == ""
+    chat_store.append_message(conversation["id"], "assistant", "带思路", reasoning="思路X")
+    second = chat_store.get_conversation(conversation["id"])["messages"][-1]
+    chat_store.update_message(conversation["id"], second["id"], "带思路改")
+    assert (
+        chat_store.get_conversation(conversation["id"])["messages"][-1]["reasoning"]
+        == "思路X"
+    )
+
+
+def test_reasoning_column_is_backfilled_from_legacy_stats(monkeypatch, tmp_path):
+    """迁移必须把旧库里 stats_json.reasoning 搬进新列。
+
+    不搬的话，用户一升级，历史消息里已有的（被截断的）思考过程就从界面上消失了——
+    那是迁移**引入**的回归，不是迁移要修的问题。
+    """
+    import sqlite3
+
+    db = tmp_path / "chats.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE conversations (id TEXT PRIMARY KEY, title TEXT, instance_id TEXT,"
+        " model TEXT, params_json TEXT, created_at REAL, updated_at REAL)"
+    )
+    conn.execute(
+        "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " conversation_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,"
+        " stats_json TEXT NOT NULL DEFAULT '{}', created_at REAL NOT NULL)"
+    )
+    conn.execute("INSERT INTO conversations VALUES ('c1','旧会话',NULL,NULL,'{}',1,1)")
+    conn.execute(
+        "INSERT INTO messages (conversation_id, role, content, stats_json, created_at)"
+        " VALUES ('c1','assistant','老回复','"
+        + '{"reasoning": "旧的一段被截断的思路"}'
+        + "',1)"
+    )
+    conn.commit()
+    conn.close()
+
+    from core import chat_store
+
+    monkeypatch.setattr(chat_store, "CHATS_DB", db)
+    chat_store._initialized_paths.clear()
+    chat_store.init_db()
+
+    stored = chat_store.get_conversation("c1")["messages"][-1]
+    assert stored["reasoning"] == "旧的一段被截断的思路", "旧数据没有被回填"
+
+
+def test_oversized_reasoning_is_rejected_not_silently_cut(monkeypatch, tmp_path):
+    """超上限要报错，不能悄悄截掉——静默截断正是这次修的问题本身。"""
+    chat_store = _isolated_chat_store(monkeypatch, tmp_path)
+    conversation = chat_store.create_conversation("会话")
+    with pytest.raises(ValueError, match="reasoning is too long"):
+        chat_store.append_message(
+            conversation["id"],
+            "assistant",
+            "x",
+            reasoning="y" * (chat_store.MAX_REASONING_CHARS + 1),
+        )
+
+
+def test_chat_reasoning_config_is_validated():
+    """新配置键必须走白名单校验，坏值不能静默生效。"""
+    import config as backend_config
+
+    assert backend_config.DEFAULT_CONFIG["chat_reasoning"] == "auto"
+    for value in ("auto", "expand", "collapse"):
+        assert (
+            backend_config.validate_config(
+                {**backend_config.DEFAULT_CONFIG, "chat_reasoning": value}
+            )["chat_reasoning"]
+            == value
+        )
+    with pytest.raises(ValueError, match="chat_reasoning"):
+        backend_config.validate_config(
+            {**backend_config.DEFAULT_CONFIG, "chat_reasoning": "whatever"}
+        )
+
+
+# ---------------------------------------------------------------------------
+# 4.1 「有没有可用构建」只留一份真相
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def isolated_runtime_registry(monkeypatch, tmp_path):
+    """把运行环境注册表整个挪进临时目录。"""
+    import config as backend_config
+    from core import runtime_registry
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    monkeypatch.setattr(backend_config, "DATA_DIR", data_dir)
+    monkeypatch.setattr(runtime_registry._config, "DATA_DIR", data_dir)
+    return runtime_registry, data_dir
+
+
+def _fake_server(tmp_path, name="llama-server.exe"):
+    exe = tmp_path / name
+    exe.write_bytes(b"MZfake")
+    return exe
+
+
+def test_legacy_server_path_is_adopted_into_the_registry(
+    isolated_runtime_registry, tmp_path
+):
+    """设置里的裸路径必须被收编成一个 profile，且幂等。
+
+    历史上"用哪个构建"有两份互不知情的真相：``config.llama_server_path`` 是裸
+    字符串，运行环境页是 profile 列表。只用运行环境的人被前端三处判成"没配置"，
+    而填了全局路径的人的构建又不在列表里。收编之后注册表是唯一真相。
+    """
+    runtime_registry, _ = isolated_runtime_registry
+    exe = _fake_server(tmp_path)
+
+    profile = runtime_registry.adopt_legacy_server_path(str(exe))
+    assert profile is not None
+    assert profile["executable_path"] == str(exe.resolve())
+
+    # 幂等：每次启动都会调，不能越积越多
+    assert runtime_registry.adopt_legacy_server_path(str(exe)) is None
+    assert len(runtime_registry.list_runtime_profiles()) == 1
+
+    # 空路径 / 不存在的路径都不该造出一个坏 profile
+    assert runtime_registry.adopt_legacy_server_path("") is None
+    assert runtime_registry.adopt_legacy_server_path(None) is None
+    assert runtime_registry.adopt_legacy_server_path(str(tmp_path / "nope.exe")) is None
+
+
+def test_default_runtime_mirrors_back_to_the_legacy_path_field(
+    isolated_runtime_registry, tmp_path
+):
+    """选了默认运行环境，就要能算出旧字段该显示什么——双向同步的那一半。
+
+    否则运行环境页改了、设置页还显示空，用户永远看不出这两个是同一件事。
+    """
+    runtime_registry, _ = isolated_runtime_registry
+    first = _fake_server(tmp_path, "first.exe")
+    second = _fake_server(tmp_path, "second.exe")
+    profile_a = runtime_registry.register_runtime(first)
+    runtime_registry.register_runtime(second)
+
+    # 没有明确默认项时返回 None：随便挑一个已注册构建写进 llama_server_path，
+    # 等于替用户决定了他没决定的事，还会静默改掉他实际启动的那个构建。
+    assert runtime_registry.sync_default_to_config_path({}) is None
+    assert runtime_registry.sync_default_to_config_path({"defaults": {}}) is None
+
+    runtime_registry.set_runtime_preferences({"defaults": {"gguf": profile_a["id"]}})
+    preferences = runtime_registry.get_runtime_preferences()
+    assert (
+        runtime_registry.sync_default_to_config_path(preferences) == str(first.resolve())
+    )
+
+    # 指向一个已被删除的 profile：返回 None，调用方保持原值
+    assert (
+        runtime_registry.sync_default_to_config_path(
+            {"defaults": {"gguf": "runtime_does_not_exist"}}
+        )
+        is None
+    )
+
+
+def test_preferences_endpoint_mirrors_the_default_runtime_into_config(
+    isolated_runtime_registry, tmp_path, monkeypatch
+):
+    """PUT /api/runtimes/preferences 必须真的把路径写回 config。
+
+    这一步是"改一个另一个随之同步"的落点；只做前端判断而不回写，两处还是会漂开。
+    """
+    import config as backend_config
+    import main as backend_main
+    from fastapi.testclient import TestClient
+
+    runtime_registry, data_dir = isolated_runtime_registry
+    monkeypatch.setattr(backend_config, "DATA_DIR", data_dir)
+    monkeypatch.setattr(backend_config, "CONFIG_FILE", data_dir / "config.json")
+    monkeypatch.setattr(backend_config, "PRESETS_DIR", data_dir / "presets")
+    monkeypatch.setattr(backend_config, "HISTORY_DB", data_dir / "history.db")
+    monkeypatch.setattr(backend_config, "CHATS_DB", data_dir / "chats.db")
+    monkeypatch.setattr(backend_config, "_config", None)
+
+    exe = _fake_server(tmp_path, "cuda.exe")
+    profile = runtime_registry.register_runtime(exe)
+
+    monkeypatch.setattr(backend_main, "SESSION_TOKEN", "mirror-token")
+    monkeypatch.setattr(backend_main, "SESSION_ID", "mirror-session")
+    monkeypatch.setattr(backend_main, "INSECURE_DEV_MODE", False)
+    with TestClient(
+        backend_main.app, headers={"X-LunarShroud-Token": "mirror-token"}
+    ) as client:
+        response = client.put(
+            "/api/runtimes/preferences",
+            json={"defaults": {"gguf": profile["id"]}},
+        )
+        assert response.status_code == 200, response.text
+        config_after = client.get("/api/system/config").json()
+    assert config_after["llama_server_path"] == str(exe.resolve())
+
+
+def test_config_repair_returns_validated_values_when_persisting_the_repair_fails(
+    monkeypatch, tmp_path
+):
+    """A read-only config must not make the process run with invalid values.
+
+    The old behavior returned the unvalidated ``merged`` dict when the repair
+    write failed. That let ``startup_timeout='not-a-number'`` reach the monitor
+    thread and let an invalid launcher_host reach uvicorn.
+    """
+    import config as backend_config
+
+    config_file = tmp_path / "config.json"
+    invalid = dict(backend_config.DEFAULT_CONFIG)
+    invalid["startup_timeout"] = "not-a-number"
+    invalid["launcher_host"] = "0.0.0.0"
+    config_file.write_text(json.dumps(invalid), encoding="utf-8")
+
+    monkeypatch.setattr(backend_config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(backend_config, "PRESETS_DIR", tmp_path / "presets")
+    monkeypatch.setattr(backend_config, "CONFIG_FILE", config_file)
+    monkeypatch.setattr(backend_config, "_config", None)
+    monkeypatch.setattr(backend_config, "_config_load_failed", False)
+
+    def readonly_save(cfg):
+        raise OSError("simulated read-only config")
+
+    monkeypatch.setattr(backend_config, "save_config", readonly_save)
+
+    loaded = backend_config.load_config()
+
+    assert loaded["startup_timeout"] == backend_config.DEFAULT_CONFIG["startup_timeout"]
+    assert loaded["launcher_host"] == "127.0.0.1"
+    assert backend_config._config_load_failed is True
+
+
+def test_restart_dead_failed_instance_is_allowed(monkeypatch):
+    """A failed instance whose process is already gone is restartable.
+
+    Only a stop that leaves a live process must be rejected; the old status-only
+    guard conflated the two and returned 409 for a perfectly dead instance.
+    """
+    from core.process_manager import Instance, InstanceStatus, ProcessManager
+
+    pm = ProcessManager()
+    dead = Instance(
+        id="dead-failed",
+        name="dead",
+        preset_id=None,
+        preset_name=None,
+        params={"model": "x", "port": 8080},
+        argv=[],
+        command_string="",
+        status=InstanceStatus.FAILED,
+        port=8080,
+    )
+    pm._instances[dead.id] = dead
+    launched: list[dict] = []
+
+    class Replacement:
+        id = "replacement"
+
+    def fake_start(**kwargs):
+        launched.append(kwargs)
+        return Replacement()
+
+    monkeypatch.setattr(pm, "start_instance", fake_start)
+
+    result = pm.restart_instance(dead.id)
+
+    assert result.id == "replacement"
+    assert launched and launched[0]["restarted_from"] == dead.id

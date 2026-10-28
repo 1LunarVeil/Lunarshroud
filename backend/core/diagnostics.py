@@ -12,7 +12,8 @@
 
 本模块只读：不写配置、不动数据目录、不启动 llama-server。服务器探测只读缓存
 （``probe_server_cached_only``），因为启动前检查必须快；缓存冷时退化成一条
-info，而不是让用户等 15 秒。
+warning（"这一项还没验证过"），而不是让用户等 15 秒，也不是伪装成一条
+不影响结论的 info。
 """
 from __future__ import annotations
 
@@ -24,7 +25,9 @@ from typing import Any
 
 import config
 
+from core.draft_compat import compare_draft_vocab, manifest_runtime_checks
 from core.gguf_probe import probe_gguf_cached
+from core.model_manifest import manifest_summary
 from core.param_builder import (
     effective_host_and_key,
     find_forbidden_extra_args,
@@ -33,6 +36,7 @@ from core.param_builder import (
 )
 from core.param_schema import (
     PARAM_DEFINITIONS,
+    SPEC_TYPES_MODEL_BACKED,
     SPEC_TYPES_REQUIRING_DRAFT_MODEL,
     split_multi_value,
 )
@@ -90,6 +94,18 @@ def _check_path_length(label: str, path: str, checks: list[dict[str, str]]) -> N
                 "Windows limit; move it to a shorter directory if loading fails.",
             )
         )
+
+
+def guardrail_blocks(setting: str, errors: int, warnings: int) -> bool:
+    """Whether preflight must block the launch.
+
+    Errors always block, regardless of policy: the policy controls how much
+    friction warnings add, never whether a known-broken launch is allowed.
+    """
+    policy = setting if setting in {"off", "warn", "strict"} else "warn"
+    if errors > 0:
+        return True
+    return policy == "strict" and warnings > 0
 
 
 def _dedupe(checks: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -229,6 +245,33 @@ def _dependency_checks(params: dict[str, Any], checks: list[dict[str, str]]) -> 
             checks.append(
                 _check("draft_missing", "error", f"draft model file does not exist: {draft}")
             )
+        else:
+            main_model = str(params.get("model") or "").strip()
+            selected = set(split_multi_value(params.get("spec_type")))
+            if (
+                main_model
+                and os.path.isfile(main_model)
+                and selected & SPEC_TYPES_MODEL_BACKED
+            ):
+                comparison = compare_draft_vocab(main_model, draft)
+                if comparison["status"] == "mismatch":
+                    checks.append(
+                        _check(
+                            "draft_vocab_mismatch",
+                            "error",
+                            "draft model vocabulary does not match the main model: "
+                            + comparison["reason"],
+                        )
+                    )
+                elif comparison["status"] == "unknown":
+                    checks.append(
+                        _check(
+                            "draft_vocab_unverified",
+                            "info",
+                            "draft vocabulary compatibility could not be verified locally: "
+                            + comparison["reason"],
+                        )
+                    )
 
     mmproj = str(params.get("mmproj") or "").strip()
     if mmproj:
@@ -237,6 +280,39 @@ def _dependency_checks(params: dict[str, Any], checks: list[dict[str, str]]) -> 
             checks.append(
                 _check("mmproj_missing", "error", f"mmproj file does not exist: {mmproj}")
             )
+
+
+def _manifest_requirement_checks(
+    params: dict[str, Any], probe: Any, checks: list[dict[str, str]]
+) -> None:
+    """Apply local manifest requirements (minimum llama.cpp build).
+
+    The manifest is optional and untrusted; unreadable manifests are ignored,
+    never fatal. ``probe.build`` is only available when the capability cache is
+    warm, so a cold cache does not invent a version mismatch.
+    """
+    model = str(params.get("model") or "").strip()
+    if not model or not os.path.isfile(model):
+        return
+    try:
+        summary = manifest_summary(model)
+    except Exception:  # noqa: BLE001 - manifest is advisory, never fatal
+        return
+    if not summary.get("found"):
+        return
+    # ``ServerProbe.build`` is usually the compiler string ("MSVC 19..."),
+    # while the numeric llama.cpp build lives in the version line
+    # ("0.7.0-dev (build 11698)"). Pass both and let the parser find it.
+    build_text = " ".join(
+        str(part)
+        for part in (
+            getattr(probe, "version", None),
+            getattr(probe, "build", None),
+        )
+        if part
+    )
+    for item in manifest_runtime_checks(summary, build_text or None):
+        checks.append(_check(item["code"], item["severity"], item["detail"]))
 
 
 def _argument_checks(params: dict[str, Any], checks: list[dict[str, str]]) -> list[str]:
@@ -393,11 +469,17 @@ def preflight(params: dict[str, Any], *, server_path: str | None = None) -> dict
         else:
             probe = probe_server_cached_only(resolved)
             if probe is None:
+                # 冷缓存不能报成 info + "启动时会验证"：那是把"预检没有错误"
+                # 交给用户当保证，而当时启动路径也只读缓存。
+                # 现在 _validate_start 会主动探测一次，但预检本身仍要如实说明
+                # "这一项还没验证过"，并按 warning 呈现。
                 checks.append(
                     _check(
                         "server_not_probed",
-                        "info",
-                        "capability cache is cold; flag support will be verified at launch",
+                        "warning",
+                        "capability cache is cold for this build; unsupported "
+                        "flags are only filtered once the launch-time probe "
+                        "succeeds",
                     )
                 )
             elif not probe.probed:
@@ -410,6 +492,7 @@ def preflight(params: dict[str, Any], *, server_path: str | None = None) -> dict
                 )
 
     info = _model_checks(params, checks)
+    _manifest_requirement_checks(params, probe, checks)
     _dependency_checks(params, checks)
     extra_tokens = _argument_checks(params, checks)
     _network_checks(params, extra_tokens, checks)
@@ -417,13 +500,18 @@ def preflight(params: dict[str, Any], *, server_path: str | None = None) -> dict
     _vram_checks(params, info, checks)
 
     ordered = _dedupe(checks)
+    errors = sum(1 for item in ordered if item["severity"] == "error")
+    warnings = sum(1 for item in ordered if item["severity"] == "warning")
+    guardrail = str(config.get_config().get("launch_guardrail", "warn"))
     return {
         "checks": ordered,
         "summary": {
-            "errors": sum(1 for item in ordered if item["severity"] == "error"),
-            "warnings": sum(1 for item in ordered if item["severity"] == "warning"),
+            "errors": errors,
+            "warnings": warnings,
             "infos": sum(1 for item in ordered if item["severity"] == "info"),
         },
+        "guardrail": guardrail,
+        "blocking": guardrail_blocks(guardrail, errors, warnings),
     }
 
 

@@ -3,7 +3,8 @@
 // 着色：stdout 白、stderr/system 蓝、错误关键字红
 // 实例列表来自实例状态中心（WS 推送 + 轮询兜底）
 
-import { boundedAppend } from './runtime.mjs';
+import { boundedAppend, scheduleObjectUrlRevoke } from './runtime.mjs';
+import { classifyLogFrame } from './log_stream.mjs';
 import { t, getLocale } from './i18n.mjs';
 import { renderInstanceList, instanceSignature, emptyStateHtml } from './panel_views.mjs';
 
@@ -22,6 +23,7 @@ let autoScroll = true;
 let searchKeyword = '';
 let levelFilter = 'all';  // all / stdout / stderr / system
 let connToastShown = false; // 每次断线只提示一次
+let droppedLogCount = 0;
 let unsubscribe = null;
 const MAX_LOG_BUFFER = 5000;
 const MAX_RENDERED_LOGS = 1500;
@@ -32,25 +34,29 @@ export function init(el, appCtx) {
   root.innerHTML = `
     <div class="page-header">
       <div>
-        <div class="page-title">${ctx.escapeHtml(t('logs.title'))}</div>
+        <h1 class="page-title">${ctx.escapeHtml(t('logs.title'))}</h1>
         <div class="page-subtitle">${ctx.escapeHtml(t('logs.subtitle'))}</div>
       </div>
     </div>
     <div class="logs-main">
       <div class="logs-toolbar">
-        <input type="text" id="log-search" placeholder="${ctx.escapeHtml(t('logs.searchPh'))}" style="min-width:160px;"/>
-        <select id="log-level" class="select" style="background:#0F172A;color:#E2E8F0;border:1px solid #334155;">
+        <label class="visually-hidden" for="log-search">${ctx.escapeHtml(t('logs.searchPh'))}</label>
+        <input type="text" id="log-search" class="logs-search" placeholder="${ctx.escapeHtml(t('logs.searchPh'))}"/>
+        <label class="visually-hidden" for="log-level">${ctx.escapeHtml(t('logs.level'))}</label>
+        <select id="log-level" class="select logs-level">
           <option value="all">${ctx.escapeHtml(t('logs.all'))}</option>
           <option value="stdout">stdout</option>
           <option value="stderr">stderr</option>
           <option value="system">system</option>
         </select>
-        <button class="btn btn-sm" id="log-pause" data-paused="false">⏸ ${ctx.escapeHtml(t('logs.pause'))}</button>
+        <button class="btn btn-sm" id="log-pause" data-paused="false" aria-pressed="false">⏸ ${ctx.escapeHtml(t('logs.pause'))}</button>
         <button class="btn btn-sm" id="log-clear">${ctx.escapeHtml(t('logs.clear'))}</button>
         <button class="btn btn-sm" id="log-download">${ctx.escapeHtml(t('logs.download'))}</button>
-        <span id="log-conn-state" class="log-conn-warn" style="display:none;"></span>
+        <span id="log-conn-state" class="log-conn-warn" role="status"></span>
+        <span id="log-dropped" class="log-dropped" role="status"></span>
+        <span id="log-count" class="logs-count" role="status" aria-live="polite"></span>
       </div>
-      <div class="logs-view" id="logs-view"></div>
+      <div class="logs-view" id="logs-view" role="log" aria-live="off" aria-label="${ctx.escapeHtml(t('logs.title'))}"></div>
     </div>
   `;
   bindEvents();
@@ -65,17 +71,41 @@ function bindEvents() {
     levelFilter = e.target.value;
     renderLogs();
   });
-  root.querySelector('#log-pause').addEventListener('click', (e) => {
+  root.querySelector('#log-pause').addEventListener('click', () => {
     autoScroll = !autoScroll;
-    e.target.dataset.paused = (!autoScroll).toString();
-    e.target.textContent = autoScroll ? `⏸ ${t('logs.pause')}` : `▶ ${t('logs.resume')}`;
+    syncPauseButton();
   });
   root.querySelector('#log-clear').addEventListener('click', () => {
     logLines = [];
     logKeys.clear();
+    droppedLogCount = 0;
     renderLogs();
   });
   root.querySelector('#log-download').addEventListener('click', downloadLogs);
+  const view = root.querySelector('#logs-view');
+  if (view) view.addEventListener('scroll', onLogScroll, { passive: true });
+}
+
+function syncPauseButton() {
+  const btn = root.querySelector('#log-pause');
+  if (!btn) return;
+  btn.dataset.paused = (!autoScroll).toString();
+  btn.setAttribute('aria-pressed', String(!autoScroll));
+  btn.textContent = autoScroll ? `⏸ ${t('logs.pause')}` : `▶ ${t('logs.resume')}`;
+}
+
+// 用户向上滚动查看历史时自动暂停跟随；回到底部时自动恢复。
+function onLogScroll() {
+  const view = root.querySelector('#logs-view');
+  if (!view) return;
+  const atBottom = view.scrollHeight - view.scrollTop - view.clientHeight < 24;
+  if (autoScroll && !atBottom) {
+    autoScroll = false;
+    syncPauseButton();
+  } else if (!autoScroll && atBottom) {
+    autoScroll = true;
+    syncPauseButton();
+  }
 }
 
 export function onShow() {
@@ -101,14 +131,23 @@ export function onHide() {
 
 function updateInstances(list) {
   instanceList = Array.isArray(list) ? list : [];
+  // 进入日志页时若已有运行实例，直接展示第一个运行中实例的日志；
+  // 否则正文会一直停在"暂无实例"，必须先点侧栏，像是日志没连上。
+  if (!currentInstanceId && instanceList.length) {
+    const preferred =
+      instanceList.find((i) => i.status === 'running' || i.status === 'starting') ||
+      instanceList[0];
+    selectInstance(preferred.id);
+  }
   // 若当前选中实例不在列表里，清空选择与日志缓冲
   if (currentInstanceId && !instanceList.some((i) => i.id === currentInstanceId)) {
     // 实例被移除：关 WS 之外必须清缓冲并重渲 —— 否则面板与"下载日志"
-    // 仍在展示/导出上一个实例的内容（审计 R6）。
+    // 仍在展示/导出上一个实例的内容。
     closeWs();
     currentInstanceId = null;
     logLines = [];
     logKeys = new Set();
+    droppedLogCount = 0;
     renderLogs();
   }
   // WS 会持续推送实例状态，签名没变就不重绘 ——
@@ -135,6 +174,7 @@ function selectInstance(instanceId) {
   currentInstanceId = instanceId;
   logLines = [];
   logKeys = new Set();
+  droppedLogCount = 0;
   renderLogs();
   openWs();
   // 面板高亮跟着走
@@ -163,7 +203,13 @@ function openWs() {
 // 收到一条日志：跳过心跳，按 时间戳|来源|内容 去重
 // （WebSocket 重连后后端会重发最近历史，避免重复行）
 function pushLog(msg) {
-  if (!msg || msg.type === 'ping') return;
+  const frame = classifyLogFrame(msg);
+  if (frame.kind === 'ignore' || frame.kind === 'heartbeat') return;
+  if (frame.kind === 'dropped') {
+    droppedLogCount += frame.count;
+    updateLogCount();
+    return;
+  }
   const key = `${msg.timestamp}|${msg.source}|${msg.line}`;
   if (logKeys.has(key)) return;
   logKeys.add(key);
@@ -175,6 +221,7 @@ function pushLog(msg) {
       logKeys.delete(`${entry.timestamp}|${entry.source}|${entry.line}`);
     }
   }
+  updateLogCount();
   appendLogLine(msg);
 }
 
@@ -199,6 +246,10 @@ function renderConnState(state) {
 function appendLogLine(entry) {
   if (!shouldShow(entry)) return;
   const view = root.querySelector('#logs-view');
+  // 空态是 renderLogs 在还没有日志时插入的；第一条日志到达后必须移除，
+  // 否则“暂无日志”会永久留在日志流上方。
+  const empty = view.querySelector('.empty-state');
+  if (empty) empty.remove();
   const div = document.createElement('div');
   div.className = `log-line ${classifyLine(entry)}`;
   const ts = entry.timestamp ? formatTs(entry.timestamp) : '';
@@ -248,9 +299,28 @@ function escapeRegExp(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function updateLogCount() {
+  const el = root && root.querySelector('#log-count');
+  const droppedEl = root && root.querySelector('#log-dropped');
+  if (droppedEl) {
+    droppedEl.style.display = droppedLogCount > 0 ? '' : 'none';
+    droppedEl.textContent = droppedLogCount > 0
+      ? t('logs.dropped', { count: droppedLogCount })
+      : '';
+  }
+  if (!el) return;
+  if (!currentInstanceId) {
+    el.textContent = '';
+    return;
+  }
+  const shown = logLines.filter(shouldShow).length;
+  el.textContent = t('logs.count', { shown, total: logLines.length });
+}
+
 function renderLogs() {
   const view = root.querySelector('#logs-view');
   view.innerHTML = '';
+  updateLogCount();
   const frag = document.createDocumentFragment();
   const visible = logLines.filter(shouldShow).slice(-MAX_RENDERED_LOGS);
   for (const entry of visible) {
@@ -287,6 +357,7 @@ function downloadLogs() {
   a.href = url;
   a.download = `logs-${currentInstanceId || 'unknown'}-${Date.now()}.log`;
   a.click();
-  URL.revokeObjectURL(url);
+  // Revoking synchronously can cancel the download in some WebView2 builds.
+  scheduleObjectUrlRevoke(url, (value) => URL.revokeObjectURL(value), 1000);
   ctx.showToast(t('logs.downloaded'), 'success', 1500);
 }

@@ -230,6 +230,79 @@ def test_preset_import_rejects_extra_args_overriding_managed_flags():
     assert any("launcher-managed flags" in e for e in errors), errors
 
 
+@pytest.mark.parametrize(
+    ("snippet", "expected"),
+    [
+        ("-m D:/models/B.gguf", "-m"),
+        ("--model D:/models/B.gguf", "--model"),
+        ("--model-url http://evil.example/m.gguf", "--model-url"),
+        ("-mu http://evil.example/m.gguf", "-mu"),
+        ("--cors-origins *", "--cors-origins"),
+        ("--cors-origins=localhost", "--cors-origins"),
+    ],
+)
+def test_extra_args_cannot_change_which_model_loads_or_the_cors_policy(
+    tmp_path, snippet, expected
+):
+    """extra_args 不能改写"实际加载哪个模型"和"默认 CORS 策略"。
+
+    ``--host`` / ``--api-key`` 早就进了黑名单，机制却对身份类参数一样成立：
+    ``extra_args`` 追加在 argv 末尾，而 llama-server 对重复的单值参数**取最后一
+    个**（本机实测 ``-m A -m B`` 先打 ``DEPRECATED: argument '-m' specified
+    multiple times``，随后加载 B）。预检、``_validate_start`` 的模型存在性检查、
+    历史记录、显存预估读的全是 ``params["model"]`` —— 于是校验通过、界面显示 A、
+    跑的却是从没被校验过的 B。
+
+    ``--cors-origins`` 是同一缺口的另一面：本机 ``--help`` 写着
+    ``--cors-origins ORIGINS (default: *)``，面板特意收紧成 localhost；末尾补一条
+    ``--cors-origins *`` 就退回"任何网站都能跨源读这个本地模型 API"，而这条边界
+    正是 SECURITY_MODEL 自己声明要避免的默认风险。
+
+    黑名单的取值范围跟着 ``config_resolver.MANAGED_KEYS`` 走（model / host /
+    port / api_key / cors_origins / path / log_file），不单方面扩大 —— 所以
+    ``--mmproj`` 仍然允许出现在附加参数里（见上面那条 normal-snippet 用例）。
+    """
+    from core.param_builder import find_forbidden_extra_args, split_cli_snippet
+    from core.preset_store import _validate_preset_data
+    from core.process_manager import ProcessManager
+
+    # 命中时返回的是**原始片段**（`--cors-origins=localhost` 整条），
+    # 这样报错信息对用户才有意义；判定用的是 partition("=")[0]。
+    hits = find_forbidden_extra_args(split_cli_snippet(snippet))
+    assert hits and hits[0].partition("=")[0] == expected, hits
+
+    params = {"model": "D:/models/A.gguf", "host": "127.0.0.1", "extra_args": snippet}
+    errors = _validate_preset_data({"name": "p", "params": params})
+    assert any(expected in e for e in errors), f"导入放过了 {snippet}: {errors}"
+
+    exe = tmp_path / "llama-server.exe"
+    exe.write_bytes(b"exe")
+    (tmp_path / "A.gguf").write_bytes(b"model")
+    manager = ProcessManager()
+    with pytest.raises(ValueError, match="launcher-managed flags"):
+        manager._validate_start(params, str(exe))
+
+
+def test_managed_flag_blacklist_covers_every_schema_spelling():
+    """黑名单必须含受管控参数在 schema 里声明的那种拼写，否则等于没拦。
+
+    面板写的是 ``-m``（不是 ``--model``）。只列长拼写的话，用户从面板里能正常
+    启动，而攻击性预设换成短拼写就绕过了 —— 这类漂移要靠派生而不是手工清单防住。
+    """
+    from core.param_builder import (
+        SECURITY_CONTROLLED_PARAM_KEYS,
+        security_controlled_flags,
+    )
+
+    flags = security_controlled_flags()
+    by_key = {meta.key: meta for meta in PARAM_DEFINITIONS}
+    for key in SECURITY_CONTROLLED_PARAM_KEYS:
+        meta = by_key.get(key)
+        if meta and meta.cli:
+            assert meta.cli in flags, f"{key} 的 {meta.cli} 没进黑名单"
+    assert "--cors-origins" in flags and "-m" in flags
+
+
 # ========== schema 侧的暴露 ==========
 
 

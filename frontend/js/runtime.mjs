@@ -72,6 +72,63 @@ export function normalizeHttpUrl(value) {
 }
 
 /**
+ * Parse a numeric form control without normalising the raw text.
+ *
+ * The parameter editor must not write a parsed value back into the focused
+ * input on every keystroke: intermediate states such as "-" or "0." are valid
+ * while typing but would be erased by Number()/parseFloat() round-tripping
+ * (typing "0.75" became "750", typing "-1" became "1").
+ *
+ * Returns `{ value, valid }`:
+ *   - empty input -> `{ value: null, valid: true }`
+ *   - complete number -> `{ value: <number>, valid: true }`
+ *   - intermediate/invalid text -> `{ value: null, valid: false }`
+ */
+/**
+ * Build the user model-defaults payload from the current parameter values.
+ *
+ * Only keys that differ from the global defaults are stored; writing the whole
+ * default dictionary would turn every upstream default into a user override
+ * and silently block future default changes. Managed keys are never included
+ * (the backend rejects them anyway).
+ */
+/**
+ * Group model-scan entries by a logical key (manifest model:).
+ *
+ * Entries without a key go into the empty-string group; the UI decides how to
+ * label/order it. Order is first-seen to keep the scan's file order stable.
+ */
+export function groupModelsByKey(models, keyOf) {
+  const groups = new Map();
+  for (const model of models || []) {
+    const key = String(keyOf(model) || '');
+    if (!groups.has(key)) groups.set(key, { key, models: [] });
+    groups.get(key).models.push(model);
+  }
+  return [...groups.values()];
+}
+
+export function diffModelDefaults(current, defaults, managedKeys = []) {
+  const managed = new Set(managedKeys);
+  const changed = {};
+  for (const [key, value] of Object.entries(current || {})) {
+    if (managed.has(key)) continue;
+    if (JSON.stringify(value) !== JSON.stringify(defaults ? defaults[key] : undefined)) {
+      changed[key] = value;
+    }
+  }
+  return changed;
+}
+
+export function parseNumericInput(raw, type = 'number') {
+  const text = String(raw ?? '').trim();
+  if (text === '') return { value: null, valid: true };
+  const value = type === 'float' ? Number.parseFloat(text) : Number(text);
+  if (!Number.isFinite(value)) return { value: null, valid: false };
+  return { value, valid: true };
+}
+
+/**
  * 判断参数在当前取值下是否激活（depends_on / depends_on_nonempty 联动）。
  * 与后端 core.param_builder._is_param_active 的语义保持一致。
  */
@@ -125,4 +182,92 @@ export function mergeUpstreamOptions(schemaOptions, upstreamOptions) {
  */
 export function shouldAutoAssignPort(params, defaults) {
   return params.port === undefined || params.port === defaults.port;
+}
+
+/**
+ * Monotonic request token for "latest response wins" UI loads.
+ *
+ * `begin()` starts a new generation; `isCurrent(token)` is false as soon as
+ * another load starts or the view is left. This is intentionally tiny: the
+ * rule is easier to keep correct than ad-hoc request-id booleans in each page.
+ */
+export function createRequestGate() {
+  let generation = 0;
+  return {
+    begin() {
+      generation += 1;
+      return generation;
+    },
+    isCurrent(token) {
+      return token === generation;
+    },
+    cancel() {
+      generation += 1;
+    },
+  };
+}
+
+function formatApiDetailItem(item) {
+  if (item === null || item === undefined) return '';
+  if (typeof item === 'string') return item;
+  if (typeof item !== 'object') return String(item);
+  const rawLoc = Array.isArray(item.loc) ? item.loc : [];
+  const loc = rawLoc
+    .filter((part) => !['query', 'body', 'path'].includes(String(part)))
+    .join('.');
+  const message = String(item.msg || item.message || '').trim();
+  if (loc && message) return `${loc}: ${message}`;
+  return message || loc;
+}
+
+/** Normalize FastAPI/JSON error payloads without producing "[object Object]". */
+export function formatApiErrorPayload(payload, fallback = '') {
+  if (payload === null || payload === undefined) return fallback;
+  if (typeof payload === 'string') return payload.trim() || fallback;
+  if (Array.isArray(payload)) {
+    const parts = payload.map(formatApiDetailItem).filter(Boolean);
+    return parts.join('; ') || fallback;
+  }
+  if (typeof payload === 'object') {
+    if (typeof payload.error === 'string' && payload.error.trim()) {
+      return payload.error.trim();
+    }
+    if (payload.detail !== undefined) {
+      const detail = formatApiErrorPayload(payload.detail, '');
+      if (detail) return detail;
+    }
+    if (typeof payload.message === 'string' && payload.message.trim()) {
+      return payload.message.trim();
+    }
+  }
+  return fallback;
+}
+
+/** A bounded display name for an instance created from a model filename. */
+export function instanceNameFromFilename(filename, maxLength = 100) {
+  const limit = Number.isFinite(Number(maxLength)) ? Math.max(1, Math.floor(Number(maxLength))) : 100;
+  return String(filename || '').trim().slice(0, limit);
+}
+
+/**
+ * Revoke a Blob URL after the browser has had a chance to start the download.
+ * Synchronous revocation cancels downloads in some WebView2 builds.
+ */
+export function scheduleObjectUrlRevoke(url, revoke, delayMs = 1000) {
+  const delay = Number.isFinite(Number(delayMs)) ? Math.max(0, Number(delayMs)) : 1000;
+  return setTimeout(() => {
+    try {
+      revoke(url);
+    } catch {
+      /* revocation is best-effort */
+    }
+  }, delay);
+}
+
+/** Toggle a control's busy state; safe for callers that may not have a button. */
+export function setButtonBusy(button, busy) {
+  if (!button || typeof button !== 'object') return;
+  button.disabled = Boolean(busy);
+  if (busy) button.setAttribute('aria-busy', 'true');
+  else button.removeAttribute('aria-busy');
 }

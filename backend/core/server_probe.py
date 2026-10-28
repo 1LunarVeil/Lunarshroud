@@ -365,8 +365,38 @@ def build_probe_from_text(path: str, help_text: str, version_text: str = "") -> 
 
 # ========== IO 与缓存 ==========
 
+def _windows_system_dir() -> str | None:
+    """真实的 System32 目录；拿不到就返回 ``None``。
+
+    用 ``GetSystemDirectoryW`` 而不是 ``SystemRoot`` / ``windir`` 环境变量：
+    后者是**调用方能写的普通字符串**。伪造 ``SystemRoot=<用户可写目录>`` 后，
+    ``os.path.join(root, "System32", "taskkill.exe")`` 会得到一个绝对路径，
+    于是"必须走绝对路径"这条防线原封不动地把攻击者的副本当成系统工具执行
+    —— 绝对路径只在**根路径可信**时才有意义。外壳侧
+    （``src-tauri/src/lib.rs``）早就用这个 API，后端没有对齐。
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        size = wintypes.MAX_PATH
+        buffer = ctypes.create_unicode_buffer(size)
+        # 返回值不含结尾 NUL；等于/超过缓冲区说明被截断，不能信。
+        written = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, size)
+    except Exception:  # noqa: BLE001 - 任何 API/加载失败都必须退到"禁用"
+        return None
+    if not 0 < written < size:
+        return None
+    resolved = buffer.value
+    if not resolved or not os.path.isabs(resolved):
+        return None
+    return resolved
+
+
 def system_tool(name: str) -> str | None:
-    """System32 里某个工具的绝对路径；拿不到 SystemRoot 时返回 ``None``。
+    """System32 里某个工具的绝对路径；拿不到系统目录时返回 ``None``。
 
     系统工具**必须**用绝对路径调用。裸名会走 CreateProcess 的搜索序，而
     "应用程序所在目录"与"当前目录"都排在 System32 之前 —— 后端的 CWD 由外壳
@@ -374,14 +404,14 @@ def system_tool(name: str) -> str | None:
     CurrentUser 模式下都是用户可写的。实测：在该目录植入 taskkill.exe 后，
     ``subprocess.run(["taskkill", ...])`` 执行的是植入副本，不是 System32 的那份。
 
-    拿不到 SystemRoot 时**没有安全的绝对路径可退**：返回 ``None``，调用方必须
+    拿不到系统目录时**没有安全的绝对路径可退**：返回 ``None``，调用方必须
     禁用该工具（taskkill 走 psutil 树杀，nvidia-smi 跳过 GPU 指标）。退回裸名
     等于把"可写目录劫持"重新引进来，AGENTS §2.1 明确禁止。
     """
-    root = os.environ.get("SystemRoot") or os.environ.get("windir")
+    root = _windows_system_dir()
     if not root:
         return None
-    return os.path.join(root, "System32", name)
+    return os.path.join(root, name)
 
 
 def sanitized_child_env() -> dict[str, str]:
@@ -454,7 +484,7 @@ _CACHE: dict[_CacheKey, ServerProbe] = {}
 _CACHE_LOCK = threading.Lock()
 
 # 失败结果（probed=False）单独缓存一个短 TTL：失败是常态（未配置、路径错、
-# exe 卡死超时），而每次失败探测要起两个子进程。审计 R2：不缓存时每个请求
+# exe 卡死超时），而每次失败探测要起两个子进程。不缓存时每个请求
 # 都在放大这个代价，还能把 to_thread 线程池占满。失败只压 30 秒尖峰，
 # 之后允许重新验证（用户可能刚修好路径）。
 _FAILED_TTL_SECONDS = 30.0
@@ -464,7 +494,7 @@ _FAILED_CACHE: dict[_CacheKey, tuple[float, ServerProbe]] = {}
 # 各起两个子进程。领先者持有 Event 直到结果落进缓存；跟随者等事件后重读。
 _INFLIGHT: dict[_CacheKey, threading.Event] = {}
 
-# 同一目标的并发等待者上限（第二轮复核 N1 的廉价闸门）：等待者要占着
+# 同一目标的并发等待者上限（一道廉价闸门）：等待者要占着
 # to_thread 的工作线程直到结果落地或截止，无上限时 30+ 并发就能把默认线程池
 # （约 32）占满、连带让实例管理端点排队。超限调用立即返回带明确文案的失败
 # （背压，不入缓存）；限额内的等待语义不变。
@@ -554,7 +584,7 @@ def _run(exe: str, args: list[str], timeout: float) -> str:
 
     `subprocess.run(timeout=)` 在 Windows 包装脚本场景下不构成时间上界：
     超时它只杀直接子进程（cmd.exe），孙进程仍握着继承来的 stdout 管道，
-    随后的 communicate() 会一直等管道 EOF —— 独立审计实测挂起 585s（H1）。
+    随后的 communicate() 会一直等管道 EOF —— 实测曾挂起 585s。
     这里改为手动 Popen：超时后用 taskkill /F /T 收掉整棵树，再限时收管道。
     """
     process = subprocess.Popen(  # noqa: S603 - 参数来自本地配置，非用户输入拼接
@@ -636,7 +666,7 @@ def probe_server_cached(exe_path: str | Path, **options: Any) -> ServerProbe:
     if key is None:
         return probe_server(exe_path, **options)
 
-    # 跟随者的总等待上界（独立审计 H1 的第二半）：领先者正常耗时 ≤ 2×timeout
+    # 跟随者的总等待上界：领先者正常耗时 ≤ 2×timeout
     # （--help + --version），加 5s 余量。没有这个截止，领先者卡死时跟随者会
     # 在 `wait(1.0)` 里每秒空转、**永不返回** —— asyncio.to_thread 的取消杀不掉
     # 工作线程，默认执行器（约 32 线程）会被逐一占满，此后所有 to_thread 端点
@@ -739,3 +769,93 @@ def clear_server_cache() -> None:
     with _CACHE_LOCK:
         _CACHE.clear()
         _FAILED_CACHE.clear()
+
+
+# ========== 后端设备枚举（--list-devices）==========
+#
+# 四个官方 Windows 构建（CPU / Vulkan / OpenVINO / ROCm）是**同一个 llama.cpp
+# 版本**：`--version` 完全一致、`--help` 里的 flag 集合也一致（实测 b11929，
+# 四包 `--help` 的 GPU 相关选项逐字相同）。所以"这份构建能用什么加速器"
+# **无法**从版本串或 help 推断，只能问构建自己：`--list-devices`。
+#
+# 实测同一台 AMD CPU + NVIDIA 独显机器：
+#   CPU      -> (none)
+#   Vulkan   -> Vulkan0: AMD Radeon 610M / Vulkan1: NVIDIA RTX 5060
+#   OpenVINO -> OPENVINO0: CPU / OPENVINO1: GPU.0 NVIDIA / OPENVINO2: GPU.1 gfx1036
+#   ROCm     -> (none)   ← 没有 ROCm 兼容设备时如实为空，不是错误
+#
+# 用户据此能看懂"为什么这个包在我机器上跑 GPU 却一点也没加速"，也才能在参数
+# 面板里填对 `--device`（其取值就是这里的设备名）。
+
+DEVICES_TIMEOUT = 20.0
+_DEVICES_CACHE: dict[tuple[str, int, int], list[dict[str, Any]]] = {}
+_DEVICES_LOCK = threading.Lock()
+# 设备名必须以数字结尾（Vulkan0 / OPENVINO2 / ROCm0 / CUDA1 / Metal0）：
+# 不加这条，`error: something broke` 这种报错行会被当成一个叫 "error" 的设备
+# 混进列表，用户会在参数面板里看到一个不存在的设备名。
+_DEVICE_LINE_RE = re.compile(r"^\s*([A-Za-z][\w.-]*\d):\s*(.+?)\s*$")
+_DEVICE_MEMORY_RE = re.compile(r"\((\d+)\s*MiB,\s*(\d+)\s*MiB free\)\s*$", re.IGNORECASE)
+
+
+def parse_device_list(text: str) -> list[dict[str, Any]]:
+    """把 ``--list-devices`` 的输出解析成结构化设备列表。
+
+    格式（b11929 实测）：``  Vulkan0: 名称 (总 MiB, 空闲 MiB)``，首行是
+    ``Available devices:``，没有设备时下一行是 ``  (none)``。
+    解析必须宽容：第三方构建可能改格式，解析不出来就当"没枚举到"，
+    绝不因此让调用方失败。
+    """
+    devices: list[dict[str, Any]] = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.lower().startswith("available devices"):
+            continue
+        match = _DEVICE_LINE_RE.match(line)
+        if not match:
+            continue
+        name = match.group(1)
+        description = match.group(2)
+        total_mib = free_mib = None
+        memory = _DEVICE_MEMORY_RE.search(description)
+        if memory:
+            total_mib = int(memory.group(1))
+            free_mib = int(memory.group(2))
+            description = description[: memory.start()].strip()
+        # 设备名（如 OPENVINO2）是 --device 的取值；description 里可能还带
+        # "GGML_OPENVINO_DEVICE=GPU.1 - gfx1036 (iGPU)" 这类后端细节，原样保留
+        # 给界面显示，不做猜测性改写。
+        devices.append({
+            "name": name,
+            "description": description,
+            "total_mib": total_mib,
+            "free_mib": free_mib,
+        })
+    return devices
+
+
+def list_devices(exe_path: str | Path, *, timeout: float = DEVICES_TIMEOUT) -> list[dict[str, Any]]:
+    """问这份构建"你实际能用哪些设备"。**永不抛异常**，失败返回空列表。"""
+    key = _cache_key(exe_path)
+    if key is None:
+        return []
+    with _DEVICES_LOCK:
+        cached = _DEVICES_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        text = _run(str(_resolved_probe_path(exe_path)), ["--list-devices"], timeout)
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    except Exception:  # noqa: BLE001 - 枚举失败只是"没有设备信息"，不影响启动
+        return []
+    devices = parse_device_list(text)
+    with _DEVICES_LOCK:
+        if len(_DEVICES_CACHE) >= 64:
+            _DEVICES_CACHE.clear()
+        _DEVICES_CACHE[key] = devices
+    return devices
+
+
+def clear_devices_cache() -> None:
+    with _DEVICES_LOCK:
+        _DEVICES_CACHE.clear()

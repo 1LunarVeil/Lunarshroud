@@ -16,7 +16,7 @@ let c2d = null;       // Canvas 2D 上下文
 let watcher = null;
 let metrics = [];     // 数据点列表：{t, cpu, mem, gpuUtil}
 const MAX_HISTORY_SECONDS = 60;
-// 数据点条数硬上限：时间戳乱序会让时间裁剪失效，防无界增长（审计 R7）
+// 数据点条数硬上限：时间戳乱序会让时间裁剪失效，防无界增长
 const MAX_METRIC_POINTS = 1200;
 let overviewTimer = null;  // 进程关联轮询
 let connToastShown = false; // 每次断线只提示一次
@@ -24,14 +24,14 @@ let connToastShown = false; // 每次断线只提示一次
 // 线条颜色（运行时根据当前主题从 CSS 变量读取）
 function getChartColors() {
   const style = getComputedStyle(document.body);
-  const isDark = document.body.classList.contains('theme-dark');
+  const value = (name, fallback) => style.getPropertyValue(name).trim() || fallback;
   return {
-    cpu: '#EF4444',     // 红
-    mem: '#10B981',     // 绿
-    gpu: '#F59E0B',     // 橙
-    grid: isDark ? 'rgba(255,255,255,0.08)' : '#E5E7EB',
-    text: style.getPropertyValue('--color-text-secondary').trim() || (isDark ? '#9A9AA4' : '#6B7280'),
-    axis: isDark ? 'rgba(255,255,255,0.15)' : '#9CA3AF',
+    cpu: value('--chart-cpu', '#EF4444'),
+    mem: value('--chart-memory', '#10B981'),
+    gpu: value('--chart-gpu', '#F59E0B'),
+    grid: value('--chart-grid', '#E5E7EB'),
+    text: value('--color-text-secondary', '#6B7280'),
+    axis: value('--chart-axis', '#9CA3AF'),
   };
 }
 let COLORS = getChartColors();
@@ -42,7 +42,7 @@ export function init(el, appCtx) {
   root.innerHTML = `
     <div class="page-header">
       <div>
-        <div class="page-title">${ctx.escapeHtml(t('monitor.title'))}</div>
+        <h1 class="page-title">${ctx.escapeHtml(t('monitor.title'))}</h1>
         <div class="page-subtitle" id="monitor-subtitle">${ctx.escapeHtml(t('monitor.subtitle'))}</div>
       </div>
       <div class="page-actions">
@@ -56,9 +56,9 @@ export function init(el, appCtx) {
         </div>
         <canvas id="metric-canvas"></canvas>
         <div class="metric-legend">
-          <span class="item"><span class="dot" style="background:${COLORS.cpu};"></span>${ctx.escapeHtml(t('monitor.cpu'))}</span>
-          <span class="item"><span class="dot" style="background:${COLORS.mem};"></span>${ctx.escapeHtml(t('monitor.memory'))}</span>
-          <span class="item"><span class="dot" style="background:${COLORS.gpu};"></span>${ctx.escapeHtml(t('monitor.gpuUtil'))}</span>
+          <span class="item"><span class="dot dot-cpu"></span>${ctx.escapeHtml(t('monitor.cpu'))}</span>
+          <span class="item"><span class="dot dot-memory"></span>${ctx.escapeHtml(t('monitor.memory'))}</span>
+          <span class="item"><span class="dot dot-gpu"></span>${ctx.escapeHtml(t('monitor.gpuUtil'))}</span>
         </div>
       </div>
       <div class="card">
@@ -189,12 +189,8 @@ function pushMetric(msg) {
 // ========== Canvas 绘图 ==========
 
 function updateLegendColors() {
-  const dots = root.querySelectorAll('.metric-legend .dot');
-  if (dots.length >= 3) {
-    dots[0].style.background = COLORS.cpu;
-    dots[1].style.background = COLORS.mem;
-    dots[2].style.background = COLORS.gpu;
-  }
+  // The legend colors come from the same custom properties the canvas reads,
+  // so a theme switch only has to repaint the chart.
 }
 
 function drawChart() {
@@ -340,7 +336,7 @@ async function refreshOverview() {
     const r = await ctx.Api.getSystemOverview();
     updateProcTable(r.gpu_processes || []);
   } catch (e) {
-    // 失败不能无声：进程表会一直显示旧数据却毫无提示（审计 R6）。
+    // 失败不能无声：进程表会一直显示旧数据却毫无提示。
     console.warn('[monitor] failed to load gpu processes', e);
     markProcTableStale();
   }
@@ -375,7 +371,7 @@ function updateProcTable(procs) {
       <tbody>
         ${showProcs.map((p) => {
           const isManaged = p.managed;
-          return `<tr style="${isManaged ? 'background: rgba(79,70,229,0.08);' : ''}">
+          return `<tr${isManaged ? ' class="managed-row"' : ''}>
             <td>${p.pid}</td>
             <td>${ctx.escapeHtml(p.name)}</td>
             <td>${formatMem(p.memory_used_mb)}</td>

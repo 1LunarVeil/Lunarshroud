@@ -1,6 +1,6 @@
 # LunarShroud
 
-LunarShroud 是一个面向 Windows 的 llama.cpp 桌面启动器，使用 Tauri、FastAPI 和原生 JavaScript 构建。它提供参数编辑、预设、多实例、实时日志、资源监控、启动历史和 llama-server 内置 Chat UI。
+LunarShroud 是一个面向 Windows 的 llama.cpp 桌面启动器，使用 Tauri、FastAPI 和原生 JavaScript 构建。它提供参数编辑、预设、多实例、实时日志、资源监控、启动历史、原生流式 Chat（可回退到 llama-server WebUI）、本地知识库/RAG、本地备份和托盘生命周期。
 
 > 当前版本：`0.9.0-beta.2`。已经完成进程生命周期与本地接口安全加固，但在标记 1.0 前仍需要多种 GPU、模型和 4–8 小时长稳测试。
 
@@ -8,13 +8,16 @@ LunarShroud 是一个面向 Windows 的 llama.cpp 桌面启动器，使用 Tauri
 
 - llama-server 参数可视化编辑：面板收录常用项，按**本机构建**自适应显隐（`--help` 探测是权威，不是硬编码清单），长尾参数走「附加命令行参数」
 - 「用途」一键配方：对话生成 / 嵌入服务 / 重排序 / 只读工具 / Agent 全功能（只写意图，不写调优数字）
-- RAG 组件齐备：`/v1/embeddings`、`/rerank`、提示词缓存、内置工具与 MCP，详见 [docs/RAG.md](docs/RAG.md)
+- 本地知识库/RAG：文本、HTML、PDF、DOCX 与扫描版 PDF（GLM-OCR）在本机建索引；Chat 可选择知识库，回答带页码引用
+- RAG 服务组件齐备：`/v1/embeddings`、`/rerank`、提示词缓存、内置工具与 MCP，详见 [docs/RAG.md](docs/RAG.md) 与 [docs/KNOWLEDGE_BASE.md](docs/KNOWLEDGE_BASE.md)
 - 多实例启动、停止、重启、端口分配和状态监控
 - 有界实时日志、搜索、过滤和下载
 - CPU、内存和 NVIDIA GPU 监控
-- 模型库：GGUF 能力探测（原生上下文/MTP/mmproj）、显存预估、配套文件识别
+- 模型库：GGUF 能力探测（原生上下文/MTP/mmproj）、显存预估、配套文件识别，以及可选的 `model.yaml` / `manifest.json` 清单编辑
 - 预设导入、导出、克隆、对比和启动历史
-- 内嵌 llama-server Web UI
+- 原生 Chat：本地会话（`chats.db`）、SSE 流式、停止/重新生成、消息编辑与分支、上下文占用、本地文本附件、提示词库、会话搜索、Markdown 导出；WebUI 作为回退
+- 本机数据备份/恢复：配置、预设、历史与聊天（含附件和提示词）快照，SHA-256 校验，恢复在下次启动应用
+- 托盘图标、可选关闭到托盘、显式退出；Ctrl+K 命令面板
 
 ## 稳定性与安全边界
 
@@ -47,8 +50,16 @@ LunarShroud 是一个面向 Windows 的 llama.cpp 桌面启动器，使用 Tauri
    | 你的显卡 | 选文件名里含 |
    |---|---|
    | NVIDIA（RTX 30/40/50 等） | `bin-win-cuda12.x-x64`（推荐，另见第 3 步） |
-   | AMD / Intel 显卡 | `bin-win-vulkan-x64` |
+   | AMD 独显（RX 6000/7000 等，官方 ROCm 支持列表内） | `bin-win-rocm-*-x64` |
+   | AMD 其它（含核显） | `bin-win-vulkan-x64` |
+   | Intel 核显 / Arc / NPU | `bin-win-openvino-*-x64` |
    | 只有 CPU | `bin-win-cpu-x64` |
+
+   ROCm 包只对 AMD 官方支持列表内的独显生效（gfx9/gfx10 系列）；核显与未列入
+   列表的型号在 `--list-devices` 里为空，请改用 Vulkan 包。OpenVINO 包走 Intel
+   的 CPU/GPU 插件，设备名以 `OPENVINO` 开头（其中 CPU 设备通常排第一）。
+   注册后到「运行环境」页可以看到这份构建在**本机实际枚举到的设备**，参数面板的
+   「计算设备」（`--device`）就填那里列出的名字。
 
 2. 解压到一个**固定位置**（例如 `D:\llama`），解压后里面就有 `llama-server.exe`。
 3. 用 NVIDIA 时需要 CUDA 运行库：装 NVIDIA 官网的 CUDA Toolkit 运行组件，或把发布包
@@ -81,12 +92,17 @@ $env:LUNARSHROUD_ALLOW_INSECURE_DEV = '1'
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest --cov=backend --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=75
-node --test frontend\tests\runtime.test.mjs frontend\tests\i18n.test.mjs
-Get-ChildItem frontend\js -File | Where-Object Extension -in '.js', '.mjs' | ForEach-Object { node --check $_.FullName }
+Push-Location frontend
+node --test tests\*.test.mjs
+Get-ChildItem js -File | Where-Object Extension -in '.js', '.mjs' | ForEach-Object { node --check $_.FullName }
+# 浏览器核心路径、axe 可访问性与首屏性能门禁（需先启动后端）
+npm ci
+npm run test:browser
+Pop-Location
 cargo test --manifest-path src-tauri\Cargo.toml --locked
 ```
 
-当前源码基线（2026-10-18）：533 个 Python 测试、21 个前端测试、17 个 JavaScript 文件语法检查、22 个 Rust 测试；产品代码覆盖率 88.01%。测试数量随回归测试增长，门禁始终是 **0 失败 + 覆盖率 ≥75%**，以实际运行为准。测试不替代真实模型和长时间压力测试。当前验证状态见 [docs/STATUS.md](docs/STATUS.md)，未完成风险、证据与 beta/1.0 判断见 [docs/RISK_ASSESSMENT.md](docs/RISK_ASSESSMENT.md)。
+当前工作树基线（2026-10-23）：723 个 Python 测试、57 个前端单元测试、3 个浏览器验收测试、全部前端 JavaScript 语法检查通过；产品代码覆盖率由门禁保证 ≥75%。Rust 测试的最近基线为 23 个，但本轮审计环境（VS 2026 + 固定 Rust 1.97.1）无法完成 `ring` 的 C 编译，需在受支持的 MSVC 环境复核；不作为本轮“已通过”证据。测试数量随回归测试增长，门禁始终是 **0 失败 + 覆盖率 ≥75%**，以实际运行为准。测试不替代真实模型和长时间压力测试。当前验证状态见 [docs/STATUS.md](docs/STATUS.md)，未完成风险、证据与 beta/1.0 判断见 [docs/RISK_ASSESSMENT.md](docs/RISK_ASSESSMENT.md)。
 
 ## 构建安装包
 
@@ -132,10 +148,17 @@ docs/           架构、构建、发布与安全说明
 - 不同 llama.cpp 版本的参数可能变化，升级后应检查生成命令。
 - llama.cpp 默认 `--cache-ram 8192` 会启用宿主侧提示词缓存。实测 4B 模型运行 10 分钟后 llama-server 内存从 5.2 GB 升至 11.4 GB 并平台化；这不是启动器泄漏。内存较小的机器请把 `--cache-ram` 调低或设为 0（代价是重复提示词不再复用）。
 - 实例端口默认不设 API 密钥。Windows 回环端口不按用户隔离，共享机器上的其他本地进程可以直接调用模型；共享环境请在参数中设置 `api_key`。
+- 实例端口范围（默认 8080–8090，共 11 个）由模型实例与知识库的嵌入/重排/OCR 服务**共用**：同时运行多个实例并建知识库索引时可能耗尽，表现为"端口范围内没有可用端口"；在设置里放宽范围即可。
+- OpenVINO 构建的设备不走 `--device`，而是 `GGML_OPENVINO_DEVICE` 环境变量（启动器会自动翻译，一次只能选一个设备）；实测部分显卡上其 GPU 插件加载模型后会崩溃（0xC0000409），遇到就换 `OPENVINO0`（CPU）或改用 Vulkan/CUDA 构建。
+- ROCm 构建在没有受支持 AMD 独显的机器上会**静默退回 CPU 推理**并照常启动（实测生成速度慢一个数量级）；启动器会在实例卡片上给出提示，但不会阻止启动。
 - Windows 上总路径超过 260 个字符的模型/草稿/mmproj 无法被 llama.cpp 打开；启动前检查会报 `path_too_long`，请把文件移到更短的目录。
 - llama.cpp v0.7.0：嵌入模型在**单槽位且未开启嵌入端点**时会触发上游断言而崩溃（`GGML_ASSERT(n_outputs_max ...)`）。勾选「启用嵌入端点」或把并行槽位设为 2 以上即可规避；启动器会把这条断言翻译成可行动的提示。
-- Chat 页把 llama-server Web UI 嵌在沙箱 iframe 里（脚本、表单、同源），沙箱不含下载权限，因此 v0.7.0 模型管理器的下载功能请点工具栏的「在浏览器中打开」。
-- 尚未完成多硬件矩阵和 4–8 小时真实模型 soak test，因此版本仍为 beta。
+- Chat 默认使用原生模式；切到 WebUI 模式后会把 llama-server Web UI 嵌在沙箱 iframe 里（脚本、表单、同源），沙箱不含下载权限，因此 v0.7.0 模型管理器的下载功能请点工具栏的「在浏览器中打开」。
+- 聊天、单会话消息和提示词库达到固定上限（500）时会**明确拒绝新建**，不会自动删除旧内容；请先导出或手动删除。启动历史仍按配置的 `history_max_records` 保留最近记录。
+- 命令行备份/恢复工具要求应用与 `backend.exe` 均已关闭；备份清单统一为 UTF-8。应用内备份可在运行中通过 SQLite 快照完成。
+- 恢复前会创建 `pre-restore-*` 快照；如果恢复过程中失败，当前版本需要从该快照手动恢复，尚未实现自动回滚。
+- 启动历史按 `history_max_records` 保留最近记录；超过上限会裁剪最旧诊断记录，不影响聊天/预设。
+- 4 小时真实模型 soak 已通过；8 小时长稳和多硬件矩阵仍未完成，因此版本仍为 beta。
 
 ## 参与和许可
 

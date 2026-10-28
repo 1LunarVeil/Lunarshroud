@@ -1,11 +1,12 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-Back up LunarShroud user data (config, history, presets) with a hash manifest.
+Back up LunarShroud user data (config, history, chats, presets) with a hash manifest.
 
 .DESCRIPTION
-Copies config.json, history.db (and WAL/SHM sidecars if present) and the
-presets directory into a timestamped folder, then writes SHA256SUMS.txt.
+Copies config.json, history.db, chats.db (and their WAL/SHM sidecars if
+present) and the presets directory into a timestamped folder, then writes
+SHA256SUMS.txt.
 The launcher must be closed first; a running LunarShroud process is refused
 unless -Force is supplied.
 
@@ -43,9 +44,12 @@ function Resolve-DataDirectory {
 }
 
 function Assert-NotRunning {
-    $running = Get-Process -Name "LunarShroud" -ErrorAction SilentlyContinue
+    # A surviving backend.exe still holds the SQLite WAL open even if the shell
+    # is gone (Job Object attach failure / blocked taskkill). Copying the raw
+    # database then is not a consistent snapshot.
+    $running = @(Get-Process -Name "LunarShroud", "backend" -ErrorAction SilentlyContinue)
     if ($running -and -not $Force) {
-        throw "LunarShroud is running. Close it first, or pass -Force (not recommended)."
+        throw "LunarShroud or backend.exe is running. Close the app first, or pass -Force (not recommended)."
     }
 }
 
@@ -97,7 +101,11 @@ if (Test-Path -LiteralPath $dest) {
 New-Item -ItemType Directory -Path $dest | Out-Null
 
 $copied = New-Object System.Collections.Generic.List[string]
-foreach ($name in @("config.json", "history.db", "history.db-wal", "history.db-shm")) {
+foreach ($name in @(
+    "config.json",
+    "history.db", "history.db-wal", "history.db-shm",
+    "chats.db", "chats.db-wal", "chats.db-shm"
+)) {
     $source = Join-Path $data $name
     if (Test-Path -LiteralPath $source -PathType Leaf) {
         Copy-Item -LiteralPath $source -Destination (Join-Path $dest $name)
@@ -129,10 +137,13 @@ foreach ($file in $files) {
 if ($lines.Count -eq 0) {
     throw "nothing to back up in $data"
 }
-$lines | Set-Content -LiteralPath $manifest -Encoding ASCII
+# UTF-8 is the manifest contract: preset filenames are user-visible Chinese
+# names. ASCII silently rewrote a non-ASCII name as ??.json, so the post-copy
+# verification failed after the backup had already been written.
+$lines | Set-Content -LiteralPath $manifest -Encoding UTF8
 
 # Verify the manifest before reporting success (fail closed).
-foreach ($line in Get-Content -LiteralPath $manifest) {
+foreach ($line in Get-Content -LiteralPath $manifest -Encoding UTF8) {
     if ($line -notmatch '^([0-9a-fA-F]{64}) \*(.+)$') {
         throw "invalid manifest line: $line"
     }

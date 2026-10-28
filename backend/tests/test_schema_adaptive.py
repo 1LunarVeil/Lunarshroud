@@ -171,6 +171,27 @@ def test_build_only_params_are_dropped_on_older_builds():
     assert _value_of(argv_new, "--load-mode") == "mlock"
 
 
+def test_default_mmap_uses_load_mode_on_new_builds():
+    """New builds deprecate --mmap; translate the default intent instead."""
+    params = {**get_default_params(), "model": "D:/m.gguf"}
+    argv = build_argv(params, FAKE_EXE, probe=full_probe())
+
+    assert "--mmap" not in argv
+    assert _value_of(argv, "--load-mode") == "mmap"
+
+    # Explicit non-default mlock keeps the legacy switch (translation only
+    # covers the common mmap=true/mlock=false case).
+    mlock_args = {**params, "mlock": True}
+    assert "--mlock" in build_argv(mlock_args, FAKE_EXE, probe=full_probe())
+
+    # An explicit load_mode wins and suppresses contradictory legacy flags.
+    explicit = {**params, "load_mode": "dio", "mmap": True, "mlock": True}
+    explicit_argv = build_argv(explicit, FAKE_EXE, probe=full_probe())
+    assert "--mmap" not in explicit_argv
+    assert "--mlock" not in explicit_argv
+    assert _value_of(explicit_argv, "--load-mode") == "dio"
+
+
 def test_new_params_stay_out_of_the_command_until_changed():
     """新增参数的默认值与上游一致（实测 agrees=True）→ 默认不落命令行。
 
@@ -187,8 +208,11 @@ def test_new_params_stay_out_of_the_command_until_changed():
         "--load-mode MODE                  load mode (default: auto)",
     )
     argv = build_argv({**get_default_params(), "model": "D:/m.gguf"}, FAKE_EXE, probe=probe)
-    for flag in ("-ctxcp", "-cms", "-cram", "--cache-reuse", "--reasoning-effort", "--load-mode"):
+    for flag in ("-ctxcp", "-cms", "-cram", "--cache-reuse", "--reasoning-effort"):
         assert flag not in argv, flag
+    # --load-mode is intentionally emitted from the default mmap=true intent on
+    # builds that support it; see test_default_mmap_uses_load_mode_on_new_builds.
+    assert "--load-mode" in argv
 
     changed = {**get_default_params(), "model": "D:/m.gguf", "cache_ram": 2048, "ctx_checkpoints": 8}
     argv_changed = build_argv(changed, FAKE_EXE, probe=probe)

@@ -16,6 +16,8 @@
    ========================================================================== */
 
 :root {
+  /* 原生控件（select 弹层、checkbox、滚动条）跟随主题 */
+  color-scheme: light;
   /* ---------- 1. 原始色阶（oklch，便于按明度等差扩展） ---------- */
   --p-indigo-50: oklch(96% 0.03 275);
   --p-indigo-100: oklch(93% 0.05 275);
@@ -42,6 +44,10 @@
   /* ---------- 2. 语义色 ---------- */
   --color-primary: #4F46E5;
   --color-primary-hover: #4338CA;
+  /* 实心主按钮的底色与文字色分开：白字只有在足够深的填充上才达到 4.5:1。 */
+  --color-primary-fill: #4F46E5;
+  --color-primary-fill-hover: #4338CA;
+  --color-on-primary: #FFFFFF;
   --color-primary-light: #EEF2FF;
   /* 主色低饱和底（浅色主题：靛蓝 8%）。此前 style.css 用 fallback 凑合，现在归位 */
   --color-primary-subtle: rgba(79, 70, 229, 0.08);
@@ -49,6 +55,11 @@
   --color-warning: #F59E0B;
   --color-danger: #EF4444;
   --color-info: #3B82F6;
+  /* 实心危险按钮：白字需要更深填充（#DC2626 = 4.83:1） */
+  --color-danger-fill: #DC2626;
+  --color-danger-fill-hover: #B91C1C;
+  --color-on-danger: #FFFFFF;
+  --color-focus-ring: color-mix(in srgb, var(--color-primary) 55%, transparent);
 
   --color-bg: #F9FAFB;
   --color-bg-elevated: #FFFFFF;
@@ -59,8 +70,9 @@
   --color-border-faint: color-mix(in srgb, var(--color-border) 55%, transparent);
 
   --color-text: #111827;
-  --color-text-secondary: #6B7280;
-  --color-text-tertiary: #9CA3AF;
+  --color-text-secondary: #4B5563;
+  /* tertiary 也必须过 4.5:1（12px 帮助/空态副文案大量使用） */
+  --color-text-tertiary: #5F6672;
   --color-text-inverse: #FFFFFF;
 
   --color-hover: #F3F4F6;
@@ -70,16 +82,24 @@
   /* 徽标 / 标签用的低饱和底色（原先散落在 style.css 里的 rgba 常量） */
   --color-success-subtle: rgba(16, 185, 129, 0.12);
   --color-warning-subtle: rgba(245, 158, 11, 0.15);
+  --color-code-bg: #0F172A;
+  --color-code-text: #E2E8F0;
+  --chart-cpu: #EF4444;
+  --chart-memory: #10B981;
+  --chart-gpu: #F59E0B;
+  --chart-grid: #E5E7EB;
+  --chart-axis: #9CA3AF;
+
   --color-danger-subtle: rgba(239, 68, 68, 0.12);
   --color-info-subtle: rgba(59, 130, 246, 0.12);
   --color-neutral-subtle: rgba(107, 114, 128, 0.15);
 
   /* 语义色·强（徽标/标签前景，深色主题覆盖为亮色变体） */
-  --color-success-strong: #059669;
-  --color-info-strong: #2563EB;
+  --color-success-strong: #047857;
+  --color-info-strong: #1D4ED8;
   --color-neutral-strong: #4B5563;
-  --color-danger-strong: #DC2626;
-  --color-warning-strong: #D97706;
+  --color-danger-strong: #B91C1C;
+  --color-warning-strong: #B45309;
 
   /* 主色的透明衍生。
      用 color-mix 从 --color-primary 派生，因此亮/暗主题自动跟随；
@@ -123,19 +143,39 @@
 
   /* ---------- 3. 尺寸 ---------- */
   --space-0: 0;
+  --space-hairline: 1px;
+  --space-0-5: 2px;
+  --space-0-75: 3px;
   --space-1: 4px;
+  --space-1-25: 5px;
   --space-2: 6px;
+  --space-1-75: 7px;
   --space-3: 8px;
+  --space-2-25: 9px;
+  --space-2-5: 10px;
   --space-4: 12px;
   --space-5: 14px;
   --space-6: 16px;
+  --space-4-5: 18px;
   --space-7: 20px;
   --space-8: 24px;
+  --space-10: 40px;
 
+  /* 主区留白：需要出血到容器边缘的页面（Chat）用它取负值，不能各自硬编码
+     20/24px —— 窄屏下主区留白会变成 14px，硬编码就会溢出视口。 */
+  --main-pad-block: var(--space-7);
+  --main-pad-inline: var(--space-8);
+
+  --radius-xxs: 2px;
+  --radius-xs: 4px;
   --radius-sm: 6px;
+  --radius-icon: 7px;
   --radius-md: 8px;
+  --radius-callout: 10px;
   --radius-lg: 12px;
   --radius-xl: 16px;
+  --radius-switch: 22px;
+  --radius-pill: 999px;
   /* 提示圈等小圆形元素（值是百分比，不是写死 px） */
   --radius-round: 50%;
 
@@ -144,20 +184,36 @@
     "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-mono: "JetBrains Mono", "Fira Code", Consolas, "Cascadia Code", Menlo, monospace;
 
+  --font-size-2xs: 10px;
   --font-size-xs: 11px;
   --font-size-sm: 12px;
   --font-size-base: 13px;
   --font-size-md: 14px;
   --font-size-lg: 15px;
   --font-size-xl: 18px;
+  --font-size-2xl: 22px;
 
   --line-height-tight: 1.4;
   --line-height-base: 1.6;
+
+  /* 排版层级。此前 .page-title(18/600) 与 .card-title(15/600) 只差 3px 和同样的
+     字重，扫读时页面标题不比卡片更"重"，所以整页看起来是平的。 */
+  --font-size-display: 26px;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+  --tracking-tight: -0.02em;
+  --tracking-caps: 0.08em;
 
   /* ---------- 5. 阴影 ---------- */
   --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.08);
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.10), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
   --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.10), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+  /* 卡片默认态与可交互态分开：静态卡片不因为悬停而"跳"，可点卡片才抬升。 */
+  --shadow-card: 0 1px 2px rgba(16, 24, 40, 0.05), 0 1px 3px rgba(16, 24, 40, 0.06);
+  --shadow-card-hover: 0 2px 4px rgba(16, 24, 40, 0.06), 0 12px 24px -12px rgba(16, 24, 40, 0.18);
+  --shadow-pop: 0 6px 12px -4px rgba(16, 24, 40, 0.10), 0 24px 48px -16px rgba(16, 24, 40, 0.24);
+  --ring-focus: 0 0 0 3px var(--color-primary-subtle);
 
   /* ---------- 6. 动效 ---------- */
   --duration-fast: 0.12s;
@@ -192,14 +248,26 @@
    深色主题：只覆盖语义色与阴影，变量名保持一致
    ========================================================================== */
 body.theme-dark {
-  --color-primary: #7C7CFF;
-  --color-primary-hover: #9595FF;
-  --color-primary-light: rgba(124, 124, 255, 0.12);
-  --color-primary-subtle: rgba(124, 124, 255, 0.10);
+  --color-code-bg: #0B1120;
+  --color-code-text: #E2E8F0;
+  --chart-grid: rgba(255, 255, 255, 0.08);
+  --chart-axis: rgba(255, 255, 255, 0.15);
+  color-scheme: dark;
+  /* 强调色（链接/激活文字）可以亮；实心按钮另用更深的 fill，保证白字对比度。 */
+  --color-primary: #9F9FFF;
+  --color-primary-hover: #B0B0FF;
+  --color-primary-fill: #5B5BD6;
+  --color-primary-fill-hover: #6A63E8;
+  --color-on-primary: #FFFFFF;
+  --color-primary-light: rgba(159, 159, 255, 0.14);
+  --color-primary-subtle: rgba(159, 159, 255, 0.10);
   --color-success: #34D399;
   --color-warning: #FBBF24;
   --color-danger: #F87171;
   --color-info: #60A5FA;
+  --color-danger-fill: #C81E1E;
+  --color-danger-fill-hover: #DC2626;
+  --color-on-danger: #FFFFFF;
 
   --color-bg: #0D0D0F;
   --color-bg-elevated: #161618;
@@ -208,13 +276,13 @@ body.theme-dark {
   --color-border-strong: #383840;
 
   --color-text: #E6E6EA;
-  --color-text-secondary: #9A9AA4;
-  --color-text-tertiary: #5C5C66;
+  --color-text-secondary: #A6A6B0;
+  --color-text-tertiary: #90909C;
   --color-text-inverse: #FFFFFF;
 
   --color-hover: #232328;
   --color-sidebar-bg: #131316;
-  --color-sidebar-active: rgba(124, 124, 255, 0.10);
+  --color-sidebar-active: rgba(159, 159, 255, 0.10);
 
   /* 强色在深色主题下换成亮色变体（原位是 body.theme-dark .badge-* 的散落覆盖） */
   --color-success-strong: #34D399;
@@ -228,6 +296,15 @@ body.theme-dark {
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
   --shadow-md: 0 4px 8px rgba(0, 0, 0, 0.3);
   --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.4);
+  /* 深色下黑阴影几乎不可见，抬升靠"更亮的边 + 更深的投影"共同表达。 */
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-card-hover: 0 2px 6px rgba(0, 0, 0, 0.45), 0 14px 28px -14px rgba(0, 0, 0, 0.6);
+  --shadow-pop: 0 8px 16px rgba(0, 0, 0, 0.5), 0 28px 56px -18px rgba(0, 0, 0, 0.7);
+  --ring-focus: 0 0 0 3px rgba(99, 102, 241, 0.32);
+}
+
+body.theme-light {
+  color-scheme: light;
 }
 
 /* ==========================================================================

@@ -2,6 +2,323 @@
 
 Notable changes follow the Keep a Changelog structure. The project is currently pre-1.0.
 
+## [Unreleased] - 2026-10-23
+
+### Added
+
+- Local knowledge bases: text/code, HTML, PDF, DOCX and scanned PDFs are indexed
+  in SQLite with chunk vectors plus FTS. GLM-OCR runs through `llama-server`,
+  Qwen embeddings are used for indexing and query retrieval, and an optional
+  Qwen reranker rescues the fused candidate list.
+- Chat knowledge mode: select a base in the toolbar, retrieve only for the
+  current question, inject numbered excerpts server-side, and persist citations
+  in assistant message stats so reload and Markdown export keep their sources.
+- Knowledge management UI: create/edit bases, add files/folders/paths, live
+  indexing progress, document preview, cancellation, retrieval testing, manual
+  model unload, and bilingual localized failures.
+- Navigation consolidation: model library/runtimes/presets now live in a
+  **Model workspace**, logs/monitor/history in **Observability**, and knowledge
+  bases have their own top-level page.
+- Model cards show quantization, size, architecture, native context, recent-use
+  state and quick launch; the dense list is now a real table (file / quant / size /
+  architecture / context / actions) instead of a control that hid the grid.
+- Knowledge indexing can be cancelled from the UI, and the confirmation names the
+  base it is about to delete before anything is destroyed.
+- Global backend reconnect/offline banner, browser core-path tests, axe-core
+  accessibility gate and first-paint performance budget in CI.
+- Two deeper browser suites: one clicks every previously unverified path (model
+  detail, view toggle, quick-launch preflight, chunk preview, cancellation,
+  settings persistence per category, English locale, dark theme, 800px layout)
+  and sweeps every non-destructive control on tabbed pages for dead actions; the
+  other forces failures — missing path, absent or broken model, embedding service
+  killed mid-index, rerank misconfiguration — and requires the UI to admit each.
+
+### Changed
+
+- Indexing is staged: OCR runs and unloads before embedding starts; page and
+  whole-document extraction results are cached by content hash.
+- Dependency locks and the PyInstaller onedir build now include `pypdf`,
+  `pypdfium2` and `numpy`; PDFium native binaries are collected explicitly.
+
+### Fixed
+
+- Knowledge-base quota failures, missing models, scanned PDFs without OCR and
+  embedding-model mismatches return readable errors without deleting an existing
+  index or silently answering as if retrieval succeeded.
+- **Hybrid retrieval was dense-only.** `search_fts` quoted the whole question as
+  one FTS5 phrase, which requires a verbatim substring of the user's wording and
+  matched nothing on natural-language questions. Measured on a 377-chunk legal
+  index: the fused ranking was identical to the dense ranking on 17 of 17
+  questions. Queries are now split into clauses (including CJK 3-grams) so the
+  lexical arm actually contributes — hit@1 35% → 52%, MRR 0.432 → 0.634, and
+  76% / 0.843 with reranking. See `docs/KNOWLEDGE_BASE.md`.
+- **The model-card 快速启动 button never fired.** Its click was swallowed by the
+  card's own `[data-open-model]` delegate, so quick launch silently opened the
+  detail pane instead. The more specific action is now matched first, and a
+  browser test refuses to pass unless the click reaches preflight or issues the
+  launch request.
+- **The 卡片/列表 toggle was dead, and "list" would have blanked the library.**
+  `workspace.js` hoists a child module's `.page-actions` into the shared toolbar,
+  which moves those nodes outside the module's subtree — so the module's
+  root-delegated listener never saw the click and `root.querySelectorAll` never
+  found the buttons to sync their pressed state. List view had also never been
+  implemented: selecting it only hid the grid. The control now holds its own
+  nodes, and list view renders a real table with file, quant, size, architecture,
+  context and actions columns.
+- **A knowledge base could not be cancelled from the UI.** `/cancel` was wired
+  end to end in the backend and in `api.js`, but no control ever called it, so an
+  indexing run could only be waited out. The progress block now has a 取消索引
+  button that leaves finished documents intact.
+- **Chat overflowed the viewport at 800px.** `.chat-page-v2` pulled itself to the
+  container edges with hardcoded `-20px -24px` margins, but the main padding
+  drops to 14px on narrow layouts, so the page measured 820px in an 800px window
+  and lost 10px on each side. The bleed is now derived from
+  `--main-pad-block` / `--main-pad-inline`.
+- **A named-but-missing source path was dropped silently.** `collect_paths`
+  skipped any path that did not exist, so a typo produced "added" while the
+  document never entered the index. Explicitly named missing paths now fail with
+  the path in the message; walk-time disappearances and symlinks still skip.
+- **The add-paths dialog closed on failure,** losing both the error context and
+  the text the user had typed. It now stays open, which is what AGENTS §2.20
+  already required.
+- **`cargo tauri build` could no longer build the shell.** `frontend/` is Tauri's
+  `frontendDist`, so the Node test dependencies added for the browser suites made
+  it refuse with *"The configured frontendDist includes the `["node_modules"]`
+  folder"* — and any scratch output under `frontend/tmp/` would have been embedded
+  into the shipped binary. The JS package (`package.json`, lockfile,
+  `node_modules`) now lives at the repository root, where Node still resolves it
+  for `frontend/tests/**`; CI runs `npm ci` from the root.
+  `backend/tests/test_web_root_hygiene.py` pins the web-root allowlist so this
+  cannot come back.
+- **A knowledge service could become permanently unreapable.** An index run took
+  the embedding service with a bare `acquire()` that nobody released, and the
+  idle reaper only started inside `lease()`; separately, `_reuse_running()`
+  returned `owned=False`, and `release()` skips non-owned handles forever.
+  Measured on a live machine: an embedding service stayed resident **22+ minutes
+  and ~2 GB of VRAM** past the documented 10-minute unload. Indexing now uses a
+  lease, `acquire()` starts the reaper, and a reused instance keeps its ownership
+  when its name carries the `[KB] ` prefix (AGENTS §2.30).
+- **`.grid-full` never applied.** The rule was written as a class selector while
+  every call site passes `grid-full` as an attribute, so the dashboard's empty
+  and debug states occupied a single 280px grid column instead of spanning.
+
+### Added
+
+- **Measured retrieval quality, reproducible.** `tools/eval_knowledge_retrieval.py`
+  scores 21 labelled questions plus 10 deliberately unanswerable ones against a
+  real 377-chunk legal index, and ablates dense / hybrid / +per-document cap /
+  +rerank. Current shipped path: **hit@1 76%, hit@3 95%, MRR 0.841**.
+  Numbers, the rejected options and the reproduction command live in
+  `docs/KNOWLEDGE_BASE.md`.
+- **Per-document cap in fusion** (`MAX_PER_DOCUMENT = 2`): one 161-chunk
+  regulation no longer fills both recall arms. Without reranking this lifted
+  hit@3 66% → 76% and hit@5 76% → 80% at no hit@1 cost.
+- **Article labels on chunks.** Chunks keep their windowed boundaries — splitting
+  on 第X条 measured *worse* (hybrid hit@1 52% → 35%) — but now carry the chapter
+  or article they mostly contain, so citations read
+  《个人信息保护法》第3页 · 第十七条.
+- **OCR provenance is disclosed.** Documents indexed from scans show an `OCR`
+  badge in the knowledge base and on every chat citation, with a tooltip saying
+  the wording is best-effort. The user's legal PDFs turned out to be browser
+  prints whose wrapped lines were clipped in the file itself, so no parser or
+  OCR setting can recover the missing characters.
+- **First-run dashboard.** Replaced the lone "暂无实例" icon with a two-card
+  panel: three working actions (选择模型并启动 / 浏览模型库 / 打开知识库) and a
+  live state card (llama-server configured, preset and knowledge-base counts).
+- **Knowledge services are labelled as such** on the dashboard, so a system-started
+  embedding server no longer looks like a model the user launched.
+
+## [Unreleased] - 2026-10-27
+
+### Added
+
+- Multi-backend runtime support for the official llama.cpp Windows packages
+  (CPU / Vulkan / OpenVINO / ROCm). All four ship the same version string and
+  the same `--help` surface, so the launcher identifies the backend from the
+  sibling accelerator DLL (`ggml-openvino.dll`, `ggml-hip.dll`,
+  `ggml-vulkan.dll`) and — the authoritative signal — from the build's own
+  `--list-devices` output, cached per path/mtime/size like the help probe.
+- The Runtime page lists the devices each build actually reports on this
+  machine (name, hardware, total/free memory) with per-backend empty-state
+  guidance: a CPU build listing nothing is normal, a ROCm build with no
+  supported AMD GPU says so, an OpenVINO build without runtime dependencies
+  says so.
+- A `--device` parameter so multi-GPU machines can pin inference to specific
+  devices (e.g. `Vulkan0`). For OpenVINO builds the launcher translates the
+  device name into the `GGML_OPENVINO_DEVICE` environment variable that
+  backend actually requires, and refuses to start on an unknown device name
+  instead of silently running on the wrong one.
+- Setting the llama-server path in Settings now mirrors into the runtime
+  registry's default slot (the reverse direction already existed), so the two
+  views of "which build am I using" can no longer drift apart. Unregistered
+  paths still save fine — sync never auto-registers a profile.
+- Auto-generated runtime display names include the backend family
+  (`VULKAN · 0.7.0-dev (build 11929…)`); the four official packages otherwise
+  produced identical rows in the runtime list.
+- A `warnings` field on running instances, rendered as an amber note (not a
+  red error), used e.g. for the ROCm CPU fallback notice below.
+
+### Fixed
+
+- **CORS did not expose the chat citation headers.** The packaged page origin
+  (`tauri.localhost`) fetches the loopback API cross-origin, and browsers only
+  let JavaScript read `Access-Control-Expose-Headers` names. The list carried
+  only `X-LunarShroud-Dropped-Turns`, so `X-LunarShroud-Sources` (knowledge
+  citations) and `X-LunarShroud-Knowledge` (miss notice) read as `null` in the
+  installed build: citations never rendered, never persisted, never exported,
+  while the backend was in fact injecting the excerpts. Both headers are now
+  exposed, pinned by a real-middleware test and a static contract test that
+  reconciles every header the frontend reads against the CORS list.
+- PowerShell 5.1 + UTF-8 Python environments crashed four portable-runtime
+  acceptance tests (`UnicodeDecodeError` on GBK console output); all test
+  subprocess reads now use `errors="replace"`.
+- Knowledge-service reaping raced a concurrent `acquire()`: a retrieval could
+  receive a handle to a service that was about to be stopped (a one-off 502).
+  Acquire/lease/release on the same service key are now serialized, released
+  services cannot be re-adopted mid-stop, and `release_kind` skips only the
+  busy service instead of the whole kind.
+- ROCm builds silently fall back to CPU inference when no supported AMD GPU
+  is present (verified on b11929: the service starts normally at ~6.8 tok/s).
+  The launcher now surfaces a warning on the instance card and in the log.
+- Every audit-identifier comment (`独立审计 M1`, `audit §7`, …) was rewritten
+  into plain technical statements so future audits can start blind.
+
+### Changed
+
+- Internal audit/remediation reports moved from the repository root into
+  `archive/audit-2026/` (still excluded from the public mirror, now by
+  directory rule instead of per-file names).
+
+
+## [Unreleased] - 2026-10-21
+
+### Added
+
+- Native Chat as the default Chat mode: local `chats.db` conversations, backend SSE proxy (API keys stay server-side), Markdown/code copy, reasoning disclosure, stop/regenerate, token/speed stats, Markdown export and a sandboxed WebUI fallback.
+- Chat advanced tools: user-message editing with truncate-and-regenerate, conversation branching, context usage meter tied to the instance `ctx_size`, and a prompt library (built-ins plus editable local prompts stored in `chats.db`).
+- Local text attachments via paperclip, file picker or drag/drop. Files are read in the webview only; text extensions, NUL/UTF-8 and per-file/message/conversation bounds are enforced, attachments persist with messages and copy into branches.
+- Local conversation search across titles, messages, attachment names and attachment content, with snippets, match-type labels, highlighting, keyboard navigation and focus preservation.
+- In-app backup/restore for config, presets, history and chats (including attachments/prompts): SQLite snapshots, SHA-256 manifests, staged restore applied before DB init, a pre-restore backup and path/hash validation.
+- Tauri tray icon with Show/Quit, opt-in `close_to_tray` (default off), runtime toggle and explicit quit; EnumWindows restore for a hidden second-instance launch.
+- Model-detail manifest editor for `model.yaml`/`manifest.json` with validation preview, atomic save/delete and old-file backups under `DATA_DIR/manifest-backups`.
+- Ctrl+K command palette for pages, new chat, model picker, parameter editor, theme and quit.
+
+### Changed
+
+- Packaged regression on 2026-10-21 rebuilt the PyInstaller onedir backend and optimized Tauri binary and verified real Qwen3.5-4B streaming plus packaged text attachments in WebView2; the repo-root portable pair was not replaced.
+- Follow-up on 2026-10-22 **did** rebuild and redeploy the repo-root portable pair (it had been left at the 2026-10-18 build while the desktop shortcut pointed there, so the shipped UI looked unchanged despite later work). The native chat UI is embedded in the shell binary at compile time, so a stale `LunarShroud.exe` cannot show newer frontend files no matter what is on disk.
+
+#### Chat reasoning trace (native Chat)
+
+- The model's thinking process is now a first-class `messages.reasoning` column with its own bound, instead of being squeezed into `stats_json`. It previously had to be truncated to 4000 characters before the write because the whole stats blob is capped at 16 KiB, so **the tail of any long chain of thought was destroyed at save time**: users saw the full trace while streaming and a shortened one after a reload, with no indication. A lazy `ALTER TABLE` migration adds the column and backfills the legacy `stats.reasoning` value, so existing sessions keep what they already had rather than losing it on upgrade.
+- The reasoning panel now expands while the model is thinking and collapses when the answer starts (default `auto`, selectable in Settings: auto / always expanded / always collapsed). Manual open/close is recorded on the message and survives the streaming re-render, and it **overrides** the preference for that message -- otherwise reading a collapsed trace would fight an automatic policy that snaps it shut on the next chunk.
+- Copy offers `Copy` and `Copy with reasoning` when a reply has a trace instead of silently dropping half the message; Markdown export writes the trace under its own heading, since an export is an archive.
+- Editing an assistant answer clears its now-inconsistent trace; `branch` copies the trace; an oversized trace is rejected with an error rather than quietly cut.
+
+#### One source of truth for "is a build configured"
+
+- `config.llama_server_path` and the runtime registry used to be two independent answers to the same question, and three UI sites looked only at the first. A user who registered a build under **运行环境 / Runtimes** could launch normally -- the backend accepts `server_path or cfg["llama_server_path"]` -- yet Settings refused to save *any* change (port, theme, tray were all blocked by that one empty field), the dashboard kept showing a "get llama-server" banner, and the Getting-started checklist reported an error.
+- The startup now adopts a legacy bare path into the runtime registry (idempotent, never fatal, and it does not invent a profile for a missing file), choosing a default runtime mirrors the path back into the legacy field, and all three sites consult one shared predicate that accepts either. A registered build whose capability probe failed still counts: probing answers *which flags* exist, not whether the binary can launch.
+
+#### Chat length is measured in tokens, not bytes
+
+- The chat send path is admitted against the model's real context window in **tokens** (`--tokenize` on the instance), trimming oldest non-system turns until the prompt fits, instead of two limits that measured different units. `MAX_REQUEST_BYTES` (2 MiB, checked as body bytes by middleware) used to fire long before `CHAT_MAX_TOTAL_CHARS` (2,000,000 characters): one Chinese character is 3 UTF-8 bytes, so a Chinese conversation was rejected at roughly 699,000 characters -- about 35% of the documented budget -- with a generic `413 request body too large` that mentions neither chat nor length, while an English conversation of the same size reached the intended `conversation is too long` message.
+- The 2 MiB transport guard is kept for every other endpoint (dropping it would let one request exhaust memory); only the chat route is widened to 8 MiB so the token policy is what actually decides, and it must be, because the middleware runs *before* trimming could happen.
+- When turns are dropped the count is returned in `X-LunarShroud-Dropped-Turns` and the UI says so -- silently losing history is the same failure class this whole pass set out to remove. The header had to be added to CORS `expose_headers`: the webview is cross-origin to the backend, so without it the notice would ship and never display.
+- If even the system prompt plus the current question cannot fit, the request fails with the measured token count and the configured window instead of trimming the user's input away.
+
+Verified against the real local build: a 3.10 MiB Chinese conversation (121 turns) against a 1024-token window now returns 200 with 120 turns trimmed and a normal reply, while a 3 MiB body to a non-chat endpoint still gets 413.
+
+### Fixed
+
+- `tools/Publish-PortableRuntime.ps1` now signs the launcher and the NSIS installer with a
+  local code-signing certificate when one is present, and skips with an explicit warning when
+  none is (so a plain clone still deploys). It signs the **source** artifact *before* staging,
+  because the whole script verifies "staged copy == source" by SHA-256 and signing after that
+  check would invalidate it. When it signs an installer it also regenerates that directory's
+  `SHA256SUMS.txt` — otherwise signing would recreate the stale-checksum defect fixed earlier in
+  this release. A signing failure aborts the deploy instead of silently shipping an unsigned
+  binary, and `-SkipSigning` exists for tests that use non-PE fixtures.
+  Local trust only: the certificate lives in `CurrentUser\My`, trusted by
+  `CurrentUser\Root` + `CurrentUser\TrustedPublisher`, and does nothing for other machines.
+
+Independence note: every item below was re-verified against the current source
+with an isolated reproduction **before** being changed; the 2026-10-21 external
+audit report was used as a lead, not as evidence. Each fix ships a red-green
+test (it fails against the pre-fix code).
+
+- A `config.json` that is valid JSON but not valid UTF-8 (saved from Notepad as
+  ANSI/GBK with a Chinese model path) no longer bricks the backend.
+  `UnicodeDecodeError` is neither `json.JSONDecodeError` nor `OSError`, so it
+  escaped `_load_config_from_file` and reached `main.py`'s **import-time**
+  `get_config()` — uvicorn never bound a port and the user only saw "backend
+  failed to start", with the config neither quarantined nor recoverable.
+  Non-decodable files are now quarantined to `config.json.corrupt` and startup
+  continues on defaults; a genuine UTF-16 (BOM) config is *read*, not discarded.
+- A corrupt `chats.db` is now quarantined and rebuilt like `history.db`.
+  Previously the app started, but every `/api/chats` and `/api/prompts` call
+  re-ran `CREATE TABLE`, re-raised `DatabaseError`, and the chat page, search,
+  prompt library and attachments stayed 500 forever with no in-app repair path.
+  The recovery rules now live in one module (`core/sqlite_recovery.py`) shared by
+  both databases: only SQLite-reported corruption is quarantined, lock and
+  permission errors still propagate, and `-wal`/`-shm` move with the main file.
+- `Publish-PortableRuntime.ps1` no longer deletes a working install when it
+  fails *before* swapping. The staging hash checks ran inside `try` while the
+  `catch` deleted all three destinations unconditionally — and because
+  `.rollback` is only created after those checks, there was nothing to restore.
+  Reproduced against a fixture: the target directory was left containing only
+  `.next` files. Rollback is now per-slot (a slot with no `.rollback` was never
+  touched), stale `.next` leftovers are cleared before staging so one crash
+  cannot wedge every later deploy, and the PS 5.1 `Remove-Item`
+  `NullReferenceException` in `finally` is gone.
+- Branching a conversation at the 500-conversation cap no longer destroys the
+  source thread. The prune deleted the oldest row without excluding the
+  conversation being branched; verified both outcomes, including the more common
+  one where an *unrelated* conversation was silently evicted instead.
+- `extra_args` can no longer override `--model` / `--cors-origins`. Managed-flag
+  enforcement covered `host`/`api_key`/`port`/`path`/`log_file`, but the same
+  last-wins mechanism applies to identity: validation, preflight, history and
+  VRAM estimates all read `params["model"]` while `extra_args` lands at the end
+  of argv. The blacklist is now scoped to `config_resolver.MANAGED_KEYS` and
+  covers each upstream spelling (`-m`, `--model`, `-mu`/`--model-url`), and is
+  enforced at preset import as well as launch. `--mmproj` deliberately stays
+  allowed.
+- Launch now probes the configured build instead of promising to. Preflight said
+  "flag support will be verified at launch" while `_validate_start` only *read*
+  the cache and `DefaultGate.supported` passed unknown flags through, so a cold
+  cache produced a launch that died in llama-server argument parsing with an
+  unhelpful `invalid argument`. The launch path now warms the probe (bounded,
+  single-flight, degrades on failure) and a cold cache is reported as a warning
+  rather than an informational line.
+- Python `system_tool()` resolves the real system directory through
+  `GetSystemDirectoryW` instead of trusting `SystemRoot`/`windir`. A forged
+  `SystemRoot` previously produced an *absolute* path into an attacker-writable
+  directory, which is exactly what the absolute-path rule was meant to prevent;
+  the Tauri shell already used the API. When the system directory cannot be
+  determined the tool is disabled rather than falling back to a bare name.
+- Presets saved with a UTF-8 BOM are no longer invisible. `preset_store` read
+  with `utf-8` while config and manifests use `utf-8-sig`, so `json.load` threw
+  and `list_presets` silently skipped the file — the preset stayed on disk but
+  vanished from the UI. Skipped presets are now logged, and the paste-to-import
+  path strips a leading BOM. The in-app backup manifest reader was aligned too.
+- `tools/verify_checksums.py` gained `--generate` and now fails when the
+  directory contains a release-shaped file the checksum list does not cover.
+  The shipped `SHA256SUMS.txt` (written 2026-10-18) did not match the
+  `0.9.0-beta.2` installer (rebuilt 2026-10-20); checksums were regenerated for
+  the current artifact. `LunarShroud_0.9.0-beta.1_x64-setup.exe` is still sitting
+  in that bundle directory and is now reported as uncovered — decide whether to
+  remove it before treating this directory as a release candidate.
+- Rust tests no longer write the real `%APPDATA%\LunarShroud\logs\launcher.log`.
+  `request_shutdown()` logs, and the candidate chain puts `%APPDATA%` first, so
+  `cargo test` both polluted user data and failed under restricted tokens
+  (AGENTS §6.5). Test runs now log beside the test binary; verified by
+  comparing file mtimes before and after `cargo test`.
+- History rows render `port` and `exit_code` through `escapeHtml`. Normal writes
+  are integers, but the column is not type-constrained, so a hand-built or
+  restored SQLite backup could carry a markup payload into the history detail
+  view.
+
+
 ## [0.9.0-beta.2] - 2026-10-17
 
 ### Added

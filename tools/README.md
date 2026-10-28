@@ -19,8 +19,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\Restore-UserData.p
     -BackupDirectory .\LunarShroud-backup-20261017-203000
 ```
 
-Backup copies `config.json`, `history.db` (plus WAL/SHM sidecars) and
-`presets\`; logs are optional via `-IncludeLogs`. Restore verifies the manifest
+Backup copies `config.json`, `history.db`, `chats.db` (chat messages, local text
+attachments and saved prompts, plus their WAL/SHM sidecars) and `presets\`;
+logs are optional via `-IncludeLogs`. The in-app
+Settings → 数据备份 panel uses the same manifest format and stores snapshots
+under `DATA_DIR\backups\`; it snapshots SQLite with its backup API and applies
+restore at the next backend start. Logs are not restored by the in-app path.
+Restore verifies the manifest
 before touching anything, renames the current data directory to
 `LunarShroud.pre-restore-<timestamp>`, then copies and re-verifies. Do not use
 `Get-FileHash` in these scripts: PowerShell 5.1 launched from a PowerShell 7

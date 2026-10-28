@@ -12,7 +12,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 # 这一整个文件曾经跑在 INSECURE_DEV_MODE=True 下 —— 认证中间件全程关闭，
 # 于是 15 个断言全都证明不了任何安全性质：把 session_auth_middleware 整个删掉
-# 它们依然全绿（audit §7 空洞测试 #1）。现在改为**启用认证**并让客户端自带
+# 它们依然全绿（曾经的空洞测试形态 #1）。现在改为**启用认证**并让客户端自带
 # 令牌，这些测试才真正穿过认证路径。
 AUTH_TOKEN = "integration-test-token"
 AUTH_HEADERS = {"X-LunarShroud-Token": AUTH_TOKEN}
@@ -179,6 +179,56 @@ def test_preset_crud_diff_import_export(api_client):
     assert api_client.delete(f"/api/presets/{preset_id}").status_code == 200
     assert api_client.delete(f"/api/presets/{clone_id}").status_code == 200
     assert api_client.get("/api/presets/missing").status_code == 404
+
+
+def test_preset_runtime_id_round_trip_and_preserved_on_update(api_client):
+    payload = {
+        "name": "runtime-pinned",
+        "params": {"model": r"D:\model.gguf", "ctx_size": 4096},
+        "runtime_id": "rt_cuda12_test",
+    }
+    created = api_client.post("/api/presets", json=payload)
+    assert created.status_code == 200
+    preset_id = created.json()["id"]
+    assert created.json()["runtime_id"] == "rt_cuda12_test"
+
+    # 编辑表单不提交 runtime_id 时必须保留，否则一次改名就悄悄解绑运行环境
+    updated = api_client.put(
+        f"/api/presets/{preset_id}",
+        json={"name": "runtime-pinned-2", "params": payload["params"]},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["runtime_id"] == "rt_cuda12_test"
+
+    clone = api_client.post(f"/api/presets/{preset_id}/clone", json={"name": "runtime-clone"})
+    assert clone.status_code == 200
+    assert clone.json()["runtime_id"] == "rt_cuda12_test"
+
+
+def test_history_records_runtime_identity(api_client):
+    from core import history_store
+
+    record_id = history_store.record_launch(
+        instance_id="runtime-history",
+        preset_id=None,
+        preset_name=None,
+        model_path=r"D:\model.gguf",
+        port=8080,
+        params={"model": r"D:\model.gguf"},
+        command_text="llama-server -m model.gguf",
+        runtime_id="rt_cuda12_test",
+        runtime_label="CUDA 12 test",
+        model_key="example-org/example-model",
+        variant_key="example-model-Q4_K_M",
+    )
+    listed = api_client.get("/api/history").json()
+    row = next(item for item in listed if item["id"] == record_id)
+    assert row["runtime_id"] == "rt_cuda12_test"
+    assert row["runtime_label"] == "CUDA 12 test"
+    assert row["model_key"] == "example-org/example-model"
+    assert row["variant_key"] == "example-model-Q4_K_M"
+    detail = api_client.get(f"/api/history/{record_id}").json()
+    assert detail["runtime_label"] == "CUDA 12 test"
 
 
 def test_sensitive_params_are_not_persisted(api_client):
@@ -565,3 +615,132 @@ def test_vram_estimate_endpoint_survives_monitor_failure(api_client, tmp_path, m
     )
     assert response.status_code == 200
     assert response.json()["fit"]["level"] == "unknown"
+
+
+def test_diagnose_reports_guardrail_policy(api_client, monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "_config", {**config.DEFAULT_CONFIG, "launch_guardrail": "strict"})
+    response = api_client.post(
+        "/api/diagnose", json={"params": {"model": "", "port": 0}}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["guardrail"] == "strict"
+    assert body["blocking"] is True
+    assert body["summary"]["errors"] >= 1
+
+
+def test_model_defaults_endpoints_round_trip(api_client, tmp_path):
+    """Manifest < user defaults, with managed keys rejected at the API boundary."""
+    model = tmp_path / "models" / "model.gguf"
+    model.parent.mkdir()
+    model.write_bytes(b"gguf")
+    (model.parent / "model.yaml").write_text(
+        """
+model: example-org/example-model
+config:
+  load:
+    fields:
+      - key: llm.load.contextLength
+        value: {checked: true, value: 16384}
+""",
+        encoding="utf-8",
+    )
+
+    response = api_client.get("/api/models/defaults", params={"model": str(model)})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["model_key"] == "example-org/example-model"
+    assert body["params"]["ctx_size"] == 16384
+    assert body["sources"]["ctx_size"] == "manifest"
+
+    response = api_client.put(
+        "/api/models/defaults",
+        json={"model": str(model), "params": {"ctx_size": 8192, "threads": 4}},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["params"]["ctx_size"] == 8192
+    assert body["sources"]["ctx_size"] == "user"
+    assert body["sources"]["threads"] == "user"
+
+    bad = api_client.put(
+        "/api/models/defaults",
+        json={"model": str(model), "params": {"host": "0.0.0.0"}},
+    )
+    assert bad.status_code == 400
+    assert "managed" in bad.json()["detail"]
+
+    response = api_client.delete("/api/models/defaults", params={"model": str(model)})
+    assert response.status_code == 200
+    assert response.json()["params"]["ctx_size"] == 16384
+    assert response.json()["sources"]["ctx_size"] == "manifest"
+
+    missing = api_client.get("/api/models/defaults")
+    assert missing.status_code == 400
+
+
+def test_instance_creation_rejects_non_string_model_path_with_400(api_client, monkeypatch, tmp_path):
+    import config
+
+    server = tmp_path / "llama-server.exe"
+    server.write_bytes(b"fake")
+    cfg = dict(config.DEFAULT_CONFIG)
+    cfg["llama_server_path"] = str(server)
+    monkeypatch.setattr(config, "_config", cfg)
+
+    response = api_client.post(
+        "/api/instances",
+        json={"params": {"model": ["D:/models/a.gguf"], "port": 0}},
+    )
+    assert response.status_code == 400
+    assert "model" in response.text.lower()
+
+
+def test_saving_the_server_path_mirrors_the_registry_default(api_client, monkeypatch, tmp_path):
+    """设置页保存路径必须让运行环境默认项跟上（走真实端点，不测纯函数）。
+
+    纯函数测试证明不了"接口有没有接线"——`api_update_config` 里漏掉那次调用时，
+    `test_runtime_path_sync.py` 依然全绿，而用户改完设置重启后用的还是旧构建。
+    """
+    from core import runtime_registry
+    from core.server_probe import ServerProbe
+
+    monkeypatch.setattr(runtime_registry._config, "DATA_DIR", tmp_path / "runtime")
+    monkeypatch.setattr(
+        runtime_registry,
+        "probe_server",
+        lambda path: ServerProbe(path=str(path), probed=True, version="0.7.0-dev", options={}),
+    )
+    monkeypatch.setattr(runtime_registry.server_probe, "list_devices", lambda path: [])
+
+    first = tmp_path / "build-cpu" / "llama-server.exe"
+    second = tmp_path / "build-vulkan" / "llama-server.exe"
+    for exe in (first, second):
+        exe.parent.mkdir(parents=True, exist_ok=True)
+        exe.write_bytes(b"fake")
+    first_profile = runtime_registry.register_runtime(str(first))
+    second_profile = runtime_registry.register_runtime(str(second))
+    runtime_registry.set_runtime_preferences({"defaults": {"gguf": first_profile["id"]}})
+
+    response = api_client.put("/api/system/config", json={"llama_server_path": str(second)})
+
+    assert response.status_code == 200
+    assert runtime_registry.get_runtime_preferences()["defaults"]["gguf"] == second_profile["id"]
+
+
+def test_saving_an_unregistered_server_path_still_saves_config(api_client, monkeypatch, tmp_path):
+    """未注册路径：配置照常保存，不因注册表同步失败而报错。"""
+    from core import runtime_registry
+
+    monkeypatch.setattr(runtime_registry._config, "DATA_DIR", tmp_path / "runtime2")
+    stray = tmp_path / "stray" / "llama-server.exe"
+    stray.parent.mkdir(parents=True, exist_ok=True)
+    stray.write_bytes(b"fake")
+
+    response = api_client.put("/api/system/config", json={"llama_server_path": str(stray)})
+
+    assert response.status_code == 200
+    assert response.json()["llama_server_path"] == str(stray)
+    assert runtime_registry.get_runtime_preferences()["defaults"] == {}

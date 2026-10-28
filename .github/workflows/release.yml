@@ -48,7 +48,13 @@ jobs:
         with:
           node-version: '22'
       - name: Frontend unit tests
-        run: node --test frontend/tests/runtime.test.mjs frontend/tests/i18n.test.mjs
+        shell: pwsh
+        run: |
+          $tests = @(Get-ChildItem frontend/tests -File -Filter '*.test.mjs')
+          if ($tests.Count -eq 0) { throw 'No frontend test files found; refusing a false-green check.' }
+          node --test $tests.FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Ran $($tests.Count) frontend test file(s)."
       - name: Frontend syntax check
         shell: pwsh
         run: |

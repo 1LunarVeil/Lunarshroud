@@ -10,7 +10,12 @@ param(
     [Parameter(Mandatory)]
     [string]$Destination,
     [string]$BackupDirectory,
-    [switch]$SkipDesktopShortcut
+    [switch]$SkipDesktopShortcut,
+    # 本机找不到签名证书时签名本来就是"跳过"，所以默认开启没有副作用；
+    # 测试用假 exe（不是合法 PE）时必须显式跳过，否则签名会失败并中断部署。
+    [switch]$SkipSigning,
+    # 维护者明确知道应用已关闭时仍可覆盖；默认拒绝正在运行的安装。
+    [switch]$AllowRunning
 )
 
 if (-not $LauncherSource) {
@@ -82,6 +87,77 @@ function Copy-TreeVerified([string]$Source, [string]$Destination, [string]$Label
     Assert-SameTree $Source $Destination $Label
 }
 
+function Get-CodeSigningCertificate {
+    # 本机自签证书（2026-10-22 建立）。刻意按 Subject 匹配而不是写死指纹：
+    # 指纹会随证书重建而变化，写死之后换一次证书就要改脚本。
+    # 找不到不是错误——别人 clone 下来本来就没有这张证书。
+    try {
+        return Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert -ErrorAction Stop |
+            Where-Object {
+                $_.Subject -like '*CN=LunarShroud Local Build*' -and $_.HasPrivateKey
+            } |
+            Select-Object -First 1
+    } catch {
+        Write-Warning "could not query the code-signing certificate store: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Protect-Artifact([string]$Path, $Certificate) {
+    $result = Set-AuthenticodeSignature -FilePath $Path -Certificate $Certificate -HashAlgorithm SHA256
+    if ($result.Status -ne 'Valid') {
+        throw "code signing failed for $Path : $($result.Status) $($result.StatusMessage)"
+    }
+    Write-Host "Signed: $Path"
+}
+
+function Invoke-OptionalSigning([string]$LauncherPath, [string]$BackendPath) {
+    # 签名发生在**复制之前**（签源文件）。这一点是刻意的：部署脚本全程靠
+    # SHA-256 校验"暂存副本 == 源文件"，如果先校验再改字节，校验结论立刻就过期了。
+    # 签源文件则暂存、部署、回滚三处的哈希始终一致。
+    #
+    # 只签外壳 exe，不签 backend.exe：backend 是外壳 spawn 的子进程，SmartScreen
+    # 只对用户主动启动的可执行文件生效；而给 it 加签会改动它的哈希，徒增风险。
+    if ($SkipSigning) {
+        Write-Host 'Code signing skipped (-SkipSigning).'
+        return
+    }
+    $cert = Get-CodeSigningCertificate
+    if (-not $cert) {
+        Write-Warning ('No local code-signing certificate found; deploying UNSIGNED. ' +
+            'Windows SmartScreen will warn on first run for every recipient.')
+        return
+    }
+    Write-Host "Code signing with: $($cert.Subject) [$($cert.Thumbprint)]"
+    Protect-Artifact $LauncherPath $cert
+
+    # 安装包是用户真正双击的那个文件，同样要签；签完必须重算校验和，否则就
+    # 复现了"清单写于最终构建之前"那个缺陷（校验和与产物不一致）。
+    $bundleDir = Join-Path (Split-Path -Parent $LauncherPath) 'bundle\nsis'
+    if (-not (Test-Path -LiteralPath $bundleDir -PathType Container)) {
+        return
+    }
+    $installers = @(Get-ChildItem -LiteralPath $bundleDir -Filter '*-setup.exe' -File -ErrorAction SilentlyContinue)
+    if (-not $installers) { return }
+    foreach ($installer in $installers) {
+        Protect-Artifact $installer.FullName $cert
+    }
+    $sums = Join-Path $bundleDir 'SHA256SUMS.txt'
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $python) {
+        Write-Warning "python not found; regenerate $sums before publishing (it is now stale)."
+        return
+    }
+    $regenerate = Join-Path $PSScriptRoot 'verify_checksums.py'
+    foreach ($installer in $installers) {
+        & $python.Source $regenerate --generate $bundleDir --artifact $installer.Name | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "could not regenerate $sums after signing $($installer.Name)"
+        }
+    }
+    Write-Host "Regenerated $sums"
+}
+
 $launcher = Get-VerifiedPath $LauncherSource 'Launcher source'
 $backend = Get-VerifiedPath $BackendSource 'Backend source'
 $backendRuntimeSource = Split-Path -Parent $backend
@@ -101,6 +177,16 @@ if ($launcher -eq $launcherDestination -or $backend -eq $backendDestination) {
     throw 'Source and destination must be different paths.'
 }
 
+if (-not $AllowRunning) {
+    $running = @(Get-Process -Name "LunarShroud", "backend" -ErrorAction SilentlyContinue)
+    if ($running) {
+        throw 'LunarShroud or backend.exe is running. Close it (including tray mode) before deploying, or pass -AllowRunning explicitly.'
+    }
+}
+
+# 在暂存/校验之前签源文件，保证后续所有 SHA-256 比对比较的是同一份字节。
+Invoke-OptionalSigning $launcher $backend
+
 New-Item -ItemType Directory -Path $destinationRoot -Force | Out-Null
 New-Item -ItemType Directory -Path (Split-Path -Parent $backendDestination) -Force | Out-Null
 
@@ -118,17 +204,70 @@ if ($BackupDirectory -and ((Test-Path -LiteralPath $launcherDestination) -or (Te
     }
 }
 
-$launcherStage = "$launcherDestination.next"
-$backendStage = "$backendDestination.next"
-$internalStage = "$internalDestination.next"
-Copy-Item -LiteralPath $launcher -Destination $launcherStage -Force
-Copy-Item -LiteralPath $backend -Destination $backendStage -Force
-Copy-TreeVerified $internalSource $internalStage 'Backend runtime staging'
+function Clear-StalePath([string]$Path) {
+    # 只用于 .next / .rollback 这种"本脚本自己造的暂存件"。上一次崩溃留下的残留
+    # 会让 Copy-Item -Destination <目录> 把文件复制进目录里，于是本次哈希校验又
+    # 失败 —— 一次故障变成永久故障。清理失败只警告：它不是本次部署的错因，
+    # 不该掩盖真正的异常。
+    if (Test-Path -LiteralPath $Path) {
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force
+        } catch {
+            Write-Warning "could not clear stale path $Path : $($_.Exception.Message)"
+        }
+    }
+}
+
+function Restore-RollbackSlot([string]$Rollback, [string]$Destination) {
+    # 按**每一格**独立恢复。三段是逐个 Move-Item 的，中途失败时可能只有 launcher
+    # 进了 .rollback，而 backend / _internal 的目的地仍是完好的旧文件。
+    # 旧实现在 catch 里无条件删掉三个目的地，把从没动过的那两格也一起删了；
+    # 而 staging 校验失败发生在旧文件移动**之前**，.rollback 根本不存在，
+    # 于是"新的没装上、旧的也没了"（实测目标目录只剩 .next 残留）。
+    # .rollback 不存在 = 这一格从没被动过 = 什么都不许碰。
+    if (-not (Test-Path -LiteralPath $Rollback)) {
+        return
+    }
+    if (Test-Path -LiteralPath $Destination) {
+        Remove-Item -LiteralPath $Destination -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Move-Item -LiteralPath $Rollback -Destination $Destination -ErrorAction SilentlyContinue
+}
 
 $launcherRollback = "$launcherDestination.rollback"
 $backendRollback = "$backendDestination.rollback"
 $internalRollback = "$internalDestination.rollback"
-$rolledBack = $false
+
+function Recover-InterruptedSwap([string]$Rollback, [string]$Destination) {
+    # A previous run may have moved the only good copy into .rollback and then
+    # crashed before installing the new one. Recover it before staging; never
+    # clear a rollback slot that is the only surviving copy.
+    if (-not (Test-Path -LiteralPath $Rollback)) { return }
+    if (Test-Path -LiteralPath $Destination) {
+        Clear-StalePath $Rollback
+        return
+    }
+    Move-Item -LiteralPath $Rollback -Destination $Destination -ErrorAction Stop
+    Write-Host "Recovered interrupted deployment slot: $Destination"
+}
+foreach ($pair in @(
+    @($launcherRollback, $launcherDestination),
+    @($backendRollback, $backendDestination),
+    @($internalRollback, $internalDestination)
+)) {
+    Recover-InterruptedSwap -Rollback $pair[0] -Destination $pair[1]
+}
+
+$launcherStage = "$launcherDestination.next"
+$backendStage = "$backendDestination.next"
+$internalStage = "$internalDestination.next"
+foreach ($path in @($launcherStage, $backendStage, $internalStage)) {
+    Clear-StalePath $path
+}
+Copy-Item -LiteralPath $launcher -Destination $launcherStage -Force
+Copy-Item -LiteralPath $backend -Destination $backendStage -Force
+Copy-TreeVerified $internalSource $internalStage 'Backend runtime staging'
+
 $swapped = $false
 
 try {
@@ -139,9 +278,7 @@ try {
     # 新 launcher/backend 会产生版本不匹配；没有回滚则可能得到"新 exe + 缺
     # 运行时"的不可启动组合。运行中的 exe 无法改名，先让用户关闭应用。
     foreach ($path in @($launcherRollback, $backendRollback, $internalRollback)) {
-        if (Test-Path -LiteralPath $path) {
-            Remove-Item -LiteralPath $path -Recurse -Force
-        }
+        Clear-StalePath $path
     }
     if (Test-Path -LiteralPath $launcherDestination) {
         Move-Item -LiteralPath $launcherDestination -Destination $launcherRollback
@@ -163,34 +300,24 @@ try {
     $swapped = $true
 }
 catch {
-    # 尽力恢复旧对；清理失败不覆盖原始异常。
-    foreach ($path in @($launcherDestination, $backendDestination, $internalDestination)) {
-        if (Test-Path -LiteralPath $path) {
-            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
-    if (Test-Path -LiteralPath $launcherRollback) {
-        Move-Item -LiteralPath $launcherRollback -Destination $launcherDestination -ErrorAction SilentlyContinue
-    }
-    if (Test-Path -LiteralPath $backendRollback) {
-        Move-Item -LiteralPath $backendRollback -Destination $backendDestination -ErrorAction SilentlyContinue
-    }
-    if (Test-Path -LiteralPath $internalRollback) {
-        Move-Item -LiteralPath $internalRollback -Destination $internalDestination -ErrorAction SilentlyContinue
-    }
-    $rolledBack = $true
+    # 逐格恢复旧对。恢复本身失败也不吞掉、不覆盖原始异常：那些 .rollback 文件
+    # 仍在原地，用户还能手动搬回去。
+    Restore-RollbackSlot $launcherRollback $launcherDestination
+    Restore-RollbackSlot $backendRollback $backendDestination
+    Restore-RollbackSlot $internalRollback $internalDestination
     throw
 }
 finally {
-    if ($swapped -or $rolledBack) {
+    if ($swapped) {
+        # 只有换入并逐文件校验通过，旧的三段才成为冗余。失败路径上它们是用户
+        # 唯一的原件，绝不允许在这里被删。
         foreach ($path in @($launcherRollback, $backendRollback, $internalRollback)) {
-            if (Test-Path -LiteralPath $path) {
-                Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
-            }
+            Clear-StalePath $path
         }
     }
-    Remove-Item -LiteralPath $launcherStage,$backendStage -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $internalStage -Recurse -Force -ErrorAction SilentlyContinue
+    foreach ($path in @($launcherStage, $backendStage, $internalStage)) {
+        Clear-StalePath $path
+    }
 }
 
 if (-not $SkipDesktopShortcut) {

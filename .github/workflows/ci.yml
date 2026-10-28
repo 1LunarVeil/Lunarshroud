@@ -48,7 +48,13 @@ jobs:
         with:
           node-version: '22'
       - name: Frontend unit tests
-        run: node --test frontend/tests/runtime.test.mjs frontend/tests/i18n.test.mjs
+        shell: pwsh
+        run: |
+          $tests = @(Get-ChildItem frontend/tests -File -Filter '*.test.mjs')
+          if ($tests.Count -eq 0) { throw 'No frontend test files found; refusing a false-green check.' }
+          node --test $tests.FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Ran $($tests.Count) frontend test file(s)."
       - name: Frontend syntax check
         shell: pwsh
         run: |
@@ -59,6 +65,34 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
           Write-Host "Checked $($scripts.Count) JavaScript files."
+      - name: Browser core-path, accessibility and performance gate
+        shell: pwsh
+        run: |
+          $env:LUNARSHROUD_ALLOW_INSECURE_DEV = '1'
+          $backend = Start-Process -FilePath python -ArgumentList '-m', 'uvicorn', 'main:app', '--host', '127.0.0.1', '--port', '17520', '--log-level', 'warning' -WorkingDirectory backend -PassThru
+          try {
+            $ready = $false
+            for ($attempt = 0; $attempt -lt 60; $attempt++) {
+              try {
+                if ((Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:17520/api/system/health').StatusCode -eq 200) {
+                  $ready = $true
+                  break
+                }
+              } catch {
+                Start-Sleep -Milliseconds 500
+              }
+            }
+            if (-not $ready) { throw 'Backend did not become ready for browser tests.' }
+            # The Node test package lives at the repository root: `frontend/` is
+            # Tauri's frontendDist, and embedding node_modules into the shell is
+            # both a build error and needless payload.
+            npm ci
+            if ($LASTEXITCODE -ne 0) { throw 'npm ci failed.' }
+            npm run test:browser
+            if ($LASTEXITCODE -ne 0) { throw 'Browser acceptance tests failed.' }
+          } finally {
+            if ($backend -and -not $backend.HasExited) { Stop-Process -Id $backend.Id -Force }
+          }
       - name: Build bundled Python backend
         working-directory: backend
         run: python -m PyInstaller backend.spec --clean -y

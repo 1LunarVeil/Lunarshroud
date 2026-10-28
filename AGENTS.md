@@ -48,7 +48,7 @@ python tools/check_release_mirror.py       # 发布镜像门禁（见 §3）
 **禁用**该工具；Rust 外壳用 `GetSystemDirectoryW` 而不是 `SystemRoot` 环境变量。
 `which_on_path()` 跳过相对 `PATH` 项；`probe_server()` 只按应用目录/PATH 解析
 相对名，解析失败返回"未探测"，绝不相对 CWD 执行。
-钉它的测试：Python 的 `test_system_tools_are_disabled_without_systemroot`、
+钉它的测试：Python 的 `test_system_tools_are_disabled_when_the_system_dir_is_unavailable`、
 `test_which_on_path_ignores_relative_path_entries`、
 `test_probe_server_never_executes_a_relative_name_from_cwd`；Rust Windows 侧的
 `system_tools_are_resolved_inside_system32` 与
@@ -145,7 +145,7 @@ python tools/check_release_mirror.py       # 发布镜像门禁（见 §3）
 
 `restart_instance` 必须先锁 `chain_root` 那一代，再沿 `replaced_by` 往下锁；
 对着已被替换的旧 ID 重启应当是**空操作**（返回当前存活的那一代）；
-停止失败（`FAILED`）时**必须拒绝**启动新一代。
+停止失败（`FAILED`）且**进程句柄仍存活**时**必须拒绝**启动新一代；已经退出的 FAILED 实例允许重启。
 
 *为什么*：只锁"被点名的那一代"是不够的——从下游 ID 进来的重启不碰上游锁，
 结果是两条实例记录同时 `running`、同时占同一个端口、两个服务进程并存。
@@ -236,6 +236,7 @@ lifespan 的 `init_db()` 抛 `DatabaseError`，进程以 exit 3 退出，用户�
 
 ### 2.15 后端是 onedir，部署必须整目录
 
+
 `backend/dist/backend/` 里的 `backend.exe` 与 `_internal/` 是一个不可拆分的
 运行时。`src-tauri/build.rs`、`tauri.conf.json` 的 bundle resources、
 `Publish-PortableRuntime.ps1` 都必须整棵复制并逐文件校验；只复制 exe 会得到
@@ -302,6 +303,218 @@ Tauri 默认的 `%LOCALAPPDATA%\<identifier>`：受限令牌/沙箱下该目录�
 `setup: main window created`、`visible_before=true/visible_after=true`，后端日志
 出现 `WebSocket /ws/instances [accepted]`。
 
+### 2.19 配额已满时不得静默删除用户内容
+
+聊天、单会话消息、提示词库达到固定上限时，必须返回可读的 4xx 并保持旧数据不变；
+允许“最后一条 assistant 回复”完成当前 user 轮次，但不能为了腾位删除旧会话/旧消息。
+前端必须把这条错误经 `localizeBackendError` 呈现。
+
+*为什么*：静默 LRU 淘汰会在用户没有删除操作、也没有提示的情况下永久丢失聊天记录。
+*钉它的测试*：`test_chat_store.py` 的 `test_message_cap_refuses...`、
+`test_conversation_cap_refuses...`、`test_assistant_can_complete...`、
+`test_branching_at_the_conversation_cap_refuses...`。
+
+### 2.20 异步弹窗动作必须等待结果
+
+`showModal` 的动作处理必须 `await` 异步 `onClick`；失败返回 `false` 时保持弹窗打开，
+成功提示只能在 API 成功后出现。聊天设置不得在请求前提交本地状态。
+
+*为什么*：旧实现把 Promise 当成成功并立即关闭，保存失败时用户既看不到错误、也丢失
+输入；聊天设置还会在失败后继续提示“已保存”。
+*钉它的测试*：`frontend/tests/runtime.test.mjs` 的 `modal actions await...`、
+`chat settings` 失败的浏览器验收（内部整改记录，不发布）。
+
+### 2.21 日志缓冲同时受行数与字节预算约束
+
+每个实例的内存日志除 `log_buffer_lines` 外还必须有字节上限
+（`MAX_LOG_BUFFER_BYTES`）；单行截断不能替代总字节预算。
+
+*为什么*：`100000` 行 × `16 KiB` ≈ 1.6 GiB/实例；第三方构建的异常输出足以拖垮启动器。
+*钉它的测试*：`test_reliability_features.py::test_instance_log_buffer_respects_a_byte_budget`。
+
+### 2.22 异步页面加载必须带请求代次
+
+会话详情、预设详情、历史详情、Dashboard 异步订阅、参数命令预览等“最后响应获胜”
+的路径必须使用 `createRequestGate`（或等价 token）；离开页面/切换目标后不得再用旧
+响应写状态。
+
+*为什么*：慢响应覆盖新选择会让消息写入错误会话、对错误预设执行删除，或让命令预览
+与实际启动参数不一致。
+*钉它的测试*：`frontend/tests/runtime.test.mjs` 的 `createRequestGate...`；浏览器验收
+覆盖了聊天/预设快速切换和设置保存失败。
+
+### 2.23 知识服务必须走 ProcessManager，并按阶段卸载
+
+`knowledge_services` 启动 embedding/rerank/OCR 时必须调用现有
+`ProcessManager.start_instance`，不得直接 `Popen` 一个模型服务；索引阶段先完成
+OCR 提取并释放 OCR，再启动 embedding。
+
+*为什么*：直接起进程会绕过绝对路径解析、端口预留、环境清洗、日志收口和 Job
+Object；OCR 与 embedding 同时常驻还会让 8 GB 显存的设备在索引中直接失败。
+*钉它的测试*：`test_knowledge_services.py` 的复用/卸载测试，
+`test_knowledge_indexer.py::test_scanned_pdf_uses_ocr_once_and_caches_pages`
+断言第二次强制重建不再获取 OCR。
+
+### 2.24 知识库配额与损坏必须可见，不得静默丢数据
+
+每个库的 2,000 文件、512 MiB 原始资料、20,000 片段上限在**写入前**拒绝；
+OCR/嵌入失败只标错当前文档并保留旧索引。损坏的 `knowledge.db` 按 SQLite 恢复
+流程隔离重建，不能拖死启动器。
+
+*为什么*：知识库是用户资料资产；一次超限或半截替换会制造不可恢复的内容缺失。
+*钉它的测试*：`test_knowledge_indexer.py::test_chunk_cap_errors_without_deleting_previous_chunks`、
+`test_knowledge_store.py`、`test_knowledge_api.py`。
+
+### 2.25 Chat 引用是响应契约，不是前端拼装
+
+后端在转发前检索并把来源以 base64url JSON 写入
+`X-LunarShroud-Sources`；前端解码后必须持久化到 assistant `stats.sources`，
+Markdown 导出同样保留。检索失败不得回退成“无引用正常回答”。
+
+*为什么*：前端若自己拼引用，历史重载、导出和不同客户端会各说各话；失败静默
+降级则让用户误以为回答有资料支撑。
+*钉它的测试*：`test_chat_api.py::test_chat_proxy_injects_knowledge_and_returns_citations`、
+`frontend/tests/chat.test.mjs` 的引用导出测试。
+
+### 2.26 浏览器验收不得靠内联脚本绕过 CSP
+
+Playwright 测试注入 axe 必须经同域路由加载脚本，不能 `addScriptTag({content})`；
+后端在测试中用 `LUNARSHROUD_ALLOW_INSECURE_DEV=1` 启动，测试结束必须停止进程。
+
+*为什么*：应用 CSP 是 `script-src 'self'`，内联注入会让“测试通过”依赖关掉真实
+安全策略；后台 dev server 泄漏则会让后续端口检查假绿。
+*钉它的测试*：`frontend/tests/browser/core-paths.test.mjs`；CI 的
+“Browser core-path, accessibility and performance gate”步骤。
+
+### 2.27 被提升到共享工具栏的控件不得依赖 root 委托
+
+`workspace.js` / `observability.js` 会把子模块的 `.page-actions` **整块搬进**共享
+工具栏。搬走之后这些节点就**不在子模块 `root` 的子树里**，于是：
+
+- 挂在 `root` 上的委托监听器永远收不到它们的点击；
+- `root.querySelectorAll(...)` 也再也找不到它们（同步 active 状态会静默失效）。
+
+控件要活着，必须**握住节点本身**：监听器绑在控件容器上（节点移动时监听器跟着
+走），状态同步用 init 时捕获的节点引用，不要用 `root` 现查。
+
+*为什么*：实测踩过——“卡片/列表”切换开关点下去**完全无反应**，而原有的
+`core-paths` 浏览器测试只断言 `.segmented-btn.active` 的文本是“卡片”，于是它
+**因为开关是死的才一直绿**。同类问题还有 `models.js` 的委托顺序：
+`[data-quick-launch]` 嵌在带 `data-open-model` 的 `<article>` 里，先匹配卡片分支
+就会 `return`，所以“快速启动”按钮其实从未被点到过。更具体的动作必须排在前。
+*钉它的测试*：`frontend/tests/browser/deep-paths.test.mjs` 的
+`every non-destructive control on a tabbed page actually does something`
+（逐个点击，要求 DOM 变更/请求/弹窗/toast 至少发生一个）与
+`model cards: detail, view toggle and quick-launch preflight are real interactions`
+（断言行数与卡片数相等、断言取消预检后没有新建实例）。
+
+### 2.28 全文检索的查询必须拆成子句，不能整句加引号
+
+`knowledge_store.search_fts()` 不得把用户整句包成一个 FTS5 短语。
+`chunks_fts` 用 `tokenize='trigram'`，整句短语等价于“必须存在逐字相同的子串”，
+对自然语言问句几乎永远为空——混合检索会**静默退化成纯向量**。
+中文问句必须拆成 CJK 连续段再取 3-gram 子句用 `OR` 组合（trigram 至少 3 字）。
+
+*为什么*：实测量化过——在 377 片段法律法规库、17 道标注题上，整句加引号时
+`hybrid` 与 `dense` 的排序**一模一样**（17 题中lexical 分支命中 0 次，
+hit@1 35%、MRR 0.432）。拆成子句后：hybrid hit@1 **52%**、MRR **0.634**；
+hybrid+rerank hit@1 **76%**、hit@3 **94%**、MRR **0.843**。
+已有的 `test_fts_search_handles_chinese_and_escapes` 只测了“密码法”这种三字
+精确短语，所以它**恰好测的是退化路径也能过的特例**，什么都没钉住。
+*钉它的测试*：`backend/tests/test_knowledge_store.py::
+test_fts_search_matches_a_paraphrased_question`（改回整句加引号必红）。
+
+### 2.29 用户点名给进来的缺失路径必须报错，不得静默跳过
+
+`knowledge_extract.collect_paths()` 对**用户显式列出**的不存在路径必须抛
+`ValueError`；只有目录遍历中消失的文件、符号链接与 reparse point 才继续跳过。
+
+*为什么*：“添加资料”成功提示是按这条调用的成功来发的；静默跳过会让界面显示
+已添加，而那份资料其实从未入库，用户不会再去查。这是 §2.24 的同一条不变量在
+“选择”而不是“配额”上的形式。
+*钉它的测试*：`test_knowledge_extract.py::
+test_collect_paths_refuses_a_named_path_that_does_not_exist`、
+`frontend/tests/browser/adversarial.test.mjs` 的第一条（要求 400 + 本地化 toast
++ 弹窗保持打开且输入不丢）。
+
+### 2.30 知识服务必须用 lease()，且复用不得夺走回收权
+
+两条相关约束：
+
+1. 索引阶段取嵌入服务必须走 `knowledge_services.lease(...)`（上下文管理器），
+   不能用裸 `acquire()`。
+2. `_reuse_running()` 返回的句柄，**只要那台实例的名字带 `[KB] ` 前缀就必须仍然
+   `owned=True`**。
+
+*为什么*：`release()` 对 `owned=False` 的句柄直接返回。曾经的行为是：索引一旦
+复用了一台正在跑的 `[KB]` 实例，那台实例就永久躲过空闲卸载 —— 实测有一个嵌入
+服务在文档承诺的 10 分钟之后仍然常驻 **22 分钟以上、约 2 GB 显存**。同时索引
+阶段用的是裸 `acquire()`，没有任何人负责释放，而 reaper 只在 `lease()` 里启动，
+所以"跑完一次索引"本身就等于"服务常驻"。这条不变量是 8 GB 单卡能反复索引的前提。
+*钉它的测试*：`test_knowledge_services.py::
+test_a_reused_knowledge_service_is_still_reaped`、
+`test_knowledge_indexer.py::test_indexing_releases_the_embedding_lease`
+
+### 2.31 前端读取的每个自定义响应头都必须进 CORS expose 清单
+
+打包态页面源是 `tauri.localhost`，对后端 API（`http://127.0.0.1:<port>`）是
+**跨源** fetch：浏览器只允许 JS 读 CORS 安全列表头 +
+`Access-Control-Expose-Headers` 清单里的头。`main.py` 的 expose 清单必须覆盖
+前端 `headers.get('X-LunarShroud-*')` 实际读取的**全部**头；前端新增读取任何
+自定义响应头时，必须同步把它加进清单。
+
+*为什么*：2026-10-25 独立审计实测——清单只含 `X-LunarShroud-Dropped-Turns`
+时，知识库引用（`X-LunarShroud-Sources`）与未命中提示（`X-LunarShroud-Knowledge`）
+在**安装版**里永远读到 `null`：引用不显示、不落库、导出缺 Sources 段、未命中
+不提示，而后端其实把资料注入了模型（回答里带着 `[1][2]` 编号）。源码运行通道
+（同源）与 TestClient（无 CORS 过滤）都测不出这条断裂——三道现有门禁全是同源的。
+*钉它的测试*：`test_auth_coverage.py::
+test_cross_origin_responses_expose_every_chat_contract_header`（带真实 Origin
+走完整中间件链）、`test_frontend_contracts.py::
+test_every_custom_response_header_the_frontend_reads_is_cors_exposed`
+（从前端源码反向扫描读点、与真实中间件配置对账，防止清单与前端再脱节）。
+
+### 2.32 知识服务的回收与租约必须按服务键互斥
+
+`knowledge_services` 的 `acquire`/`lease`/`release` 对**同一个服务键**的
+操作必须经 `_key_lock_for(key)` 串行化：`lease` 在键锁内完成"acquire + 标记
+`_ACTIVE`"；`release` 在键锁内复核 `_ACTIVE` 并把实例加入 `_RETIRED` 后才能
+stop；`_reuse_running` 不得收编 `_RETIRED` 里的实例；`release_kind` 的忙判定
+按具体键、不按整个类别。
+
+*为什么*：`release_idle` 在锁内选候选、在锁外 stop，两步之间的窗口里一次新的
+acquire 会拿到"马上就要被停掉"的句柄，那次检索以 502 收场——可自愈但无法追查。
+锁序恒为 key_lock → `_LOCK`（键锁用 RLock，`lease` 重入 `acquire`），不得倒置。
+*钉它的测试*：`test_knowledge_services.py::
+test_release_cannot_stop_a_service_that_was_just_acquired`（stop 钩子确定性
+复现交错）、`::test_release_kind_only_skips_the_busy_key_not_the_whole_kind`、
+`::test_idle_unload_skips_busy_services`。
+（把两处改动分别退回去，对应测试必红）。
+
+### 2.33 计算设备的传递通道按后端而定，且必须钉在真实包上
+
+CPU / Vulkan / OpenVINO / ROCm 四个官方 Windows 包 `--version` 完全相同、
+`--help` 的 GPU flag 集合也逐字相同（实测 b11929）——**版本串与 help 无法区分
+后端**。识别只能靠同级加速 DLL（`ggml-openvino.dll` / `ggml-hip.dll` /
+`ggml-vulkan.dll`）与构建自己的 `--list-devices`。
+
+- 设备名的解析正则必须要求**以数字结尾**，否则 `error: something broke` 这类
+  报错行会被当成名为 `error` 的设备（写完即被测试抓出过）。
+- OpenVINO 后端**不认 `--device`**（实测传了直接退出：`... chosen with the
+  GGML_OPENVINO_DEVICE environment variable, not -dev`）。设备必须译成
+  `GGML_OPENVINO_DEVICE` 环境变量（`OPENVINO1` → `GPU.0`，取自
+  `--list-devices` 描述里的 `GGML_OPENVINO_DEVICE=` 前缀，并剥掉
+  ` (selected)` 标记）；翻译不出来或多设备时必须 400 拒绝启动，不得猜。
+- ROCm 构建在没有受支持 AMD 独显时会**静默退回 CPU**并正常就绪（实测
+  ~6.8 tok/s，比 Vulkan GPU 慢一个数量级）；实例就绪时必须给出
+  `warnings` 提示（不是 `error_message`——后者在 RUNNING 态被渲染成红色错误）。
+- 相关测试不得写死机器路径：`study/` 里有真实包就对它们断言，没有就 skip
+  （`test_multibackend_runtimes.py`）。
+
+*钉它的测试*：`test_device_backends.py`（设备翻译/`(selected)`/argv 通道/
+DLL 判别）、`test_multibackend_runtimes.py`（四包归属与设备枚举）、
+`test_runtime_path_sync.py`（路径双向同步）。
+
 ## 3. 发布镜像与门禁
 
 `github/` 是**精选的公开镜像**，不是工作树快照。任何被镜像文件的改动，
@@ -361,3 +574,16 @@ UTF-8 / UTF-16LE / UTF-16BE / latin-1 以及 gzip/zlib 容器——所以"把路
    或由夹具注入；清理失败要记录，不能用 `let _ =` 静默吞掉。
    证据：把 `TEMP`/`TMP` 指向不存在的路径后直接运行 Rust 测试二进制，
    `22/22` 通过。
+6. **本机验收套件不得并行跑，也不得写死机器路径。**
+   `frontend/tests/browser/deep-paths.test.mjs` 与 `adversarial.test.mjs` 会对着
+   **同一个后端的共享状态**建库/索引/删库，两个文件同时跑会互相看到对方的中间态
+   （实测：并行跑时一个守卫误报“库消失了”，其实是另一个套件的时序）。用
+   `--test-concurrency=1`。机器相关的输入只能来自环境变量
+   （`LUNARSHROUD_TEST_EMBEDDING` / `LUNARSHROUD_TEST_KB`），没给就整条跳过 ——
+   把绝对路径写进测试文件会把私人目录结构发布进 `github/` 镜像，而且让测试
+   “只在一台机器上成立”。
+7. **UI 验收必须读存储状态，不能只读界面文本。** 面板按自己的节奏轮询，一次
+   小索引可能在下一个请求之前就完成；只看“界面变成空闲”既会在旧文本上立刻为真
+   （假绿），也会在永远等不到闪现的中间态时超时（假红）。断言要读
+   `GET /api/knowledge/{id}` 的 `status` + `updated_at`，再给界面一点追上来的
+   时间。本项目 2026-10-23 两条都踩到了。

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from datetime import datetime
@@ -31,6 +32,8 @@ from core.param_schema import (
 
 # ========== 数据模型 ==========
 # 简化：用 dict 表示 preset，不用 pydantic 模型，方便 JSON 序列化
+
+LOGGER = logging.getLogger("lunarshroud.presets")
 
 
 def _now_iso() -> str:
@@ -151,7 +154,11 @@ def list_presets() -> list[dict[str, Any]]:
     presets: list[dict[str, Any]] = []
     for path in sorted(PRESETS_DIR.glob("*.json")):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            # utf-8-sig：用户用记事本另存预设（UTF-8 带 BOM）后，json 会抛
+            # JSONDecodeError，旧代码在这里静默 continue —— 预设文件还在盘上，
+            # 但 UI 里"凭空消失"。配置文件与清单都用 utf-8-sig，
+            # 这里必须一致。
+            with open(path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             presets.append({
                 "id": data["id"],
@@ -164,7 +171,10 @@ def list_presets() -> list[dict[str, Any]]:
                 "created_at": data.get("created_at", ""),
                 "updated_at": data.get("updated_at", ""),
             })
-        except (json.JSONDecodeError, KeyError, OSError):
+        except (json.JSONDecodeError, KeyError, OSError) as exc:
+            # 仍然跳过（一个坏文件不该让整页 500），但要留下可见证据：
+            # 静默丢弃是"我的预设呢"这类工单的根源。
+            LOGGER.warning("skipping unreadable preset %s: %s", path.name, exc)
             continue
     return presets
 
@@ -175,9 +185,10 @@ def get_preset(preset_id: str) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             return json.load(f)
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError) as exc:
+        LOGGER.warning("preset %s is unreadable: %s", preset_id, exc)
         return None
 
 
@@ -191,6 +202,12 @@ def save_preset(data: dict[str, Any], validate: bool = True) -> dict[str, Any]:
     data = dict(data)
     if isinstance(data.get("params"), dict):
         data["params"] = scrub_sensitive_params(data["params"])
+    # runtime_id 是可选的运行时引用；不校验 profile 是否存在（预设可跨机器导入）。
+    runtime_id = data.get("runtime_id")
+    if not isinstance(runtime_id, str) or not runtime_id.strip() or len(runtime_id) > 128:
+        data.pop("runtime_id", None)
+    else:
+        data["runtime_id"] = runtime_id.strip()
 
     # 校验
     if validate:
@@ -213,9 +230,11 @@ def save_preset(data: dict[str, Any], validate: bool = True) -> dict[str, Any]:
         data["id"] = preset_id
         data["created_at"] = now
     else:
-        # 更新：保留原 created_at
+        # 更新：保留原 created_at 与未提交的 runtime_id
         existing = get_preset(preset_id)
         data["created_at"] = existing.get("created_at", now) if existing else now
+        if existing and "runtime_id" not in data and existing.get("runtime_id"):
+            data["runtime_id"] = existing["runtime_id"]
 
     data["updated_at"] = now
     data.setdefault("tags", [])
@@ -253,6 +272,8 @@ def clone_preset(src_id: str, new_name: str | None = None) -> dict[str, Any]:
         "tags": list(src.get("tags", [])),
         "params": dict(src.get("params", {})),
     }
+    if src.get("runtime_id"):
+        new["runtime_id"] = src["runtime_id"]
     return save_preset(new)
 
 
@@ -267,6 +288,8 @@ def import_preset(data: dict[str, Any]) -> dict[str, Any]:
         "tags": data.get("tags", []),
         "params": data.get("params", {}),
     }
+    if data.get("runtime_id"):
+        cleaned["runtime_id"] = data["runtime_id"]
     # 仅跳过模型必填检查，其余校验（参数非空/ctx 范围/联动一致）保留
     errors = _validate_preset_data(cleaned, allow_empty_model=True)
     if errors:

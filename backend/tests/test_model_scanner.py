@@ -87,7 +87,7 @@ def _make_junction(link, target) -> bool:
 
 
 def test_scan_models_does_not_descend_into_junctions(tmp_path):
-    """junction 不是普通目录：扫描不得穿越（审计 W2 已实证）。"""
+    """junction 不是普通目录：扫描不得穿越（已实证）。"""
     from core.model_scanner import scan_models
 
     root = tmp_path / "models"

@@ -24,6 +24,7 @@ GGUF 的词表数组（``tokenizer.ggml.tokens`` 等）动辄上百 MB 条目前
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import struct
 import threading
@@ -103,6 +104,11 @@ _FILE_TYPE_NAMES: dict[int, str] = {
 DEFAULT_MAX_READ_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_KV = 8192
 DEFAULT_MAX_TENSORS = 20000
+# Vocabulary identity only needs a short prefix. Reading 256 token strings is
+# enough to distinguish tokenizer families while staying milliseconds-fast and
+# bounded even for a 300k-token vocabulary. No network access, ever.
+VOCAB_PREFIX_TOKENS = 256
+VOCAB_MAX_READ_BYTES = 16 * 1024 * 1024
 # 单个元数据字符串存进结果前截断的长度（chat_template 可以有几十 KB）
 MAX_STRING_KEEP = 512
 # GGUF 的嵌套数组实践中最深一两层（词表、张量形状）。给一个宽松但**有限**的
@@ -509,6 +515,152 @@ def _normalize(
     }
 
 
+# ========== 词表前缀（草稿模型兼容性，B3） ==========
+
+
+def read_vocab_prefix(
+    path: str | Path,
+    *,
+    max_tokens: int = VOCAB_PREFIX_TOKENS,
+    max_read_bytes: int = VOCAB_MAX_READ_BYTES,
+) -> dict[str, Any]:
+    """Read a bounded tokenizer prefix without loading tensors or using network.
+
+    Returns a signature that can be compared between a main model and a draft
+    model. ``prefix_hash`` covers the total vocabulary count plus the first
+    ``max_tokens`` token strings, so equal hashes imply equal count and prefix.
+    Any malformed/truncated file returns a signature with ``error`` instead of
+    raising; callers treat that as "unknown", never as compatible.
+    """
+    result: dict[str, Any] = {
+        "path": str(path),
+        "tokenizer_model": None,
+        "token_count": 0,
+        "prefix_count": 0,
+        "prefix_hash": None,
+        "complete_prefix": False,
+        "error": None,
+    }
+    p = Path(path)
+    try:
+        fh = open(p, "rb")
+    except OSError as exc:
+        result["error"] = f"cannot open file: {exc}"
+        return result
+
+    with fh:
+        reader = _Reader(fh, max_read_bytes)
+        try:
+            if reader.read(4) != GGUF_MAGIC:
+                result["error"] = "not a GGUF file"
+                return result
+            version = reader.u32()
+            if version < 2:
+                result["error"] = f"unsupported GGUF version {version}"
+                return result
+            reader.u64()  # tensor count
+            kv_count = reader.u64()
+        except _BUDGET_OR_PARSE as exc:
+            result["error"] = f"bad GGUF header: {exc}"
+            return result
+
+        tokenizer_model: str | None = None
+        try:
+            for _ in range(min(kv_count, DEFAULT_MAX_KV)):
+                key = reader.string()
+                vtype = reader.u32()
+                if vtype == TYPE_ARRAY:
+                    if key != "tokenizer.ggml.tokens":
+                        _skip_array(reader)
+                        continue
+                    elem_type = reader.u32()
+                    count = reader.u64()
+                    if elem_type != TYPE_STRING:
+                        result["error"] = "tokenizer.ggml.tokens is not a string array"
+                        return result
+                    if count <= 0:
+                        result["error"] = "empty tokenizer vocabulary"
+                        return result
+                    limit = min(count, max(0, min(int(max_tokens), 4096)))
+
+                    def _token_text(r: _Reader) -> str:
+                        length = r.u64()
+                        # A token longer than this is not a real vocabulary
+                        # entry; refusing avoids hashing a silently truncated
+                        # string and calling two different tokens equal.
+                        if length > 4096:
+                            raise ValueError("vocabulary token is unreasonably long")
+                        return r.read(length).decode("utf-8", errors="replace")
+
+                    tokens = [_token_text(reader) for _ in range(limit)]
+                    digest = hashlib.sha256()
+                    digest.update(struct.pack("<Q", count))
+                    for token in tokens:
+                        raw = token.encode("utf-8", errors="replace")
+                        digest.update(struct.pack("<Q", len(raw)))
+                        digest.update(raw)
+                    result.update(
+                        {
+                            "tokenizer_model": tokenizer_model,
+                            "token_count": int(count),
+                            "prefix_count": len(tokens),
+                            "prefix_hash": digest.hexdigest(),
+                            "complete_prefix": len(tokens) == count,
+                        }
+                    )
+                    return result
+                if vtype == TYPE_STRING:
+                    value = reader.string()
+                    if key == "tokenizer.ggml.model":
+                        tokenizer_model = value
+                    continue
+                _read_scalar(reader, vtype)
+        except _BUDGET_OR_PARSE as exc:
+            result["error"] = f"could not read tokenizer prefix: {exc}"
+            return result
+
+    result["error"] = "tokenizer.ggml.tokens not found"
+    return result
+
+
+_VOCAB_CACHE: dict[tuple[str, int, int, int, int], dict[str, Any]] = {}
+_VOCAB_LOCK = threading.Lock()
+_VOCAB_CACHE_MAX = 128
+
+
+def read_vocab_prefix_cached(
+    path: str | Path,
+    *,
+    max_tokens: int = VOCAB_PREFIX_TOKENS,
+    max_read_bytes: int = VOCAB_MAX_READ_BYTES,
+) -> dict[str, Any]:
+    """Cache a vocabulary signature by path/mtime/size/options.
+
+    A model replaced on disk gets a new mtime/size and therefore a new key.
+    """
+    p = Path(path)
+    try:
+        st = p.stat()
+    except OSError:
+        return read_vocab_prefix(p, max_tokens=max_tokens, max_read_bytes=max_read_bytes)
+    key = (str(p), st.st_mtime_ns, st.st_size, max_tokens, max_read_bytes)
+    with _VOCAB_LOCK:
+        hit = _VOCAB_CACHE.get(key)
+    if hit is not None:
+        return dict(hit)
+    value = read_vocab_prefix(p, max_tokens=max_tokens, max_read_bytes=max_read_bytes)
+    with _VOCAB_LOCK:
+        if len(_VOCAB_CACHE) >= _VOCAB_CACHE_MAX:
+            _VOCAB_CACHE.clear()
+        _VOCAB_CACHE[key] = value
+    return dict(value)
+
+
+def clear_vocab_cache() -> None:
+    with _VOCAB_LOCK:
+        _VOCAB_CACHE.clear()
+
+
 # ========== 缓存 ==========
 
 _CACHE: dict[tuple[str, int, int, tuple[tuple[str, Any], ...]], dict[str, Any]] = {}
@@ -586,7 +738,7 @@ def find_companion_files(model_path: str | Path, *, max_entries: int = 4000) -> 
         return result
 
     # 边迭代边计数：目录可能有几千个文件，list(iterdir()) 会先物化全部
-    # Path 对象再切片（审计 R3 的 O(n²) 形态），这里在 max_entries 处直接停。
+    # Path 对象再切片（O(n²) 形态），这里在 max_entries 处直接停。
     scanned = 0
     for entry in entries:
         if scanned >= max_entries:

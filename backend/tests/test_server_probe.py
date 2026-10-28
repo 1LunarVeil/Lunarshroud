@@ -308,7 +308,7 @@ def test_probe_server_on_a_file_that_is_not_an_executable(tmp_path):
     assert result.error
 
 
-# ========== 探测缓存语义（审计 R2 / F10）==========
+# ========== 探测缓存语义 ==========
 
 
 def _probe_exe(tmp_path):
@@ -320,7 +320,7 @@ def _probe_exe(tmp_path):
 def test_failed_probe_is_cached_for_a_short_ttl(tmp_path, monkeypatch):
     """失败探测结果必须进缓存（短 TTL），否则每个请求都放大两次子进程。
 
-    审计 R2：失败不缓存时，"路径写错/未配置/卡死超时"这类常态失败会把
+    失败不缓存时，"路径写错/未配置/卡死超时"这类常态失败会把
     to_thread 线程池占满。TTL 到期后才允许重新探测（用户可能刚修好路径）。
     """
     from core import server_probe as sp
@@ -439,7 +439,7 @@ def test_probe_child_process_never_inherits_the_session_token(tmp_path, monkeypa
 
 
 def test_probe_timeout_survives_a_pipe_holding_wrapper(tmp_path):
-    """包装脚本卡死时，探测必须在超时上界附近返回并回收进程树（独立审计 H1）。
+    """包装脚本卡死时，探测必须在超时上界附近返回并回收进程树。
 
     `subprocess.run(timeout=)` 只杀直接子进程；孙进程握着继承的管道会让
     communicate() 无限等（实测挂起 585s）。测试跑在守护线程里，超界判"挂起"。
@@ -475,7 +475,7 @@ def test_probe_timeout_survives_a_pipe_holding_wrapper(tmp_path):
         worker = threading.Thread(target=run_probe, daemon=True)
         worker.start()
         worker.join(timeout=3.0 + 12.0)
-        assert not worker.is_alive(), "探测在超时后仍挂起：孙进程持管道（审计 H1）"
+        assert not worker.is_alive(), "探测在超时后仍挂起：孙进程持管道"
         assert box["result"].probed is False
         assert box["elapsed"] < 3.0 + 10, box["elapsed"]
         _time.sleep(0.5)
@@ -486,7 +486,7 @@ def test_probe_timeout_survives_a_pipe_holding_wrapper(tmp_path):
 
 
 def test_follower_returns_after_its_deadline_when_the_leader_hangs(tmp_path, monkeypatch):
-    """领先者卡死时，跟随者必须在总截止内返回（独立审计 H1 的线程泄漏面）。
+    """领先者卡死时，跟随者必须在总截止内返回（否则线程泄漏）。
 
     没有截止的 `while True: wait(1.0)` 会让每个 to_thread 请求泄漏一个永不
     返回的工作线程，最终饿死实例管理 API。以 1s 名义超时驱动：
@@ -525,7 +525,7 @@ def test_follower_returns_after_its_deadline_when_the_leader_hangs(tmp_path, mon
     follower.join(timeout=7.0 + 4.0)
     elapsed = _time.monotonic() - t0
     try:
-        assert not follower.is_alive(), "跟随者未按截止返回（审计 H1：线程泄漏）"
+        assert not follower.is_alive(), "跟随者未按截止返回：线程泄漏"
         assert result_box and result_box[0].probed is False
         assert elapsed < 7.0 + 2.0, elapsed
     finally:

@@ -161,7 +161,7 @@ def test_restart_reuses_port_and_tracks_lineage(e2e_env):
     _wait_for_status(second, "running")
     assert second.restarted_from == first.id
     assert second.port == first.port
-    # 重启世代必须写启动历史（独立审计 M1）：回调在监控线程启动前拿到新实例
+    # 重启世代必须写启动历史：回调在监控线程启动前拿到新实例
     assert [inst.id for inst in recorded] == [second.id]
 
     pm.stop_instance(second.id)
@@ -182,9 +182,9 @@ def test_two_auto_assigned_instances_get_distinct_ports(e2e_env):
         _wait_for_status(inst, "stopped")
 
 
-# ========== 重启的幂等性（R1 / F9） ==========
+# ========== 重启的幂等性 ==========
 #
-# 审计原文把 R1 写成"一个逻辑实例两个活进程，8 GB 卡必 OOM"。真机复现**证伪**了
+# 曾有判断把这条写成"一个逻辑实例两个活进程，8 GB 卡必 OOM"。真机复现**证伪**了
 # 这个严重度：`start_instance` 的端口预留会拦住第二次启动（顺序与并发都是
 # `port ... is already in use`），而 llama.cpp 在**打开模型之前**就 bind HTTP
 # 套接字（实测 0.02 s 报 bind 失败），所以即便漏过检查也只是 20 ms 后退出，

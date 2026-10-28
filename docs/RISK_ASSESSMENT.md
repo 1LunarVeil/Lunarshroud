@@ -1,7 +1,9 @@
 # 剩余风险评估
 
-评估对象：`0.9.0-beta.2` 当前部署对（哈希见 STATUS.md 的部署段）
-评估日期：2026-10-20  
+评估对象：`0.9.0-beta.2` 当前工作树与 `src-tauri/target/release/` 候选对
+（launcher `5C8BA375…`、backend `28136B22…`；根目录部署对仍为
+`0E778DD0…` / `A1BAACAA…`）
+评估日期：2026-10-21  
 结论：**可以作为 beta 发布，但不能按 1.0 宣传。** 本轮能自行验证的风险已实测；
 不能在本机闭环的风险（代码签名、8 小时长稳、多硬件矩阵、构建来源证明）仍
 构成发布门槛，必须如实披露；4 小时真实模型长稳已于 2026-10-19 通过。
@@ -27,9 +29,9 @@
 | R8 | 卸载清理与安装位置注册表键 | 低 | 低 | 2026-10-20 直接复跑：安装/启动/卸载/清理全部通过；安装器内 launcher 是 NSIS 变体 `87B0B2E1…`（根便携版 `0E778DD0…`，仅差 3 字节 `BUNDLE_TYPE_VAR` `NSS`/`UNK`，已用测试钉住）；安装版后端 `A1BAACAA…`、`_internal` 757，401/404/HMAC/config 200、WM_CLOSE、端口释放、无后端残留；卸载 exit 0，安装目录（含 WebView2/log）移除，真实数据/快捷方式恢复。Add/Remove 条目仍**无法观测**：Python HKCU 探针通过，但 POSTINSTALL 钩子实测安装器为低完整性（`TEMP=...\Temp\Low`，`HKCU_WRITE_ERROR` 对 HKCU 和 SHCTX 均失败），Highest 计划任务同样失败；2026-10-20 最小 NSIS 探针（非 LunarShroud）完整走完向导，`.onInit` 写 `ran.txt`、安装段写 `probe.txt`/`uninstall.exe`，但未创建快捷方式/HKCU；`ran.txt` 显示 `...\Temp\Low`，开始菜单 ACL 对沙箱组只有 `ReadAndExecute`，证明是当前 Codex 会话的受限令牌，不是本产品脚本；候选安装包 `860FC8FC…` 已加显式 HKCU POSTINSTALL；2026-10-17 正常桌面曾观测到 | 再次安装会复用旧目录；删除数据/手工清理可恢复默认。发布前需在普通交互桌面再确认一次 Add/Remove 条目 |
 | R9 | 非 ASCII/含空格模型路径、长路径 | 低 | 中 | 非 ASCII/空格路径实测 RUNNING、768 维嵌入；315 字符路径实测 llama.cpp 报 `failed to open GGUF`，重建后启动前检查会报 `path_too_long` | >260 字符仍不受支持，但用户会得到明确原因和“移到更短目录”的修复建议 |
 | R10 | 启动器日志含每次启动的 `session_id` | 低 | 低 | 隔离日志扫描：令牌 0 命中；重建后 `backend.log` 只写 `backend started pid=…`，测试钉住不含 session | 已收口；无需再分享前手工删除 |
-| R11 | 用户数据（`config.json`、`history.db`、预设）无自动备份/云同步 | 低 | 中 | 配置与预设原子写入；历史库有上限；新增 `Backup-UserData.ps1` / `Restore-UserData.ps1`，带 SHA-256 清单、篡改拒绝和 `pre-restore` 回退点 | 仍需用户主动运行；没有云同步/自动定时备份 |
+| R11 | 用户数据（`config.json`、`history.db`、`chats.db`、预设）无自动备份/云同步 | 低 | 中 | 配置与预设原子写入；历史/聊天库有上限；`Backup-UserData.ps1` / `Restore-UserData.ps1` 和设置页「数据备份」提供 SHA-256 清单、篡改拒绝、SQLite 快照、恢复前快照与延迟恢复；聊天附件/提示词随 `chats.db` 备份 | 仍需用户主动运行；没有云同步/自动定时备份 |
 | R12 | 依赖告警（7 条）与 FastAPI/httpx 测试弃用告警 | 中 | 低 | `cargo audit` 0 漏洞；5 个 `unic-*`、`proc-macro-error`、Linux-only `glib` 告警；二者不在 Windows 依赖图 | 需跟随 Tauri/urlpattern 上游；测试告警可能在下次依赖升级时变成失败 |
-| R13 | 打包态真实窗口截图/高 DPI 未在本轮完整取证 | 中 | 低 | 无头 Chrome/CDP 已逐页检查且无 console 错误；2026-10-18 用 DevTools 协议复核仪表盘与参数编辑器，console 0 错误、网络 0 个 404；截图接口在无头会话超时 | 真实 WebView2 的字体/缩放/多显示器差异仍可能影响观感；本轮没有像素级截图证据 |
+| R13 | 打包态真实窗口截图/高 DPI 未在本轮完整取证 | 低 | 低 | 2026-10-21 已在真实 WebView2（debug 与全新打包对）完成截图与审计：DPR 1.545、800/DPR2 抽屉、1280/DPR2 桌面、逐页无横向溢出、console 0 warning/error；截图在 `tmp/webview2-check-20261021/`。同一轮还发现并修复打包版 PyYAML 缺失。随后 release 候选在隔离环境通过 UI Automation 实跑真实 Qwen3.5-4B：流式回答、本地附件 `8642`、上下文仪表、数据落盘和退出清理；证据在 `tmp/packaged-check-20261021-chat/` | 多显示器移动、物理 200% 缩放与不同字体仍可能影响观感；WebView2 155 的本机 CDP 端点不可用（上游回归），打包 UI 改用 UI Automation |
 | R14 | 恶意/畸形 GGUF、超长请求、日志洪水等资源耗尽 | 低 | 中 | GGUF 字节/条数/嵌套预算与异常面测试；请求体、日志、历史、DOM 有上限 | 极端文件仍可能让扫描变慢；不会 500，但会跳过该文件 |
 | R15 | 后端重启窗口里，前端可能把**已失效**的旧令牌发给抢到端口的进程 | 中 | 低 | 每代后端换发新 session_id+token；`get_backend_session` 在 HMAC 校验通过前返回空；前端 Tauri 模式不再回落到硬编码端口。旧令牌对新一代无效 | 严格"任何情况下都不把任何令牌发给未确认对端"仍未完全满足：`api.js` 在重连前可能用缓存 base 发一次已过期令牌。攻击者只能拿到废值 |
 | R16 | 重复启动/单实例失败误报 | 低 | 低 | 2026-10-18 起持有 `Local\LunarShroud-SingleInstance` 命名互斥体；第二次启动把已有窗口 `ShowWindow(SW_RESTORE)`+`SetForegroundWindow` 后退出；mutex API 失败按 `Unavailable` 放行并记日志，不再误报"已在运行" | 互斥体是每登录会话的 `Local\`；不同 Windows 用户仍可能各起一套（端口是机器级，第二个会明确报端口冲突）。预测名称可被同用户进程抢占造成拒绝启动 |

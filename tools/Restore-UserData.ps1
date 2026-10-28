@@ -38,9 +38,9 @@ function Resolve-DataDirectory {
 }
 
 function Assert-NotRunning {
-    $running = Get-Process -Name "LunarShroud" -ErrorAction SilentlyContinue
+    $running = @(Get-Process -Name "LunarShroud", "backend" -ErrorAction SilentlyContinue)
     if ($running -and -not $Force) {
-        throw "LunarShroud is running. Close it first, or pass -Force (not recommended)."
+        throw "LunarShroud or backend.exe is running. Close the app first, or pass -Force (not recommended)."
     }
 }
 
@@ -86,7 +86,7 @@ $data = Resolve-DataDirectory -Requested $DataDirectory
 Assert-NotRunning
 
 $entries = New-Object System.Collections.Generic.List[object]
-foreach ($line in Get-Content -LiteralPath $manifest) {
+foreach ($line in Get-Content -LiteralPath $manifest -Encoding UTF8) {
     if ($line -notmatch '^([0-9a-fA-F]{64}) \*(.+)$') {
         throw "invalid manifest line: $line"
     }

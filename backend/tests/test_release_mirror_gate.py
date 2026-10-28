@@ -69,6 +69,12 @@ APP_RUNTIME_ARTIFACTS = [
     "sub/CLAUDE.md",
     # 外部工具曾在 backend/ 根掉落 8 字符 tempfile 风格残留（jy4s_b4h）。
     "backend/jy4s_b4h",
+    # AI 编码工具（ZCode）在仓库根生成的状态目录。2026-10-28 实测它曾被
+    # `--apply` 复制进 github/：EXCLUDED_DIR_NAMES 与 FORBIDDEN_GLOBS 只列了
+    # .claude/.mimosa 而没有 .zcode，于是公开镜像里出现了一份"本项目用什么
+    # 工具开发"的自述配置。规则必须与 .gitignore 同口径覆盖。
+    ".zcode/config.json",
+    "sub/.zcode/config.json",
 ]
 
 MUST_STILL_MIRROR = [

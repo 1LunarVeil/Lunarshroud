@@ -63,9 +63,10 @@
 
 1. **状态常驻模块级**：`currentValues` 等都活在模块闭包里，关掉浮层再打开不会丢
    （`Ctrl+L` 重开选择器换个模型 = 在原参数上换模型，不是清零重来）。
-2. **二级交互一律 inline-sheet**：`showModal` 单实例、开头先 `closeModal()`，编辑器
-   自己再弹任何窗都会把浮层顶掉（包括 `showConfirm`）。启动确认 / 保存预设 /
-   重置确认共用浮层底部命令条上方的 `#pe-sheet`，同一时刻只开一个。
+2. **二级交互优先 inline-sheet**：`showModal` 默认仍是“替换当前浮层”（开头
+   `closeAllModals()`）；启动前检查通过 `{ stack: true }` 叠在宿主表单上，关闭后
+   宿主表单与输入保留。编辑器自身的启动确认 / 保存预设 / 重置确认仍共用
+   `#pe-sheet`，同一时刻只开一个。
 3. **底部命令条接管了 `modal-footer`**：`open()` 传空 actions，再整体重写 footer
    内容（摘要行 / `#cmd-suppressed` / 保存预设 / 立即启动）。不要往这里塞
    `data-idx` 按钮 —— `showModal` 的按钮机制已经不在这条 footer 上。
@@ -77,7 +78,29 @@
 
 1. 维护一个 `draft`（初值 `{...config}`）；
 2. 在**切分类前**和**保存前**都调一次 `collect()`，把当前 DOM 收进 `draft`；
-3. 渲染时读 `draft[key]` 而不是 `config[key]`。
+3. 渲染时读 `draft[key]` 而不是 `config[key]`；
+4. 关闭浮层前必须比较 `draft` 与**展示基线 `baseline`**（不是后端 `config`）：
+   输入框把 `null` 显示成空串、主题单选项来自前端 `localStorage` 偏好、语言
+   单选项来自当前界面语言，这些渲染归一化会让“打开后立即关闭”误报未保存。
+   每个分类**首次渲染后**调用 `captureGroupBaseline()`，把控件回读值写入基线；
+   之后只有用户真的改动才算 dirty。X / Esc / 遮罩三条路径都要拦截并弹
+   “继续编辑 / 放弃修改”；Ctrl+L 会经 `showModal` 替换所有浮层，也必须拦截。
+   保存成功或确认放弃设置 `allowClose` 后直接关闭。`showModal` 的 `onClose`
+   在 DOM 移除后才执行，不能用来挽回草稿。
+
+**托盘与退出**：设置页“常规”的 `close_to_tray`（默认关闭）保存后会调用 Tauri
+命令 `set_close_to_tray` 立即生效；后端 `config.json` 的同一布尔值供下次启动
+读取。窗口关闭时外壳仅在托盘可用且该值为 true 时隐藏窗口，否则按旧行为退出。
+命令面板在 Tauri 环境额外提供“退出 LunarShroud”（`quit_app`），避免开启托盘后
+用户找不到退出路径。托盘不可用时 `set_close_to_tray` 返回 false，前端提示
+“关闭窗口仍会退出”。
+
+**数据备份**：设置左侧“数据备份”分类是自定义面板（`renderBackupPane`），
+不参与字段 `collect()`。它通过 `/api/backups*` 列出/创建/验证/删除备份，并把
+恢复请求暂存为 `restore-pending.json`；恢复在下次后端启动时、打开 SQLite 之前
+应用。确认框统一用 `askBackup()`（`showModal({stack:true})`），不会把设置
+浮层替换掉。恢复后的“现在退出”调用 `quit_app`；取消调用
+`DELETE /api/backups/pending`。
 
 ### 二级左栏（上下文面板）
 
@@ -88,6 +111,10 @@
   `appCtx.refreshPanel()`，否则面板会停留在"加载中"
   （`param_editor` 模态化后已无二级左栏，此规则对 `models` / `presets` / `logs` 仍适用）。
 - 面板内若有订阅/观察者（如 `IntersectionObserver`），**必须**在 `onHide()` 中断开。
+- `<=900px` 时二级面板是左侧抽屉（`body.panel-drawer-open` + `#btn-panel-toggle`）：
+  选中条目自动关闭，ESC/遮罩关闭并恢复焦点，窗口拖宽时移除 inert/class。
+  不要在窄屏 CSS 里再写 `.context-panel { display:none }` —— 那会让
+  模型/预设/日志实例列表失去入口。
 
 #### 共享面板视图 `panel_views.mjs`
 
@@ -126,14 +153,17 @@ item 里三个文本/徽标字段的分工（`models` 页踩过一遍才知道�
 
 页面注册顺序 = 侧边栏顺序，见 `app.js` 的 `PAGES`：
 
-`dashboard, models, chat, param_editor(模态), presets, logs, monitor, history, settings(模态)`
+`dashboard, models, runtimes, chat, param_editor(模态), presets, logs, monitor, history, help, settings(模态)`
+
+侧栏显示顺序由 `app.js::NAV_GROUPS` 决定（运行 / 模型 / 诊断 / 工具），
+`runtimes` 属于“模型”组；参数编辑器与设置是模态动作，仍不在路由目的地列表中。
 
 ### `appCtx` 形状（`app.js::initPages` 注入）
 
 ```
 Api, showToast, showModal, closeModal, showConfirm,
 escapeHtml, formatDuration, formatTime, formatBytes, basename, statusBadge,
-copyToClipboard, setTheme, getTheme, subscribeInstances, t,
+copyToClipboard, setTheme, getTheme, getThemePreference, subscribeInstances, t,
 refreshPanel, navigate
 ```
 
@@ -146,7 +176,8 @@ refreshPanel, navigate
 既依赖 DOM 结构、又被复制到了两处；再加一处就是第三份。
 
 **跳转传参**沿用既有约定：发送方先写 `window.__pendingXxx`，接收方在 `onShow()` 里读取并清空
-（`__pendingLogsInstanceId`、`__pendingModelPath`）。这是跨页传参的既有模式，不是新设计。
+（`__pendingLogsInstanceId`、`__pendingModelPath`、`__pendingChatInstanceId`、`__pendingChatNew`）。
+这是跨页传参的既有模式，不是新设计。
 
 ---
 
@@ -155,15 +186,26 @@ refreshPanel, navigate
 | 文件 | 导出 |
 |---|---|
 | `api.js` | `tauriInvoke`, default `Api` |
-| `app.js` | `showToast`, `showModal`, `closeModal`, `showConfirm`, `escapeHtml`, `formatDuration`, `formatTime`, `formatBytes`, `basename`, `statusBadge`, `getTheme`, `setTheme`, `subscribeInstances` |
+| `app.js` | `showToast`, `formatDuration`, `formatTime`, `formatBytes`, `basename`, `statusBadge`, `getTheme`, `getThemePreference`, `setTheme`, `subscribeInstances`；并再导出 `modal.mjs` 的 `showModal`/`closeModal`/`showConfirm` 与 `html.mjs` 的 `escapeHtml`（兼容既有页面模块） |
+| `html.mjs` | `escapeHtml`（无状态，避免 `app.js`↔页面模块成环） |
+| `modal.mjs` | `showModal`, `closeModal`, `showConfirm`, `closeAllModals`（浮层栈、焦点陷阱、背景 inert、焦点恢复、确认框） |
 | `i18n.mjs` | `LOCALE_NAMES`, `detectLocale`, `getLocale`, `setLocale`, `t`, `localizeBackendError` |
-| `runtime.mjs` | `createSingleFlight`, `createReconnectDelays`, `boundedAppend`, `normalizeHttpUrl`, `isLoopbackHost`, `isParamEnabled`, `shouldAutoAssignPort`, `mergeUpstreamOptions` |
+| `runtime.mjs` | `createSingleFlight`, `createReconnectDelays`, `boundedAppend`, `normalizeHttpUrl`, `isLoopbackHost`, `isParamEnabled`, `shouldAutoAssignPort`, `mergeUpstreamOptions`, `parseNumericInput`, `diffModelDefaults`, `groupModelsByKey` |
 | `panel_views.mjs` | `renderList`, `renderInstanceList`, `instanceSignature`, `emptyStateHtml` |
+| `tooltip.mjs` | `initTooltips(root)`（单一 portal tooltip；`app.js` 启动时初始化一次） |
+| `theme-boot.js` | 经典脚本，无导出；`index.html` 在 `<body>` 后同步加载，首帧前应用主题 |
 | `model_picker.mjs` | `open(ctx)`（**不是页面模块**：没有 `id`/`init`，不参与路由，由 `app.js` 与 chat 按需调用） |
-| `chat.js` | `id`, `title`, `init`, `onShow`, `onHide` |
+| `command_palette.mjs` | `openCommandPalette(ctx)`（Ctrl+K；浮层内搜索页面/动作） |
+| `markdown.mjs` | `renderMarkdown(text, {copy})`, `markdownPlainText(text)`（纯渲染，先转义再生成标签） |
+| `chat_stream.mjs` | `createSseParser()`, `extractChunk(payload)`, `buildChatStats({...})`, `contextUsage(messages, contextSize)`（原生 Chat 的纯流式解析与上下文占用计算） |
+| `chat_attachments.mjs` | 文本附件扩展名白名单/上限、文件名与大小格式化、`buildMessagePayloadContent(message)`（把附件包进清晰的发送文本） |
+| `chat_search.mjs` | `highlightParts(text, query)`（大小写不敏感，返回未转义片段，由调用方逐段转义） |
+| `chat.js` | `id`, `title`, `init`, `onShow`, `onHide`, `renderPanel`（原生流式 Chat + WebUI 回退） |
 | `dashboard.js` | `id`, `title`, `init`, `onShow`, `onHide` |
 | `models.js` | `id`, `title`, `init`, `onShow`, `onHide`, `renderPanel` |
-| `param_editor.js` | `id`, `title`, `kind`(`'modal'`), `open` |
+| `runtimes.js` | `id`, `title`, `init`, `onShow`, `onHide`（运行环境页：注册/探测/默认/移除） |
+| `param_editor.js` | `id`, `title`, `kind`(`'modal'`), `open`；渲染纯函数在 `param_editor_view.mjs`（`createParamView`、`isUnsupported`、`isWideField`） |
+| `param_editor_view.mjs` | `createParamView({escapeHtml, t, locale, getValues})` → `paramLabel`/`paramHelp`/`paramControlId`/`optionLabel`/`groupLabel`/`paramHtml`/`groupHtml`/`multiSelectHtml`/`controlHtml`；`isUnsupported`, `isWideField` |
 | `presets.js` | `id`, `title`, `init`, `onShow`, `onHide`, `renderPanel` |
 | `logs.js` | `id`, `title`, `init`, `onShow`, `onHide`, `renderPanel` |
 | `monitor.js` | `id`, `title`, `init`, `onShow`, `onHide` |
@@ -185,21 +227,27 @@ refreshPanel, navigate
 `btn-sidebar-toggle`, `btn-theme`, `btn-lang`, `btn-about`,
 `context-panel`, `context-panel-title`, `context-panel-body`,
 `btn-panel-toggle`（顶栏开关，无面板的页面置灰而非隐藏）, `btn-panel-collapse`（面板头部收起）
+`#ui-tooltip` 由 `tooltip.mjs` 动态创建（单一 portal，`role="tooltip"`）。
+
+侧栏由 `NAV_GROUPS` 分组渲染为真正的 `<button class="sidebar-item">`（`aria-current="page"`）；
+`#btn-sidebar-collapse` 是底部展开/收起按钮，状态存
+`localStorage.lunarshroud_sidebar_collapsed`（默认展开）。
 
 ### 4.2 各模块动态生成的 id
 
 | 模块 | id |
 |---|---|
-| `dashboard` | `instance-grid`, `btn-launch`, `launch-preset`, `launch-port`, `launch-model`, `launch-name` |
-| `models` | `models-subtitle`, `btn-models-rescan`, `model-detail`, `model-caps-body`, `btn-copy-model-path`, `btn-use-in-editor`, `btn-launch-model`, `model-search`, `model-show-all`, `model-list-body` |
-| `chat` | `chat-instance-select`, `chat-instance-info`, `chat-frame-container`, `chat-iframe`（运行时创建）, `chat-empty`, `chat-goto-dashboard`, `btn-chat-refresh`, `btn-chat-external` |
-| `param_editor` | 浮层内动态创建（无 `page-param_editor` 容器）：`pe-nav`（左分组导航）, `model-caps-card`（顶部能力条，空时不占位）, `vram-estimate`（能力条内显存预估行，空时不显示）, `btn-apply-recommended`, `param-groups`（参数区，一次只渲染当前分组）, `pe-cmd-toggle` / `pe-cmd-summary`（底部命令条摘要行）, `cmd-preview`（命令全文，默认收起）, `cmd-suppressed`（被丢弃参数的 **chip 组**容器，预置但 hidden，有内容才显示；每参数一枚 `.supp-chip`，`data-tip` 放「全名 + flag」）, `pe-sheet`（inline-sheet 容器，默认 hidden）, `load-preset-select` / `btn-reset-defaults`（浮层标题栏右侧）, `btn-copy-cmd`, `btn-save-preset`, `btn-launch-now`, `preset-name` / `preset-desc` / `preset-tags` / `launch-name`（均在 inline-sheet 内） |
+| `dashboard` | `instance-grid`, `btn-launch`, `launch-preset`, `launch-runtime`, `launch-port`, `launch-model`, `launch-name` |
+| `models` | `models-subtitle`, `btn-models-rescan`, `model-group-toggle`（仅目录中存在清单 `model:` 键时显示）, `model-detail`, `model-caps-body`, `model-manifest-body`（可选清单卡）, `btn-copy-model-path`, `btn-use-in-editor`, `btn-launch-model`, `model-search`, `model-show-all`, `model-list-body` |
+| `runtimes` | `btn-add-runtime`, `runtimes-body`, `runtime-detail`, `runtime-path`（浏览器模式路径输入） |
+| `chat` | `chat-instance-select`, `chat-instance-info`, `chat-thread`, `chat-input`, `chat-model-badge`, `chat-context-meter`, `chat-stream-state`, `chat-scroll-bottom`, `btn-chat-send`, `btn-chat-stop`, `btn-chat-attach`, `chat-file-input`, `chat-pending-attachments`, `chat-drop-hint`, `btn-chat-prompts`, `btn-chat-settings`, `btn-chat-export`, `btn-chat-new`, `[data-chat-mode]`, `chat-frame-container`, `chat-iframe`（WebUI 模式运行时创建）, `chat-empty`, `chat-goto-dashboard`, `btn-chat-refresh`, `btn-chat-external`；消息动作 `[data-edit-message]` / `[data-branch-message]` / `[data-copy-message]` / `[data-regenerate]` / `[data-preview-message]`；附件 chip `[data-remove-attachment]`；提示词浮层 `chat-prompt-*` / `[data-edit-prompt]` / `[data-delete-prompt]`；面板内 `chat-conversation-search` / `chat-search-clear` / `chat-panel-body` / `[data-search-result]`，会话列表的 `[data-chat-id]` / `[data-delete-chat]` |
+| `param_editor` | 浮层内动态创建（无 `page-param_editor` 容器）：`pe-nav`（左分组导航）, `model-caps-card`（顶部能力条，空时不占位）, `vram-estimate`（能力条内显存预估行，空时不显示）, `btn-apply-recommended`, `btn-apply-model-defaults`（能力条内，模型默认值无内容时 disabled）, `model-defaults-note`（来源标签行，空时 hidden）, `model-defaults-actions` / `btn-save-model-defaults` / `btn-clear-model-defaults`（保存差异/清除用户默认值，能力条内）, `param-groups`（参数区，一次只渲染当前分组）, `pe-cmd-toggle` / `pe-cmd-summary`（底部命令条摘要行）, `cmd-preview`（命令全文，默认收起）, `cmd-suppressed`（被丢弃参数的 **chip 组**容器，预置但 hidden，有内容才显示；每参数一枚 `.supp-chip`，`data-tip` 放「全名 + flag」）, `pe-sheet`（inline-sheet 容器，默认 hidden）, `runtime-select` / `load-preset-select` / `btn-reset-defaults`（浮层标题栏右侧）, `btn-copy-cmd`, `btn-save-preset`, `btn-launch-now`, `preset-name` / `preset-desc` / `preset-tags` / `launch-name`（均在 inline-sheet 内） |
 | 顶栏 / 模型选择器 | `btn-model-picker`（静态 HTML，文案由 `app.js` 注入）, `picker-search`, `picker-list`, `picker-foot`（后三个由 `model_picker.mjs` 生成在模态里；foot 是左侧 `.model-picker-kbd` 快捷键提示 + 右侧计数的两段结构） |
 | `chat` | `chat-instance-select`, `chat-instance-info`, `chat-frame-container`, `chat-empty`, `chat-reload-last`, `chat-external-only`, `chat-open-external`, `chat-goto-dashboard` |
-| `presets` | `preset-detail`, `btn-new`, `btn-import`, `btn-diff`, `btn-copy-params`, `i-json`, `i-file`, `e-name`, `e-desc`, `e-tags`, `e-params`, `d-a`, `d-b`, `d-result` |
-| `logs` | `logs-main`, `logs-view`, `log-search`, `log-level`, `log-pause`, `log-clear`, `log-download`, `log-conn-state` |
+| `presets` | `preset-detail`, `btn-new`, `btn-import`, `btn-diff`, `btn-copy-params`, `clone-name`（克隆浮层输入）, `i-json`, `i-file`, `e-name`, `e-desc`, `e-tags`, `e-params`, `d-a`, `d-b`, `d-result` |
+| `logs` | `logs-main`, `logs-view`, `log-search`, `log-level`, `log-pause`, `log-clear`, `log-download`, `log-conn-state`, `log-count`（显示 X / Y 行） |
 | `monitor` | `metric-canvas`, `gpu-table-wrap`, `proc-table-wrap`, `monitor-refresh`, `monitor-subtitle` |
-| `history` | `history-table`, `history-pagination`, `btn-refresh`, `btn-clear`, `pg-prev`, `pg-next` |
+| `history` | `history-table`, `history-pagination`, `btn-refresh`, `btn-clear`, `pg-prev`, `pg-next`；详情显示 `model_key` / `variant_key` |
 | `settings` | 浮层内动态创建：`settings-nav`, `settings-pane`（无 `page-settings` 容器） |
 | 全局（`app.js`） | `app-modal-overlay`（`showModal` 创建）, `debug-banner`（可选，index.html 未定义时静默跳过） |
 
@@ -207,8 +255,24 @@ refreshPanel, navigate
 
 `param_editor` 是模态型浮层（`modal-xl`）：顶部能力条 + 左分组导航 + 右参数网格 +
 底部命令条。`#model-caps-card` 按当前 `model` 字段的值渲染，数据来自
-`/api/system/capabilities?model=…`，把探测到的事实（原生上下文、层数、MTP 形态、
-同目录配套文件）和一键应用放在一起；无模型时能力条不占位（`:empty` 隐藏）。
+`/api/system/capabilities?model=…&runtime_id=…`，把探测到的事实（原生上下文、层数、
+MTP 形态、同目录配套文件）、模型默认值来源与一键应用放在一起；无模型时能力条不占位
+（`:empty` 隐藏）。
+
+**运行环境选择（B2）**：标题栏 `#runtime-select` 的值会随 schema、配方、能力探测、
+命令预览与启动请求一起发送；切换运行环境会按新构建重新取 schema，并把仍存在的参数值
+合并过去（能力缓存键是 `runtime_id + model path`，不能只按路径缓存）。预设可固定
+`runtime_id`，载入时若目标 profile 可用则自动切过去；不可用时保留当前选择并告警。
+模型默认值卡显示 `清单 N 项 · 用户 M 项` 以及每个键的来源（清单/用户），只有用户点击
+“应用模型默认值”才写入当前参数；这保证来源标签可见但不会静默覆盖手调值。
+“保存当前为模型默认值”只写入与全局默认不同的键（`diffModelDefaults`）并过滤受管键；
+“清除用户默认值”删除该模型的用户覆盖。`customFields` 的 boolean/string
+`setJinjaVariable` 默认值作为清单默认值进入 `chat_template_kwargs`。
+
+**启动前检查策略（B4）**：设置页的 `launch_guardrail` 取 `off|warn|strict`。
+`confirmLaunch` 读取 `/api/diagnose` 返回的 `guardrail` 与 `blocking`：
+`off` 时纯警告直接放行，`strict` 时警告也走阻断分支；错误始终阻断。
+请求体与响应结构向后兼容（旧后端没有字段时按错误列表判断）。
 
 **挂在 `refreshAllControls()` 上**：它是"值变化后的统一出口"——载入预设、重置默认、
 浏览选择、字段编辑全汇聚到它，卡片只要跟住这一处就不会漏。浮层标题里的模型文件名
@@ -237,12 +301,28 @@ refreshPanel, navigate
    `currentValues` 即时写回保证切组不丢输入 —— 不要改回"全量渲染 +
    IntersectionObserver"那套。
 
+### 模型库按逻辑模型分组（`models`）
+
+模型详情的清单卡提供“编辑清单”：打开 YAML/JSON 编辑器（`manifest-modal`），
+可插入模板、校验并预览模型标识/警告、保存或删除。已有清单时格式锁定；保存
+前由后端按扫描同一解析器验证，旧文件自动备份到 `DATA_DIR/manifest-backups/`。
+只有真实 `.gguf` 旁才允许写，且不允许在已有清单旁再建另一种格式。
+
+模型库扫描带 `with_manifest=true`。工具栏显示 `#model-group-toggle` 的条件是：
+至少一个文件声明了清单 `model:`，或某个文件夹里有多个可加载模型（无清单回退）。
+开关状态存 `localStorage.lunarshroud_models_group_by_model`，默认关闭。打开后
+清单文件按 `manifest.model_key` 分组；无清单但同目录多文件的模型按父目录分组，
+组标题为 `目录 · <folder>`；其余归入“无清单”。组顺序为清单组 → 目录组 →
+无清单。分组只改变列表呈现，选中/详情/参数编辑器路径不变；单个文件的平铺
+目录不会出现开关，行为与分组前一致。
+
 ### 键盘快捷键（都要能被解绑；注册位置随宿主生命周期）
 
 | 组合 | 作用 | 注册位置 | 边界 |
 |---|---|---|---|
 | `Ctrl+Enter` | 参数编辑器：打开启动确认（inline-sheet） | `param_editor` 浮层 `open()` 时绑在 overlay 上，随浮层销毁自动解绑（焦点在浮层内才触发） | 其他页面 / 其他浮层不抢键；再按一次同 kind = 收起 |
 | 模型选择器 `↑`/`↓` | 在结果列表移动选中行（`scrollIntoView nearest` 跟随） | `model_picker.mjs` 搜索框 keydown（随浮层销毁） | 只在搜索框聚焦时生效 |
+| `Ctrl+K` | 打开命令面板 | `app.js` 的 `initLayout` | 有浮层打开时不替换（避免丢失参数编辑器草稿）；设置页 dirty 时由设置页拦截并询问 |
 | `Ctrl+L` | 打开模型选择器 | `app.js` 的 `initLayout`（与 ESC 同一处，键盘处理只有一份） | `preventDefault()` 否则会选中地址栏；编辑器浮层开着时按它 = 选择器替换编辑器（选完回来，参数不丢） |
 | `Ctrl+R` | Chat 空态：重载上次使用的模型 | `chat.onShow` / `onHide` 解绑 | **只在空态**——有实例可用时抢它会把"刷新页面"变成"再拉一个模型" |
 
@@ -264,6 +344,59 @@ Esc 走全局关闭。选中行有左缘 3px 指示条（与 `.panel-nav-item.ac
 动作是 `window.__pendingModelPath = path; ctx.closeModal(); ctx.navigate('param_editor')`
 （沿用 `models.js` 的跨模块传参约定；`param_editor` 是模态型模块，`navigate` 打开浮层）。
 取消按钮是唯一的纯退出路径。
+
+Chat 工具栏的实例信息显示“模型文件名 · 运行时标签”；iframe 加载期间
+`#chat-frame-container[aria-busy=true]`，load 后移除。日志页进入时若已有运行实例，
+自动选中首个 running/starting 实例；首条日志到达时移除空态，并实时更新行数。
+
+### 原生 Chat（2026-10-21）
+
+Chat 页默认是**原生对话**，WebUI 只是高级回退（顶部 `[data-chat-mode]` 切换，
+选择存 `localStorage.lunarshroud_chat_mode`）。原生模式不直接 fetch
+llama-server：请求经后端 `POST /api/instances/{id}/chat/completions` 转发，原因是
+CSP/CORS 下 webview 的 Origin 不是 llama-server 允许的 `localhost`，同时 API Key
+必须留在主进程侧。后端强制 `stream=true`，逐块转发 SSE；前端用
+`chat_stream.mjs` 跨块解析 `data:` 事件，`markdown.mjs` 先转义再渲染。
+
+会话持久化在 `chats.db`（`/api/chats*`），消息/参数/统计都有上限；前端负责
+“追加用户消息 → 流式生成 → 追加 assistant 消息（含 usage/timings/部分中断）”。
+停止用 `AbortController`；中断时保存已生成的部分。重新生成会先删除最后一条
+assistant 消息再重跑。`reasoning_content` 在消息内以可折叠“思考过程”保存
+（stats 里有界存储）。
+
+**Chat 进阶（2026-10-21）**：编辑用户消息会调用 PATCH 消息接口并删除其后的
+消息，然后自动重新生成；只有自动标题会跟随首条用户消息更新，手动改名不受影响。
+任意已保存消息可“分支”为新的会话（复制到该消息为止的内容、参数、模型绑定和
+stats，源会话不变）。输入框底部的上下文仪表读取最近一条 assistant 的
+`total_tokens`（缺失时用 `prompt_tokens/completion_tokens` 或
+`prompt_n/predicted_n`）并对照实例 `context_size`，85% 起变为警示色；没有统计时
+显示 “—”，不伪造字符数。提示词库含 6 个内置提示词和本地保存的提示词，插入到
+输入框光标处；自定义提示词存在 `chats.db` 的 `prompts` 表，因此随备份迁移。
+自定义提示词可点击铅笔按钮在原表单中编辑（保存调用 `PATCH /api/prompts/{id}`，
+取消恢复原输入），删除仍需二次点击确认。
+
+**本地文本附件（2026-10-21）**：纸夹按钮、文件选择或拖放把文本文件读入
+webview（`File.text()`，不上传）；白名单见 `chat_attachments.mjs`，每文件
+≤200000 字符、每条消息 ≤5 个且合计 ≤500000 字符、每会话合计 ≤2000000 字符。
+附件存在 `chats.db.attachments`，消息只显示 chip；点击 chip 打开预览（超过
+30000 字符只截断预览，发送/保存仍是全文）。发送时 `buildMessagePayloadContent`
+把附件放进 `--- Attached file: … ---` 分隔块，仅用于请求，不污染可见消息；
+纯附件消息也可发送，自动标题会回退到文件名。分支复制附件，导出 Markdown
+包含附件全文；备份随 `chats.db` 一起携带。二进制文件（含 NUL）、不在白名单的
+扩展名、超大文件都会被拒绝并提示。
+
+**会话搜索（2026-10-21）**：侧栏搜索框防抖 220ms 调用
+`GET /api/chats/search`，覆盖标题、消息、附件名和附件内容；结果展示匹配类型、
+附件名、消息数与高亮片段。输入框在列表刷新时保留焦点和光标；Enter 打开首个
+结果，上下键在结果间移动，Escape/× 清空并回到普通会话列表；原生模式下
+`Ctrl+F` 聚焦并全选搜索框（有浮层时让给浮层/浏览器）。后端返回的是
+短 snippet，不会把完整附件回传到侧栏。
+
+跨页入口：仪表盘实例卡的“对话”写 `window.__pendingChatInstanceId`；Ctrl+K 的
+“新建对话”写 `window.__pendingChatNew`，两者都在 `onShow()` 读取并清空。
+原生 Chat 的动态 id 还包括 `chat-thread`、`chat-input`、`chat-composer`、
+`chat-context-meter`、`chat-conversation-list`（面板内）、`chat-setting-*`；
+WebUI 仍用 `chat-frame-container`/`chat-iframe`。
 
 ### Chat 的降级：非回环实例不嵌 iframe
 
@@ -388,17 +521,27 @@ Esc 走全局关闭。选中行有左缘 3px 指示条（与 `.panel-nav-item.ac
 | GET | `/api/system/config` | 读取全局配置 |
 | PUT | `/api/system/config` | 更新配置（仅接受已知键） |
 | GET | `/api/system/overview` | 系统资源快照 |
-| GET | `/api/params/schema` | 参数 schema（前端表单唯一数据源） |
+| GET | `/api/params/schema?runtime_id=` | 参数 schema（前端表单唯一数据源；按所选构建取 supported） |
 | GET | `/api/params/defaults` | 默认参数字典 |
-| POST | `/api/params/build-command` | 由参数构建命令行预览。返回 `{argv, command, suppressed}` |
+| GET | `/api/params/recipes?runtime_id=` | 用途配方（按所选构建标注 unsupported） |
+| POST | `/api/params/build-command` | 由参数构建命令行预览（`{params, runtime_id?}`）。返回 `{argv, command, suppressed}` |
 | GET/POST | `/api/presets` | 列出 / 新建预设 |
 | GET/PUT/DELETE | `/api/presets/{id}` | 预设详情 / 更新 / 删除 |
 | POST | `/api/presets/{id}/clone` | 克隆 |
 | GET | `/api/presets/{id}/export` | 导出 |
 | POST | `/api/presets/import` | 导入 |
 | POST | `/api/presets/diff` | 对比两个预设 |
-| GET | `/api/models/scan` | 扫描 .gguf |
+| GET | `/api/models/scan` | 扫描 .gguf（可选 `with_capabilities` / `with_manifest`） |
 | GET | `/api/models/browse` | 浏览目录 |
+| GET | `/api/models/manifest` | 模型同目录清单（`model.yaml` / `manifest.json`），只读叠加 |
+| GET | `/api/models/manifest/raw` | 读取原始清单文本（编辑用，`?model=`） |
+| POST | `/api/models/manifest/validate` | 校验清单文本（`{model, content, format}`），不写盘 |
+| PUT/DELETE | `/api/models/manifest` | 原子写入（`overwrite`）/ 删除；旧文件备份到 `DATA_DIR/manifest-backups` |
+| GET/PUT/DELETE | `/api/models/defaults` | 模型默认值：`GET ?model=` 返回 `{params, sources, unknown_fields, warnings}`；PUT `{model, params}`；DELETE `?model=` |
+| GET/POST | `/api/runtimes` | 运行时 profile 列表 / 注册并探测（`{path, manifest_path?, display_name?}`） |
+| POST | `/api/runtimes/{id}/probe` | 重新探测运行时 |
+| PUT/DELETE | `/api/runtimes/{id}` | 重命名 / 移除注册（不删 exe） |
+| GET/PUT | `/api/runtimes/preferences` | 按模型格式的默认运行时 id |
 | GET | `/api/models/vram-estimate` | 按**当前参数值**估算显存（`model`/`ctx_size`/`n_gpu_layers`/`cache_type_k`/`cache_type_v`/`parallel`/`mmproj`） |
 | GET/POST | `/api/instances` | 列出 / 启动实例 |
 | GET/DELETE | `/api/instances/{id}` | 实例详情 / 移除 |
@@ -409,6 +552,21 @@ Esc 走全局关闭。选中行有左缘 3px 指示条（与 `.panel-nav-item.ac
 | POST | `/api/history/clear` | 清空历史 |
 | POST | `/api/history/{id}/relaunch` | 按历史重启 |
 | GET | `/api/chat/instances` | 可用于 Chat 的运行中实例 |
+| GET/POST | `/api/chats` | 本机会话列表 / 新建会话（`{title?, instance_id?, model?, params?}`） |
+| GET | `/api/chats/search` | 本地搜索会话（`q`, `limit`），覆盖标题/消息/附件，返回 snippet 与 match_type |
+| GET/PATCH/DELETE | `/api/chats/{id}` | 会话详情（含 messages）/ 改名或参数 / 删除 |
+| POST | `/api/chats/clear` | 清空全部本机会话 |
+| POST | `/api/chats/{id}/messages` | 追加消息（`{role, content, stats?, attachments?}`；附件仅 user，`{name, content}`） |
+| PATCH | `/api/chats/{id}/messages/{message_id}` | 编辑消息（`{content, truncate_after?}`），返回删除数量与当前会话标题 |
+| DELETE | `/api/chats/{id}/messages/{message_id}` | 删除消息（重新生成前用） |
+| POST | `/api/chats/{id}/branch` | 分支会话（`{message_id?, title?}`），返回含 messages 的新会话 |
+| GET/POST | `/api/prompts` | 列出 / 新建本地提示词 |
+| PATCH/DELETE | `/api/prompts/{id}` | 修改 / 删除本地提示词 |
+| POST | `/api/instances/{id}/chat/completions` | 原生 Chat 的 SSE 代理；强制 `stream=true`，API Key 只在后端注入 |
+| GET/POST | `/api/backups` | 列出本机备份 + `pending` / 创建备份（`{include_logs?}`） |
+| GET/DELETE | `/api/backups/{name}` | 校验备份清单 / 删除备份 |
+| POST | `/api/backups/restore` | 校验并暂存恢复（`{name}`）；有运行中实例时 409，返回 `restart_required` |
+| DELETE | `/api/backups/pending` | 取消待恢复 |
 
 WebSocket：`/ws/system/metrics`、`/ws/instances`、`/ws/instances/{id}/logs`
 （统一经 `_createWebSocketWatcher`，带指数退避重连，令牌失效后自动刷新会话）
@@ -462,9 +620,10 @@ cli_no_value, unit, order`
 | `window.__LLAMA_LAST_REQUEST_URL__` | 最后一次请求 URL（诊断展示用） |
 | `window.__LLAMA_BACKEND_URL_ERROR__` | 会话获取失败原因（诊断展示用） |
 | `window.__pendingLogsInstanceId` | `dashboard` → `logs` 的跳转参数：仪表盘点「日志」写入，日志页 `onShow` 读取 |
-| `localStorage.lunarshroud_theme` | 主题（**注意**：`data/config.json` 里的 `theme` 目前只写不读，开屏主题完全由它决定） |
+| `localStorage.lunarshroud_theme` | 主题偏好：`light` / `dark` / `system`。开屏由 `theme-boot.js` 读取并解析；后端 `config.theme` 同步保存但启动不再依赖它 |
 | `localStorage.lunarshroud_locale` | 语言 |
 | `localStorage.lunarshroud_panel_collapsed` | 二级左栏是否收起 |
+| `localStorage.lunarshroud_sidebar_collapsed` | 一级侧栏是否收起为图标轨道（默认展开） |
 | `localStorage.lunarshroud_models_show_all` | 模型库是否显示配套文件（mmproj / 解码头） |
 | `window.__pendingModelPath` | 模型库 / 顶栏选择器 → 参数编辑器浮层：要把哪个模型填进 `model` 字段（发送方写入，编辑器 `open()` 消费并清空） |
 | `window.__pendingLogsInstanceId` | 仪表盘 / 聊天 → 日志页：要打开哪个实例的日志 |

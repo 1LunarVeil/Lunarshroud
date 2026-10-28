@@ -59,7 +59,8 @@ NVIDIA 用户还需要 CUDA 运行库：安装 NVIDIA 官网的 CUDA Toolkit 运
   显存不足、端口被占用等问题会直接列出。错误项会阻止启动；警告项可以选择
   「仍然启动」。
 - 第一次加载大模型可能需要几十秒到几分钟，状态是「启动中」。就绪后顶部显示
-  运行中，Chat 页会嵌入 llama-server 自带的 WebUI。
+  运行中，Chat 页默认使用**原生流式对话**；需要上游模型管理器或高级界面时可
+  切到 WebUI 模式（仍然嵌在沙箱 iframe 中）。
 - 失败时实例卡片上会出现 **「为什么没启动？」**，点开会给出原因分类和修复建议。
 
 ## 这些操作最容易出错
@@ -121,9 +122,10 @@ NVIDIA 用户还需要 CUDA 运行库：安装 NVIDIA 官网的 CUDA Toolkit 运
 
 ### 备份与恢复用户数据
 
-`config.json`、`history.db` 和 `presets\` 都在 `%APPDATA%\LunarShroud\`。最直接的
-备份方式是关闭启动器后复制整个目录；源码/便携版还可以用随仓库提供的工具
-（需要 Windows PowerShell 5.1 或更新版本）：
+`config.json`、`history.db`、`chats.db`（聊天、附件、提示词）和 `presets\`
+都在 `%APPDATA%\LunarShroud\`。可以在 **设置 → 数据备份** 创建、验证和恢复
+本机备份（恢复在下次启动应用）；也可以关闭启动器后复制整个目录，或使用随
+仓库提供的工具（需要 Windows PowerShell 5.1 或更新版本）：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\Backup-UserData.ps1

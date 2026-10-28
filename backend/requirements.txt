@@ -21,3 +21,8 @@ pydantic==2.13.4
 httpx==0.28.1
 # GPU monitoring prefers NVML; falls back to spawning nvidia-smi when absent
 nvidia-ml-py==13.610.43
+# Knowledge base: PDF text extraction, PDF page rendering for OCR, and the
+# cosine-similarity scan over up to 20k chunks per base.
+pypdf==6.18.1
+pypdfium2==5.13.0
+numpy==2.4.6

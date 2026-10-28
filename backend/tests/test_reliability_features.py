@@ -182,6 +182,112 @@ def test_data_page_corruption_is_quarantined_not_just_non_sqlite_files(monkeypat
     assert history_store.mark_unfinished_as_interrupted() == 0
 
 
+def test_corrupt_chat_database_is_quarantined_and_rebuilt(monkeypatch, tmp_path):
+    """损坏的 chats.db 必须像 history.db 一样隔离重建，而不是让聊天永久 500。
+
+    ``chat_store.init_db()`` 以前只有建表 + 记路径，没有任何损坏处理：
+    lifespan 捕获异常后继续启动（这个取舍本身是对的，聊天不该拦死模型管理），
+    但 ``_initialized_paths`` 因此永远不含该路径，于是**每个** ``/api/chats``、
+    ``/api/prompts``、附件读取都会重跑建表并再抛 ``DatabaseError`` ——
+    聊天功能整体永久不可用，应用里也没有任何修复入口。
+    """
+    import sqlite3
+
+    from core import chat_store
+
+    db_path = tmp_path / "chats.db"
+    original = b"this is not a sqlite database\n" * 10
+    db_path.write_bytes(original)
+    monkeypatch.setattr(chat_store, "CHATS_DB", db_path)
+    chat_store._initialized_paths.discard(str(db_path))
+
+    chat_store.init_db()
+
+    quarantine = tmp_path / "chats.db.corrupt"
+    assert quarantine.exists(), "损坏聊天库没有被隔离"
+    assert quarantine.read_bytes() == original, "隔离必须保留原件供用户取证"
+    with sqlite3.connect(str(db_path)) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+    assert "conversations" in tables
+    conversation = chat_store.create_conversation("恢复后仍可写")
+    assert chat_store.get_conversation(conversation["id"])["title"] == "恢复后仍可写"
+
+
+def test_corrupt_chat_db_sidecars_are_quarantined_too(monkeypatch, tmp_path):
+    """``-wal`` / ``-shm`` 必须跟着主库一起挪走。
+
+    只移主库的话，新连接会接着读到旧 sidecar —— "重建"出来的库依然是坏的，
+    而且这次连报错都对不上原因。
+
+    这里直接测 :func:`sqlite_recovery.quarantine_corrupt_files`：非 SQLite
+    文件那条路径上 SQLite 会在打开失败时顺手清掉 sidecar，所以端到端测不出
+    这个分支；真实需要它的形态是"主库合法、数据页坏"，那时 sidecar 还在。
+    """
+
+    from core import sqlite_recovery
+
+    db_path = tmp_path / "chats.db"
+    db_path.write_bytes(b"main")
+    (tmp_path / "chats.db-wal").write_bytes(b"stale wal")
+    (tmp_path / "chats.db-shm").write_bytes(b"stale shm")
+
+    sqlite_recovery.quarantine_corrupt_files(db_path, "chat")
+
+    assert not db_path.exists()
+    assert not (tmp_path / "chats.db-wal").exists()
+    assert not (tmp_path / "chats.db-shm").exists()
+    assert (tmp_path / "chats.db.corrupt").read_bytes() == b"main"
+    assert (tmp_path / "chats.db.corrupt-wal").read_bytes() == b"stale wal"
+    assert (tmp_path / "chats.db.corrupt-shm").read_bytes() == b"stale shm"
+
+
+def test_a_locked_chat_db_is_not_mistaken_for_corruption(monkeypatch, tmp_path):
+    """锁冲突不是损坏：必须原样抛出，绝不把一个好库改名"恢复"掉。
+
+    判据写反的后果比不判更糟 —— 另一个进程正持着写锁时把 chats.db 挪走，
+    用户的会话就真的没了，而且新库还会在旧连接底下建起来。
+    """
+    import sqlite3
+
+    from core import chat_store, sqlite_recovery
+
+    db_path = tmp_path / "chats.db"
+    monkeypatch.setattr(chat_store, "CHATS_DB", db_path)
+    chat_store._initialized_paths.discard(str(db_path))
+
+    def locked() -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(chat_store, "_create_schema", locked)
+    with pytest.raises(sqlite3.OperationalError):
+        chat_store.init_db()
+
+    assert not (tmp_path / "chats.db.corrupt").exists(), "锁冲突被误判成了损坏"
+    assert str(db_path) not in chat_store._initialized_paths, (
+        "没建成功的库不能被记成已初始化，否则后续请求全静默"
+    )
+    assert (
+        sqlite_recovery.is_database_corruption(
+            sqlite3.OperationalError("database is locked")
+        )
+        is False
+    )
+    assert sqlite_recovery.is_database_corruption(
+        sqlite3.DatabaseError("attempt to write a readonly database")
+    ) is False
+    assert sqlite_recovery.is_database_corruption(
+        sqlite3.DatabaseError("file is not a database")
+    ) is True
+    assert sqlite_recovery.is_database_corruption(
+        sqlite3.DatabaseError("database disk image is malformed")
+    ) is True
+
+
 def test_unfinished_history_rows_are_marked_interrupted(monkeypatch, tmp_path):
     """上一次后端进程留下的非终态记录必须在启动时收口。
 
@@ -356,7 +462,9 @@ def test_log_persistence_failure_disables_only_that_instance(monkeypatch, tmp_pa
     assert (tmp_path / "logs" / "instances" / "healthy.log").exists()
 
 
-def test_restart_records_lineage_and_reuses_port(monkeypatch, tmp_path):
+def test_restart_records_lineage_and_reuses_port(
+    monkeypatch, tmp_path, stub_launch_probe
+):
     """重启应携带 restarted_from 血缘，且无固定 sleep。"""
     import core.process_manager as process_manager
     from core.process_manager import ProcessManager
@@ -413,16 +521,19 @@ def test_restart_records_lineage_and_reuses_port(monkeypatch, tmp_path):
         "_terminate_process_tree",
         lambda item, force: item.process.kill() if force else item.process.terminate(),
     )
-    first = pm.start_instance({"model": str(model), "port": 18300}, name="origin")
+    first = pm.start_instance(
+        {"model": str(model), "port": 18300, "ctx_size": 4096}, name="origin"
+    )
     second = pm.restart_instance(first.id)
 
     assert second.id != first.id
     assert second.restarted_from == first.id
     assert second.port == 18300  # 停止后立即可复用同端口
     assert second.to_dict()["restarted_from"] == first.id
+    assert second.to_dict()["context_size"] == 4096
 
 
-def test_manager_level_change_broadcast(monkeypatch, tmp_path):
+def test_manager_level_change_broadcast(monkeypatch, tmp_path, stub_launch_probe):
     """任意实例状态变化都应触发管理器级订阅者（供 /ws/instances 推送）。"""
     import core.process_manager as process_manager
     from core.process_manager import InstanceStatus, ProcessManager
@@ -668,3 +779,112 @@ def test_schema_and_presets_expose_english_fields():
     defined = {p.key for p in PARAM_DEFINITIONS}
     assert set(PARAM_LABELS_EN) == defined
     assert set(PARAM_HELP_EN) == defined
+
+
+def test_history_database_path_that_is_a_directory_is_quarantined(monkeypatch, tmp_path):
+    """A directory at history.db is corrupt data, not a permanent startup failure.
+
+    This shape can be produced by a bad restore/sync tool. The launcher must
+    move it aside, rebuild a real database, and keep the old path for forensics.
+    """
+    from core import history_store
+
+    db_path = tmp_path / "history.db"
+    db_path.mkdir()
+    monkeypatch.setattr(history_store, "HISTORY_DB", db_path)
+    monkeypatch.setattr(history_store, "_initialized_paths", set())
+
+    history_store.init_db()
+
+    assert db_path.is_file()
+    assert (tmp_path / "history.db.corrupt").is_dir()
+    assert history_store.list_history() == []
+
+
+def test_chat_database_path_that_is_a_directory_is_quarantined(monkeypatch, tmp_path):
+    from core import chat_store
+
+    db_path = tmp_path / "chats.db"
+    db_path.mkdir()
+    monkeypatch.setattr(chat_store, "CHATS_DB", db_path)
+    monkeypatch.setattr(chat_store, "_initialized_paths", set())
+
+    chat_store.init_db()
+
+    assert db_path.is_file()
+    assert (tmp_path / "chats.db.corrupt").is_dir()
+    assert chat_store.list_conversations() == []
+
+
+def test_history_init_failure_does_not_block_backend_startup(monkeypatch, tmp_path):
+    """History is diagnostic data; a locked/unrecoverable DB must not stop the app.
+
+    Chat storage already has this isolation in lifespan. History did not: any
+    unexpected error escaped and uvicorn exited, taking model management with it.
+    """
+    import config as backend_config
+    import main as backend_main
+    from core import history_store
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(backend_main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(backend_config, "HISTORY_DB", tmp_path / "history.db")
+    monkeypatch.setattr(history_store, "HISTORY_DB", tmp_path / "history.db")
+    monkeypatch.setattr(
+        backend_config, "get_config", lambda: dict(backend_config.DEFAULT_CONFIG)
+    )
+    monkeypatch.setattr(backend_main, "_warm_server_probe", lambda: None)
+    monkeypatch.setattr(backend_main, "_adopt_legacy_runtime", lambda: None)
+
+    def broken_init():
+        raise OSError("simulated locked history database")
+
+    monkeypatch.setattr(history_store, "init_db", broken_init)
+
+    # Must not raise: the launcher remains usable for models/instances.
+    with TestClient(backend_main.app):
+        pass
+
+
+def test_instance_log_buffer_respects_a_byte_budget(monkeypatch):
+    """Line count alone is not a memory bound when a single line can be 16 KiB."""
+    from collections import deque
+
+    import core.process_manager as process_manager
+    from core.process_manager import Instance, ProcessManager
+
+    instance = Instance(
+        id="byte-budget",
+        name="byte-budget",
+        preset_id=None,
+        preset_name=None,
+        params={},
+        argv=[],
+        command_string="",
+    )
+    instance.logs = deque()
+    instance._log_buffer_max_lines = 10
+    instance._log_persist_enabled = False
+    monkeypatch.setattr(process_manager, "MAX_LOG_BUFFER_BYTES", 100)
+
+    manager = ProcessManager()
+    manager._append_log(instance, "stdout", "a" * 60)
+    manager._append_log(instance, "stdout", "b" * 60)
+
+    assert len(instance.logs) == 1
+    assert sum(len(entry.line.encode("utf-8")) for entry in instance.logs) <= 100
+
+
+def test_database_quarantine_keeps_previous_corrupt_evidence(tmp_path):
+    from core import sqlite_recovery
+
+    source = tmp_path / "history.db"
+    source.write_bytes(b"new corrupt contents")
+    previous = tmp_path / "history.db.corrupt"
+    previous.write_bytes(b"older evidence")
+
+    sqlite_recovery.quarantine_corrupt_files(source, "history")
+
+    assert not source.exists()
+    assert previous.read_bytes() == b"older evidence"
+    assert any(p.name.startswith("history.db.corrupt.") for p in tmp_path.iterdir())

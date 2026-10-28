@@ -1,0 +1,16 @@
+{
+  "name": "lunarshroud-frontend-checks",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "node --test frontend/tests/*.test.mjs",
+    "test:browser": "node --test frontend/tests/browser/core-paths.test.mjs",
+    "test:browser:deep": "node --test --test-concurrency=1 frontend/tests/browser/deep-paths.test.mjs",
+    "test:browser:adversarial": "node --test --test-concurrency=1 frontend/tests/browser/adversarial.test.mjs"
+  },
+  "devDependencies": {
+    "axe-core": "^4.11.0",
+    "playwright-core": "^1.57.0"
+  }
+}

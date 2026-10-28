@@ -244,6 +244,21 @@ PARAM_DEFINITIONS: list[ParamMeta] = [
         order=2,
     ),
     ParamMeta(
+        key="device", label="计算设备", cli="--device",
+        group=ParamGroup.PERFORMANCE, type="text",
+        default="", placeholder="如 Vulkan0 / OPENVINO1 / ROCm0 / CUDA0（留空=自动）",
+        help=(
+            "指定用哪个后端设备（逗号分隔可多选，如 Vulkan0,Vulkan1）。"
+            "取值必须来自**当前这份构建**在「运行环境」页列出的设备名——"
+            "CPU 包没有设备、Vulkan 包列出 Vulkan0/1…、OpenVINO 包列出 "
+            "OPENVINO0/1…（其中 OPENVINO 的 CPU 设备通常排第一）、ROCm 包列出 "
+            "ROCm0…（没有 ROCm 兼容显卡时为空）。留空 = 由 llama.cpp 自行选择。"
+            "AMD 显卡请用 Vulkan 包（本机若装了 ROCm 兼容驱动则可用 ROCm 包）；"
+            "Intel 核显/Arc/NPU 请用 OpenVINO 包。"
+        ),
+        order=3,  # 与 CPU 线程数同序：定义顺序决定展示位置（排序是稳定的）
+    ),
+    ParamMeta(
         key="threads", label="CPU 线程数", cli="-t",
         group=ParamGroup.PERFORMANCE, type="number",
         default=-1, min=-1, max=256, step=1, skip_when_default=True,
@@ -718,6 +733,14 @@ PARAM_DEFINITIONS: list[ParamMeta] = [
         order=3,
     ),
     ParamMeta(
+        key="cors_origins", label="CORS 允许来源", cli="--cors-origins",
+        group=ParamGroup.SERVER, type="text",
+        default="localhost", placeholder="localhost 或逗号分隔的 Origin 列表",
+        help="允许跨域访问的 Origin。默认 localhost：只反射本机来源，避免任意网页读取"
+             "本机模型输出；设为 * 会允许所有网站（不推荐）。旧构建没有该参数时会自动省略。",
+        order=4,
+    ),
+    ParamMeta(
         key="path", label="WebUI 路径", cli="--path",
         group=ParamGroup.SERVER, type="dir",
         default="", placeholder="留空使用 llama-server 内置 WebUI",
@@ -956,7 +979,7 @@ PARAM_DEFINITIONS: list[ParamMeta] = [
     ),
     # 必须是列表的**最后一项**：它按声明顺序追加到命令行末尾，长尾 flag
     # 因此不会被面板写出的东西盖掉。但**不允许**反过来覆盖启动器代管的 5 个
-    # 参数 —— 那是安全边界被绕过的根因（audit S2），校验已在
+    # 参数 —— 那是安全边界被绕过的根因，校验已在
     # process_manager._validate_start 与 preset_store._validate_preset_data 两处拒绝。
     ParamMeta(
         key="extra_args", label="附加命令行参数",
@@ -991,6 +1014,7 @@ PARAM_LABELS_EN: dict[str, str] = {
     "chat_template": "Chat template name",
     "ctx_size": "Context length",
     "n_gpu_layers": "GPU layers",
+    "device": "Compute device",
     "threads": "CPU threads",
     "threads_batch": "Batch threads",
     "batch_size": "Logical batch size",
@@ -1029,6 +1053,7 @@ PARAM_LABELS_EN: dict[str, str] = {
     "host": "Listen address",
     "port": "Listen port",
     "api_key": "API key",
+    "cors_origins": "Allowed CORS origins",
     "path": "WebUI path",
     "embeddings": "Enable embeddings endpoint",
     "rerank": "Enable reranking endpoint",
@@ -1110,6 +1135,16 @@ PARAM_HELP_EN: dict[str, str] = {
         "loads and passes readiness fine and then crashes on the first "
         "request. A number is precise control (e.g. roughly 20-28 for a 9B "
         "Q4 model at 32K context on 8 GB of VRAM)."
+    ),
+    "device": (
+        "Comma-separated backend devices to use, e.g. Vulkan0 or "
+        "OPENVINO1,OPENVINO2. The names must come from what THIS build "
+        "reports on the Runtime page: CPU builds list nothing, Vulkan builds "
+        "list Vulkan0/1…, OpenVINO builds list OPENVINO0/1… (its CPU device "
+        "usually comes first), ROCm builds list ROCm0… (empty without a "
+        "supported AMD GPU). Leave empty to let llama.cpp choose. Use the "
+        "Vulkan build for AMD GPUs (or ROCm on supported discrete cards) and "
+        "the OpenVINO build for Intel iGPU/Arc/NPU."
     ),
     "threads": (
         "CPU threads for generation. -1 = all logical cores. Usually best at "
@@ -1263,6 +1298,12 @@ PARAM_HELP_EN: dict[str, str] = {
     "api_key": (
         "API access key. When set, requests must carry it in the "
         "Authorization header. Strongly recommended when exposed to the LAN."
+    ),
+    "cors_origins": (
+        "Allowed CORS origins. The default 'localhost' reflects only local "
+        "origins, so arbitrary websites cannot read local model output; '*' "
+        "allows every origin (not recommended). Older builds omit this flag "
+        "automatically when unsupported."
     ),
     "path": (
         "Custom WebUI static file path. Empty = the WebUI built into "
