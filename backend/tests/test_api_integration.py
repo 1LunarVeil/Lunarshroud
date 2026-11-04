@@ -83,12 +83,15 @@ def test_system_params_and_command_endpoints(api_client):
     assert "--no-mmap" in command.json()["command"]
     assert "-t 8" in command.json()["command"]
 
+    # 样例值运行时生成：本测试要证明"密钥不出现在响应里"，
+    # 需要一份测试能读到的明文，但不需要它像一把真钥匙。
+    sample_secret = f"do-not-store-{secrets.token_hex(8)}"
     secret_command = api_client.post(
         "/api/params/build-command",
-        json={"params": {"model": r"D:\model.gguf", "api_key": "do-not-store"}},
+        json={"params": {"model": r"D:\model.gguf", "api_key": sample_secret}},
     )
     assert secret_command.status_code == 200
-    assert "do-not-store" not in secret_command.text
+    assert sample_secret not in secret_command.text
     assert "[REDACTED]" in secret_command.json()["command"]
 
     bad = api_client.post("/api/params/build-command", json={"params": "bad"})

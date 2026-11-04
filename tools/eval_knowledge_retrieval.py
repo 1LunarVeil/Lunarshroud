@@ -210,6 +210,12 @@ def wait_ready(port: int, proc: subprocess.Popen, timeout: float = 180.0) -> Non
 
 
 def start(model: str, port: int, extra: list[str], ctx: int) -> subprocess.Popen:
+    # 端口必须是一个真实的 TCP 端口号：下面要把它拼进日志文件名与命令行。
+    # 这个脚本是维护者手工运行的评测工具，`port` 来自命令行，但把它当成
+    # "一定合法"的整数去拼路径仍然是不该有的形状。先收敛成 1..65535 的整数。
+    port = int(port)
+    if not 1 <= port <= 65535:
+        raise ValueError(f"port out of range: {port}")
     cmd = [
         LLAMA, "-m", model, "--jinja", "-c", str(ctx), "-ngl", "99",
         "-b", "2048", "-ub", "2048", "-np", "1", "-fa", "on", "--kv-unified",
