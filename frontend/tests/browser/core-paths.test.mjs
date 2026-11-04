@@ -20,14 +20,21 @@ test('core navigation, knowledge modal and chat controls stay error-free', async
     await page.goto(BASE_URL, { waitUntil: 'networkidle' });
     await page.waitForSelector('.sidebar-item');
     const sidebar = await page.locator('.sidebar-item').allTextContents();
+    // 8 个导航入口：会话组（仪表盘 / Chat）、服务组（本地 API 服务）、
+    // 资源组（模型工作区 / 知识库 / 可观测性）、工具组（加载模型 / 新手指南）。
+    // 「设置」不在分组里 —— 它固定在侧栏底部动作区（与"收起导航"同一块），
+    // 所以 `.sidebar-item` 的计数从 9 回到 8。它是普通 button 而不是页面分组项。
     assert.equal(sidebar.filter(Boolean).length, 8, `unexpected navigation: ${sidebar.join(',')}`);
+    // 侧栏底部动作仍然可达（用户要能打开设置）。
+    await page.waitForSelector('#btn-sidebar-settings');
 
     await gotoPage(page, 'workspace');
     await page.click('[data-workspace-tab="runtimes"]');
     await page.waitForSelector('#observability-tab-logs, [data-workspace-tab="presets"]');
     await page.click('[data-workspace-tab="models"]');
-    await page.waitForSelector('.segmented-btn.active');
-    assert.equal((await page.locator('.segmented-btn.active').textContent()).trim(), '卡片');
+    // 模型库不再有"卡片 / 列表"切换：列表搬进侧栏后，正文只留详情，
+    // 同一批模型在左栏与正文各列一遍是重复。这里改为断言侧栏列表出现。
+    await page.waitForSelector('#model-list-body .panel-list-item, #model-list-body .empty-state');
 
     await gotoPage(page, 'knowledge');
     await page.click('#kb-new');

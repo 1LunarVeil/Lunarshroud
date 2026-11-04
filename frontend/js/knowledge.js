@@ -57,7 +57,16 @@ export function onHide() {
   clearPoll();
 }
 
-export function renderPanel(el) {
+/** 侧栏列表的标题与主行动。 */
+export function sidebarListTitle() {
+  return t('nav.knowledge');
+}
+
+export function sidebarListAction() {
+  return { label: '+', title: t('knowledge.new'), onClick: () => openCreateModal() };
+}
+
+export function renderSidebarList(el) {
   renderList(el, ctx, {
     items: bases.map((base) => ({
       key: base.id,
@@ -75,7 +84,7 @@ export function renderPanel(el) {
       settingsDirty = false;
       searchResults = null;
       searchError = '';
-      ctx.refreshPanel();
+      ctx.refreshList?.();
       loadDetail({ full: true });
     },
     emptyText: t('knowledge.panelEmpty'),
@@ -102,7 +111,7 @@ async function refresh({ quiet = false } = {}) {
     bases = Array.isArray(response?.bases) ? response.bases : [];
     if (selectedId && !bases.some((base) => base.id === selectedId)) selectedId = null;
     if (!selectedId && bases.length) selectedId = bases[0].id;
-    ctx.refreshPanel();
+    ctx.refreshList?.();
     if (!selectedId) {
       detail = null;
       documents = [];
@@ -128,7 +137,7 @@ async function loadDetail({ full = false, quiet = false } = {}) {
     documents = Array.isArray(response?.documents) ? response.documents : [];
     if (!detail) {
       selectedId = null;
-      ctx.refreshPanel();
+      ctx.refreshList?.();
       renderDetail();
       return;
     }
@@ -710,7 +719,7 @@ async function refreshBasesQuietly() {
   try {
     const response = await ctx.Api.listKnowledge();
     bases = Array.isArray(response?.bases) ? response.bases : [];
-    ctx.refreshPanel();
+    ctx.refreshList?.();
   } catch {
     /* the next poll retries */
   }

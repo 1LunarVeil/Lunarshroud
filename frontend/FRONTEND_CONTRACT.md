@@ -44,7 +44,7 @@
 | `init(el, appCtx)` | function | 只调用一次；负责填充 `el` 并绑定事件。**模态型模块不要导出它** |
 | `onShow()` | function（可选） | 每次切到该页时调用；订阅/刷新放这里 |
 | `onHide()` | function（可选） | 离开该页时调用；**必须在这里解绑订阅** |
-| `renderPanel(el, appCtx)` | function（可选） | 提供二级左栏（上下文面板）内容。未导出 → 该页面板整列隐藏，顶栏开关置灰 |
+| `renderSidebarList(el, appCtx)` | function（可选） | 提供侧栏列表区内容。未导出 → 列表区整块隐藏 |
 | `kind: 'modal'` | string（可选） | 声明该模块是**浮层而非路由目的地**，见下 |
 | `open(appCtx)` | function | 模态型模块的入口（取代 `init`） |
 
@@ -102,19 +102,39 @@
 浮层替换掉。恢复后的“现在退出”调用 `quit_app`；取消调用
 `DELETE /api/backups/pending`。
 
-### 二级左栏（上下文面板）
+### 侧栏列表区（1.0 第二轮：取代"二级左栏"）
 
-- 位置：`#context-panel`，夹在图标轨道与 `#main-content` 之间，宽度 `--panel-width`。
-- 渲染时机：`navigateTo()` 每次切页、以及页面主动调用 `appCtx.refreshPanel()` 时。
-- 收起状态存在 `localStorage.lunarshroud_panel_collapsed`，跨会话保持。
-- 页面若在异步数据到达后才具备面板内容，**必须**在数据就绪后调用
-  `appCtx.refreshPanel()`，否则面板会停留在"加载中"
-  （`param_editor` 模态化后已无二级左栏，此规则对 `models` / `presets` / `logs` 仍适用）。
-- 面板内若有订阅/观察者（如 `IntersectionObserver`），**必须**在 `onHide()` 中断开。
-- `<=900px` 时二级面板是左侧抽屉（`body.panel-drawer-open` + `#btn-panel-toggle`）：
-  选中条目自动关闭，ESC/遮罩关闭并恢复焦点，窗口拖宽时移除 inert/class。
-  不要在窄屏 CSS 里再写 `.context-panel { display:none }` —— 那会让
-  模型/预设/日志实例列表失去入口。
+**结构变了。** 旧版是「图标轨道 + 独立列表列 + 内容区」三列，窗口被切成三条
+各带边框的带子；而列表列的显隐需要一个顶栏开关，那个开关藏在右上角第三个
+位置，关掉之后没人知道怎么再打开。现在只有**一列侧栏**：
+
+```
+.sidebar
+├── .sidebar-nav     导航项（按 NAV_GROUPS 分组）
+├── .sidebar-list    当前页面的列表（flex:1，独立滚动）
+└── .sidebar-footer  设置入口 + 收起导航
+```
+
+- 页面模块导出 `renderSidebarList(el, appCtx)` 提供列表内容；未导出 → 列表区
+  `hidden`（不占高度、不画分隔线）。
+- 页面可以额外导出 `sidebarListTitle()` 与 `sidebarListAction()`，分别提供列表区
+  标题与右上角主行动（`{label, title, onClick}`）。聚合页
+  （`workspace` / `observability`）把这两个再代理给当前 tab，所以切到"运行环境"
+  时标题会跟着变。
+- 数据变化后**必须**调用 `appCtx.refreshList()`（旧名 `refreshPanel` 保留为别名）。
+  逐字符输入的场景用 `appCtx.refreshListKeepFocus()`，它会保住搜索框焦点与光标。
+- 列表项用 `.panel-list-item` + `data-list-key`，**不能**用 `.sidebar-item`：
+  后者是页面入口的选择器（`navigateTo` 绑定、导航计数、`aria-current` 都按它查）。
+- 侧栏收起 = **整列隐藏**（`body.sidebar-collapsed`），不是"图标轨道"。恢复入口
+  是顶栏的 `#btn-sidebar-toggle`，它只在侧栏不可见时出现（桌面收起 / 窄屏抽屉关闭）。
+- `<=900px` 时整列变左侧抽屉：`#sidebar.show` + `#sidebar-backdrop.show`。
+  导航项与列表一起走，因为它们本来就在同一列里。
+
+#### 腿按钮为什么合成一个
+
+`#btn-sidebar-toggle` 同时负责"桌面端从收起恢复"和"窄屏打开抽屉"——它们是同一件事
+（把侧栏叫回来）。拆成两个会让顶栏在两种场景下各显示一个长得一样的按钮。
+**1500 不要**再加一个"显示/隐藏列表"的开关：列表永远是侧栏的一部分。
 
 #### 共享面板视图 `panel_views.mjs`
 
@@ -153,10 +173,19 @@ item 里三个文本/徽标字段的分工（`models` 页踩过一遍才知道�
 
 页面注册顺序 = 侧边栏顺序，见 `app.js` 的 `PAGES`：
 
-`dashboard, models, runtimes, chat, param_editor(模态), presets, logs, monitor, history, help, settings(模态)`
+`dashboard, chat, api_server, workspace(models/runtimes/presets), knowledge, observability(logs/monitor/history), param_editor(模态), help, settings(模态)`
 
-侧栏显示顺序由 `app.js::NAV_GROUPS` 决定（运行 / 模型 / 诊断 / 工具），
-`runtimes` 属于“模型”组；参数编辑器与设置是模态动作，仍不在路由目的地列表中。
+侧栏显示顺序由 `app.js::NAV_GROUPS` 决定（会话与服务 / 资源 / 工具）。
+`workspace` 与 `observability` 是一级入口，其内部标签页仍是原来的
+`models` / `runtimes` / `presets` 与 `logs` / `monitor` / `history` 模块
+（各自 `init` 到自己的 section 里）。参数编辑器与设置是模态动作，
+不在路由目的地列表中。
+
+`api_server`（1.0 新增）是**真实页面而不是模态**：它有自己的
+`#page-api_server` 容器、`onShow`/`onHide` 轮询生命周期，并在
+`NAV_GROUPS` 的「服务」组里。它没有 `renderSidebarList`，所以进入时
+侧栏列表区整块收起。数据面（`/v1/*`）在**另一个端口上的独立应用**里
+（`backend/api/gateway.py`），页面只调管理面接口（走会话令牌）。
 
 ### `appCtx` 形状（`app.js::initPages` 注入）
 
@@ -164,10 +193,10 @@ item 里三个文本/徽标字段的分工（`models` 页踩过一遍才知道�
 Api, showToast, showModal, closeModal, showConfirm,
 escapeHtml, formatDuration, formatTime, formatBytes, basename, statusBadge,
 copyToClipboard, setTheme, getTheme, getThemePreference, subscribeInstances, t,
-refreshPanel, navigate
+refreshList, refreshListKeepFocus, navigate
 ```
 
-`init()` 与 `renderPanel()` 收到的是**同一个** ctx 对象（`app.js::buildAppContext`）。
+`init()` 与 `renderSidebarList()` 收到的是**同一个** ctx 对象（`app.js::buildAppContext`）。
 
 新增页面所需能力 → 加到这里，不要在页面模块里直接 import `app.js`（会成环）。
 
@@ -200,14 +229,15 @@ refreshPanel, navigate
 | `chat_stream.mjs` | `createSseParser()`, `extractChunk(payload)`, `buildChatStats({...})`, `contextUsage(messages, contextSize)`（原生 Chat 的纯流式解析与上下文占用计算） |
 | `chat_attachments.mjs` | 文本附件扩展名白名单/上限、文件名与大小格式化、`buildMessagePayloadContent(message)`（把附件包进清晰的发送文本） |
 | `chat_search.mjs` | `highlightParts(text, query)`（大小写不敏感，返回未转义片段，由调用方逐段转义） |
-| `chat.js` | `id`, `title`, `init`, `onShow`, `onHide`, `renderPanel`（原生流式 Chat + WebUI 回退） |
+| `chat.js` | `id`, `title`, `init`, `onShow`, `onHide`, `renderSidebarList`（原生流式 Chat + WebUI 回退） |
+| `api_server.js` | `id`, `title`, `init`, `onShow`, `onHide`（本地 API 服务：开关/端口/跨域/密钥/请求日志/接入片段） |
 | `dashboard.js` | `id`, `title`, `init`, `onShow`, `onHide` |
-| `models.js` | `id`, `title`, `init`, `onShow`, `onHide`, `renderPanel` |
+| `models.js` | `id`, `title`, `init`, `onShow`, `onHide`, `renderSidebarList` |
 | `runtimes.js` | `id`, `title`, `init`, `onShow`, `onHide`（运行环境页：注册/探测/默认/移除） |
 | `param_editor.js` | `id`, `title`, `kind`(`'modal'`), `open`；渲染纯函数在 `param_editor_view.mjs`（`createParamView`、`isUnsupported`、`isWideField`） |
 | `param_editor_view.mjs` | `createParamView({escapeHtml, t, locale, getValues})` → `paramLabel`/`paramHelp`/`paramControlId`/`optionLabel`/`groupLabel`/`paramHtml`/`groupHtml`/`multiSelectHtml`/`controlHtml`；`isUnsupported`, `isWideField` |
-| `presets.js` | `id`, `title`, `init`, `onShow`, `onHide`, `renderPanel` |
-| `logs.js` | `id`, `title`, `init`, `onShow`, `onHide`, `renderPanel` |
+| `presets.js` | `id`, `title`, `init`, `onShow`, `onHide`, `renderSidebarList` |
+| `logs.js` | `id`, `title`, `init`, `onShow`, `onHide`, `renderSidebarList` |
 | `monitor.js` | `id`, `title`, `init`, `onShow`, `onHide` |
 | `history.js` | `id`, `title`, `init`, `onShow`, `onHide` |
 | `settings.js` | `id`, `title`, `kind`(`'modal'`), `open` |
@@ -224,14 +254,18 @@ refreshPanel, navigate
 
 `sidebar`, `main-content`, `sidebar-backdrop`, `toast-container`,
 `header-status`, `header-status-dot`, `header-status-text`,
-`btn-sidebar-toggle`, `btn-theme`, `btn-lang`, `btn-about`,
-`context-panel`, `context-panel-title`, `context-panel-body`,
-`btn-panel-toggle`（顶栏开关，无面板的页面置灰而非隐藏）, `btn-panel-collapse`（面板头部收起）
+`btn-sidebar-toggle`（侧栏不可见时才出现）, `btn-theme`, `btn-lang`, `btn-about`,
+`sidebar-resizer`（唯一的手柄；独立的列表列与它的手柄已删除）
 `#ui-tooltip` 由 `tooltip.mjs` 动态创建（单一 portal，`role="tooltip"`）。
 
 侧栏由 `NAV_GROUPS` 分组渲染为真正的 `<button class="sidebar-item">`（`aria-current="page"`）；
-`#btn-sidebar-collapse` 是底部展开/收起按钮，状态存
+`#btn-sidebar-collapse` 在底部，点它整列隐藏，状态存
 `localStorage.lunarshroud_sidebar_collapsed`（默认展开）。
+
+侧栏内部三段：`.sidebar-nav`（页面入口）/ `.sidebar-list`（当前页列表）/
+`.sidebar-footer`（`#btn-sidebar-settings` + `#btn-sidebar-collapse`）。
+设置用 `.sidebar-action` 而不是 `.sidebar-item` —— 它打开浮层、不改变路由，
+混用会让导航计数与 `navigateTo` 绑定都出错。
 
 ### 4.2 各模块动态生成的 id
 
@@ -249,6 +283,7 @@ refreshPanel, navigate
 | `monitor` | `metric-canvas`, `gpu-table-wrap`, `proc-table-wrap`, `monitor-refresh`, `monitor-subtitle` |
 | `history` | `history-table`, `history-pagination`, `btn-refresh`, `btn-clear`, `pg-prev`, `pg-next`；详情显示 `model_key` / `variant_key` |
 | `settings` | 浮层内动态创建：`settings-nav`, `settings-pane`（无 `page-settings` 容器） |
+| `api_server` | `api-server-body`, `api-server-refresh`, `api-server-enabled`, `api-server-copy-url`, `api-server-goto-chat`, `api-server-save`, `api-server-port`, `api-server-cors`, `api-server-key`, `api-server-log-requests`, `api-server-clear-logs`, `api-server-export-logs`, `[data-copy-recipe]`（curl / python / powershell 三段接入片段） |
 | 全局（`app.js`） | `app-modal-overlay`（`showModal` 创建）, `debug-banner`（可选，index.html 未定义时静默跳过） |
 
 ### 模型能力卡片与参数编辑器浮层（`param_editor`）
@@ -395,8 +430,40 @@ webview（`File.text()`，不上传）；白名单见 `chat_attachments.mjs`，�
 跨页入口：仪表盘实例卡的“对话”写 `window.__pendingChatInstanceId`；Ctrl+K 的
 “新建对话”写 `window.__pendingChatNew`，两者都在 `onShow()` 读取并清空。
 原生 Chat 的动态 id 还包括 `chat-thread`、`chat-input`、`chat-composer`、
-`chat-context-meter`、`chat-conversation-list`（面板内）、`chat-setting-*`；
+`chat-context-meter`、`chat-conversation-list`（面板内）；
 WebUI 仍用 `chat-frame-container`/`chat-iframe`。
+
+### Chat 右栏双视图（Configuration / Integrations）
+
+对标 LM Studio：右侧检查器顶部是一个分段控件，同一块宽度放两套内容。
+
+| 视图 | 内容 | 说明 |
+|---|---|---|
+| `config` | 实例 / 知识库 / 系统提示 / 采样 / 思考模式 / 上下文 / 动作 | 这条对话**怎么生成** |
+| `integrations` | 智能体与工具 / 工具目录授权 / 知识库服务 / 本地 API 网关 | 模型能**用什么** |
+
+- 切换按钮：`[data-inspector-view="config|integrations"]`；容器
+  `#chat-inspector-config` / `#chat-inspector-integrations`（用 `hidden` 切换）。
+- 选择存 `localStorage.lunarshroud_chat_inspector_view`，跨会话保持。
+- Integrations 的内容是**异步拉取**的（`getKnowledgeServicesStatus` /
+  `getApiServerStatus`），切过去才请求；每块独立 catch，一个接口挂掉不会
+  让整块面板空白。
+- 工具目录授权用会话级 `tool_root`（`PATCH /api/chats/{id}`），可"选择"与"撤销"。
+
+### 设置页：硬件 / 开发者（只读信息面板）
+
+新增两个分类，均为**只读**、不带 `data-field`（`collect()` 会把带 `data-field`
+的元素写进 draft，而 `update_config` 拒绝未知键 → 保存必 400）。
+
+| 分类 | 数据来源 |
+|---|---|
+| `hardware` | `GET /api/system/overview`（CPU/内存/GPU/显存/温度/GPU 进程） |
+| `developer` | `GET /api/system/paths`（新接口：版本/平台/数据与日志路径/端口）+ `GET /api/runtimes` |
+
+`GET /api/system/paths` 的 `app_version` 来自环境变量
+`LUNARSHROUD_APP_VERSION`（外壳用 `env!("CARGO_PKG_VERSION")` 注入；
+源码运行通道回落到 `0.0.0-dev`）。
+
 
 ### Chat 的降级：非回环实例不嵌 iframe
 
@@ -567,6 +634,19 @@ WebUI 仍用 `chat-frame-container`/`chat-iframe`。
 | GET/DELETE | `/api/backups/{name}` | 校验备份清单 / 删除备份 |
 | POST | `/api/backups/restore` | 校验并暂存恢复（`{name}`）；有运行中实例时 409，返回 `restart_required` |
 | DELETE | `/api/backups/pending` | 取消待恢复 |
+| GET | `/api/api-server/status` | 网关状态（开关 / 运行 / 错误 / 端口 / 可调用模型）；**不回传密钥** |
+| GET/DELETE | `/api/api-server/logs` | 转发请求日志（内存环形缓冲，最多 200 条）/ 清空 |
+| POST | `/api/api-server/restart` | 按当前配置重新对齐监听（保存后立即生效，免重启） |
+| GET | `/api/api-server/recipes` | curl / Python / PowerShell 接入片段（密钥走环境变量占位） |
+| GET | `/api/system/paths` | 运行期路径与版本（数据/日志/配置文件、Python、平台、监听端口）；设置页「开发者」用 |
+| GET | `/api/knowledge/services/status` | 当前常驻的 embedding / rerank / OCR 服务（来自 `[KB] ` 实例）；Chat「集成」视图用 |
+
+**本地 API 服务是两套鉴权面**：上面这几个在启动器端口上，走会话令牌
+（`test_auth_coverage` 穷举验证）；数据面 `/v1/models` 与
+`/v1/chat/completions` 在**另一个端口**的独立应用上（`backend/api/gateway.py`），
+走 `Authorization: Bearer <api_server_key>`（空密钥 = 不校验，仅本机）。
+不要把 `/v1/*` 挂到启动器 app 上：外部客户端拿不到会话令牌，而为让它能用
+就得把路由加进认证豁免名单，那会扩大安全面。
 
 WebSocket：`/ws/system/metrics`、`/ws/instances`、`/ws/instances/{id}/logs`
 （统一经 `_createWebSocketWatcher`，带指数退避重连，令牌失效后自动刷新会话）
@@ -628,18 +708,22 @@ cli_no_value, unit, order`
 | `window.__pendingModelPath` | 模型库 / 顶栏选择器 → 参数编辑器浮层：要把哪个模型填进 `model` 字段（发送方写入，编辑器 `open()` 消费并清空） |
 | `window.__pendingLogsInstanceId` | 仪表盘 / 聊天 → 日志页：要打开哪个实例的日志 |
 
-### 外壳布局（P2 起）
+### 外壳布局（1.0 第二轮）
 
 ```
-.app-header
+.app-header   品牌 / 居中模型胶囊 / 状态 / 语言·主题·关于
 .app-body
-├── .sidebar          一级图标轨道，宽度固定 --sidebar-width，永不改变
-├── .context-panel    二级上下文面板，宽度 --panel-width，可收起、按页变化
+├── .sidebar          单列：导航项 + 当前页列表 + 底部动作（宽度可拖，200–420）
 └── .main-content     页面容器（各页面根节点 #page-<id> 在此，滚动容器）
+.app-statusbar  CPU / 内存 / 显存 + 后端状态 + 实例计数
 ```
 
-- 轨道**不再** hover 变宽：旧实现 `:hover { width: 60px → 220px }` 会推动整页重排。
-- 导航项在轨道态只显示图标，文案靠 `title` 悬浮提示；窄屏抽屉态恢复图标 + 文字。
+- 旧版的 `.context-panel`（独立列表列）与其 resizer **已删除**。列表现在长在侧栏里。
+- 侧栏收起 = 整列 0 宽；唯一的恢复入口是顶栏 `#btn-sidebar-toggle`。
+- 宽度存后端 `chat_sidebar_width`（0 = 未设置）；`chat_panel_width` 属于
+  Chat 右侧参数面板（`PANEL_LIMITS` 260–420），**有真实的拖拽消费者**：
+  `#chat-inspector-resizer` 经 `attachResizer({ invert: true })` 调整，
+  松手后防抖 500ms 写入该键。
 - `IntersectionObserver` 的 `root` 必须是 `.main-content`（真正的滚动容器），
   用默认视口会导致折叠分组判定不准。
 

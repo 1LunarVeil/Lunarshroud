@@ -57,4 +57,6 @@ The frontend is static HTML/CSS/JavaScript. It uses bounded polling and renderin
   local user/runtime and is not source or a release input. `github/` is a
   separate curated source mirror.
 
-For runtime placement and recovery see [HANDOVER.md](HANDOVER.md).
+For data-directory placement rules see [SECURITY_MODEL.md](SECURITY_MODEL.md)
+and `config._frozen_data_dir()`, which probes each candidate for real
+writability instead of trusting `%APPDATA%`.

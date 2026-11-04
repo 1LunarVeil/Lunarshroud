@@ -11,32 +11,27 @@ venv/
 env/
 .venv/
 .pytest_cache/
+.ruff_cache/
 .coverage
 .coverage.*
 coverage.xml
 htmlcov/
+wheelhouse/
 
 # Rust / Tauri
 src-tauri/target/
 src-tauri/gen/
-# Cargo.lock 对于可执行应用建议提交，保留
+# Cargo.lock is committed on purpose: this is an application, not a library.
 
-# Runtime data：整个 data/ 都是本机运行时数据，一律不进仓库。
-# 必须整目录忽略而不是逐个列名 —— SQLite 开了 WAL 会产生 history.db-wal /
-# history.db-shm，配置损坏时 config.py 会写出 config.json.corrupt（内含本机
-# 模型目录绝对路径）。派生文件名不可枚举，逐条列名必然漏。
-# 内置预设模板已在 0.9.0 移除，data/ 下没有任何需要发布的内容。
+# Runtime and user data
+#
+# The whole directory is ignored rather than an enumerated list of filenames.
+# SQLite in WAL mode creates history.db-wal / history.db-shm beside history.db,
+# and a damaged config is rebuilt into config.json.corrupt containing absolute
+# model paths. Derived names cannot be enumerated, so a per-file list would
+# eventually miss one.
 data/
 backend/data/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.DS_Store
-Thumbs.db
 
 # Build output
 *.exe
@@ -47,9 +42,9 @@ Thumbs.db
 *.deb
 *.zip
 *.7z
-# Tauri build.rs 把 backend/dist/backend.exe 暂存到这里（bundle resource）
+# Staged by src-tauri/build.rs as a bundle resource.
 src-tauri/backend/
-# PyInstaller onedir 运行时（部署时与 backend.exe 同目录，构建产物）
+# PyInstaller onedir runtime, deployed beside backend.exe.
 backend/_internal/
 
 # Logs
@@ -57,6 +52,16 @@ debug.log
 stdout.txt
 stderr.txt
 *.log
+
+# IDE and editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+# A *.bak* copy sits next to the live file with nearly the same name; published,
+# a reader would take it for the real thing.
+*.bak*
 
 # OS
 .DS_Store
@@ -66,15 +71,20 @@ stderr.txt
 .Trashes
 ehthumbs.db
 Thumbs.db
-# Windows 快捷方式：内部以 UTF-16LE 存着目标 exe 的绝对路径，属于本机 shell
-# 产物而非源码资源。内容隐私扫描会整体跳过二进制，所以只能靠这里和门禁规则表
-# 拦住 —— 在工作区根目录右键"创建快捷方式"就会落下一个，必须忽略。
+# Windows shortcuts store the target executable's absolute path as UTF-16LE.
+# A content privacy scan skips binaries, so this has to be ignored here.
 *.lnk
 
-# Test screenshots
+# Local runtime directories the packaged app creates next to the executable
+# (WebView2 profile, fallback logs, extraction temp). Running a portable build
+# from a source checkout creates them at the repository root.
+webview2-data/
+logs/
+runtime-temp/
+appdata/
 shots/
 
-# Config overrides
+# Secrets and local configuration overrides
 config.local.json
 .env
 .env.*
@@ -83,57 +93,29 @@ config.local.json
 *.key
 *.pfx
 *.p12
+credentials*.json
+secrets*.json
+SHA256SUMS.txt
+
+# Local databases
 *.db
 *.sqlite
 *.sqlite3
-credentials*.json
-secrets*.json
-*.sqlite
-*.sqlite3
-wheelhouse/
-SHA256SUMS.txt
 
-# 应用在 exe 同目录创建的运行时目录（Tauri 外壳的 WebView2 数据目录、
-# 回退日志、PyInstaller 运行时临时目录）。从源码树根直接运行便携版时，
-# 这些目录会出现在仓库根，里面的路径与缓存都不是源码。
-webview2-data/
-logs/
-runtime-temp/
-appdata/
-
-# 外部 AI 工具导出的本地会话目录（dsh-session-*）与 Claude Code 指令文件。
-dsh-session-*/
-CLAUDE.md
-
-# 本地调试产物 / IDE 私有设置（绝不提交）
-# .claude/settings.local.json 里记着本机用户名与绝对路径，不能进历史
+# Local scratch space and tool state.
+# These directories hold machine-specific absolute paths and session data. None
+# of it is source, and none of it should reach the published tree.
 tmp/
-.claude/
-
-# LM Studio 学习资料（安装副本、.lmstudio 用户数据、截图）。整目录忽略：
-# 里面含会话、凭据、模型清单和第三方二进制，既不是源码也不能发布。
 study/
-# Mimosa 安全插件的会话状态（hook-state/*.json 记录本机绝对路径），同理不进历史、不进镜像
-.mimosa/
-
-# 工具缓存（.pytest_cache/ 已在上面）
-.ruff_cache/
-
-# 编辑器备份文件（如 backend/core/param_builder.py.bak-20260917、
-# param_schema.py.bak2-20260917）。它们与活代码同名相邻，
-# 一旦被发布出去，读者会当成活代码 —— 覆盖 .bak / .bak2 / .bak-<日期> 三种写法
-*.bak*
-
-# 内部记录文档：check_release_mirror.py 的 CURATED_EXCLUDES 判定它们
-# "含本机绝对路径，不对外"，但 .gitignore 原先没有对应条目 —— 在根目录
-# git init 就会被提交（审计已用 git check-ignore 实证）。
-LunarShroud-演进规划.md
-独立代码审计报告.md
-全面审计文档.md
 docs/archive/
 
-# 仓库布局决策：公开仓库在 github/ 里 git init，github/ 本身就是仓库根，
-# 不是根仓库的子目录。根目录若被误 init，不能把这 131 个文件的重复副本带进去。
-github/
-
-.zcodeignore
+# Contributor-local tooling state.
+#
+# Editor and assistant integrations create their own state directories beside
+# the code and sometimes drop an instruction file at the repository root. All of
+# it describes one machine's setup and carries absolute paths, so it stays out
+# of the repository. The patterns are generic on purpose: this file is itself
+# published, and naming individual tools would document a private toolchain
+# rather than protect the tree.
+.*-session/
+*-session-*/

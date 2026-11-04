@@ -3,75 +3,82 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="description" content="LunarShroud — llama.cpp 桌面启动器：模型库、参数编辑、实例生命周期、日志与资源监控。" />
+  <meta name="description" content="LunarShroud — 本地 llama.cpp 桌面工作台：模型库、参数编辑、实例生命周期、对话、知识库与本地 API 服务。" />
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <title>LunarShroud</title>
   <!-- 显式声明图标：否则浏览器会请求 /favicon.ico，在 SPA 静态资源 404
        规则下表现为一条 console 错误。 -->
-  <link rel="icon" href="/assets/logo.png?v=2" />
-  <link rel="stylesheet" href="/css/tokens.css?v=1" />
-  <link rel="stylesheet" href="/css/style.css?v=1" />
+  <link rel="icon" href="/assets/logo.png?v=3" />
+  <link rel="stylesheet" href="/css/tokens.css?v=3" />
+  <link rel="stylesheet" href="/css/style.css?v=3" />
 </head>
 <body class="theme-dark">
   <!-- 首帧前应用保存的主题（浅色用户不应先看到一帧深色） -->
-  <script src="/js/theme-boot.js?v=1"></script>
+  <script src="/js/theme-boot.js?v=3"></script>
   <div class="app-layout">
-    <!-- 顶部导航栏 -->
+    <!-- 顶部导航栏：品牌 / 居中模型胶囊 / 状态 / 控件。
+         没有"侧栏开关"按钮 —— 侧栏收起后由左侧的汉堡按钮恢复，
+         那个按钮只在收起态出现（见 .app-header 的 .sidebar-reveal）。 -->
     <header class="app-header">
-      <button id="btn-sidebar-toggle" class="sidebar-toggle" title="" aria-label="">
-        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      <!-- 侧栏开关。**只在侧栏不可见时出现**，两种场景共用这一个按钮：
+             - 桌面端收起（整列 0 宽）→ 点它展开；
+             - 窄屏抽屉关闭（侧栏移出屏幕）→ 点它打开抽屉。
+           之所以合并成一个 id：它们是同一件事（"把侧栏叫回来"），拆成两个
+           会让顶栏在两种场景下各显示一个长得一样的按钮。
+           展开态不显示它 —— 展开态已经有侧栏内的"收起导航"。 -->
+      <button id="btn-sidebar-toggle" class="btn btn-ghost btn-icon sidebar-toggle"
+              hidden aria-label="展开侧栏" title="展开侧栏">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
       </button>
       <div class="brand">
-        <img class="logo" src="/assets/logo.png?v=2" alt="LunarShroud logo" />
+        <img class="logo" src="/assets/logo.png?v=3" alt="LunarShroud logo" />
         <span class="brand-text">LunarShroud</span>
       </div>
-      <div class="header-spacer"></div>
-      <!-- 居中：模型选择器（Ctrl+L）。文案由 app.js 注入，避免静态 HTML 里出现
-           未翻译的中文。窄屏下整块隐藏（快捷键仍可用） -->
+      <!-- 居中：模型选择器 + 停止（Ctrl+L 打开）。
+           外框是 div[role=group] 而不是 button —— 里面要放"停止"按钮，
+           HTML 不允许 button 嵌套；内容由 app.js 的 renderModelCapsule 注入。 -->
       <div class="header-center">
-        <button id="btn-model-picker" class="btn btn-secondary btn-sm model-picker-btn"></button>
+        <div id="btn-model-picker" class="btn model-picker-btn" role="group"></div>
       </div>
-      <!-- 当前运行实例状态指示器 -->
+      <div class="header-spacer"></div>
+      <!-- 当前后端/实例状态：一个点 + 一行字。窄屏只留点。 -->
       <div class="header-status" id="header-status">
         <span class="status-dot" id="header-status-dot"></span>
         <span id="header-status-text"></span>
       </div>
       <div class="header-actions">
-        <button id="btn-panel-toggle" class="btn btn-ghost btn-icon" aria-pressed="true">
-          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
-        </button>
         <button id="btn-lang" class="btn btn-ghost btn-icon btn-labelled" title="Language / 语言">EN</button>
         <button id="btn-theme" class="btn btn-ghost btn-icon btn-labelled" title="Theme / 主题">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
         </button>
         <button id="btn-about" class="btn btn-ghost btn-icon btn-labelled" title="About / 关于">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
         </button>
       </div>
     </header>
 
     <div class="app-body">
-      <!-- 一级：图标轨道。宽度固定，hover 不再改变宽度（旧版会从 60px 撑到 220px，
-           把主内容整页推动，这是 P2 要修的第一处抖动） -->
+      <!-- 单列侧栏。三段结构（由 app.js 渲染）：
+             1. 导航项（仪表盘 / Chat / 本地 API 服务 / …）
+             2. 当前页面的列表（会话、模型、预设、知识库、日志实例…）
+             3. 底部动作（设置 / 收起）
+           列表长在侧栏里而不是单独一列：LM Studio 就是这样，窗口只有
+           "导航栏 + 内容"两条带子，不会把内容区挤成第四条。 -->
       <nav class="sidebar" id="sidebar">
         <!-- 由 app.js 动态渲染 -->
       </nav>
-
-      <!-- 二级：上下文面板。内容由当前页面模块的 renderPanel() 提供，
-           没有面板的页面整列隐藏，主内容自动占满 -->
-      <aside class="context-panel" id="context-panel" hidden>
-        <div class="context-panel-head">
-          <span class="context-panel-title" id="context-panel-title"></span>
-          <button id="btn-panel-collapse" class="btn btn-ghost btn-icon" aria-pressed="true">
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
-          </button>
-        </div>
-        <div class="context-panel-body" id="context-panel-body">
-          <!-- 由页面模块注入 -->
-        </div>
-      </aside>
+      <!-- 侧栏宽度拖拽手柄。role="separator" + aria-orientation 让读屏软件
+           知道这是可调整的分隔条；可聚焦的 separator 必须带
+           aria-valuenow/min/max（ARIA window splitter），缺值时 axe 判
+           aria-required-attr（critical）。数值由 resizable.mjs 同步。 -->
+      <div class="sidebar-resizer-wrap" role="region" aria-label="调整侧栏宽度">
+        <div class="sidebar-resizer" id="sidebar-resizer" role="separator"
+             aria-orientation="vertical" aria-label="调整侧栏宽度"
+             aria-controls="sidebar" aria-valuemin="200" aria-valuemax="420"
+             aria-valuenow="264" tabindex="0"></div>
+      </div>
 
       <!-- 主内容区 -->
       <div class="backend-banner" id="backend-banner" role="status" hidden></div>
@@ -79,15 +86,22 @@
         <!-- 页面由 app.js 动态注入 -->
       </main>
     </div>
+
+    <!-- 窗口状态条：常驻的硬件读数与后端/实例计数（LM Studio 式）。
+         放在窗口底部而不是侧栏里：侧栏收起时读数不该消失。 -->
+    <footer class="app-statusbar" aria-label="运行状态">
+      <div class="sidebar-hardware" id="sidebar-hardware" hidden></div>
+      <div class="sidebar-status" id="sidebar-status" role="status"></div>
+    </footer>
   </div>
 
-  <!-- 窄屏侧边栏遮罩 -->
+  <!-- 窄屏侧栏遮罩 -->
   <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
 
   <!-- 全局 Toast 容器 -->
   <div class="toast-container" id="toast-container" aria-live="polite" aria-atomic="false"></div>
 
   <!-- 主应用脚本（ES Module） -->
-  <script type="module" src="/js/app.js?v=1"></script>
+  <script type="module" src="/js/app.js?v=3"></script>
 </body>
 </html>

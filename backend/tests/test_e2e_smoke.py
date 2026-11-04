@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -49,22 +50,54 @@ def _wait_for_status(instance, wanted, timeout: float = E2E_TIMEOUT_SECONDS) -> 
 
 
 def _free_port_window(size: int = 20) -> tuple[int, int]:
-    """分配一段当前空闲的端口窗口（替代硬编码 18480-18499）。
+    """分配一段当前空闲、且**与其他测试不重叠**的端口窗口。
 
-    并行 CI 或多个套件同时跑时，硬编码区间会互相踩。取系统临时端口做起点；
-    窗口内个别端口即便随后被别人抢走，process_manager 的逐端口 bind 探测
-    也会跳过它们。
+    为什么不能用 ``bind(("127.0.0.1", 0))`` 取起点
+    ------------------------------------------------
+    这个函数原先探测一个临时端口做窗口起点，但 Windows（以及 Linux）的
+    ephemeral 分配是**递增**的：连续几次 ``bind(0)`` 会拿到 N、N+1、N+2……
+    于是每个用例的 20 端口窗口几乎完全重叠。本模块的用例又各自用
+    ``port_start + 10/11/12/13`` 这种**固定偏移**指向"自己的"端口，
+    重叠的直接后果是：测试 A 刚释放的端口正好是测试 B 要绑定端口，
+    而 A 的替身服务是 ``cmd.exe`` 包装器 + 孙进程，孙进程回收比
+    ``instance.process`` 的退出晚一步 —— B 的 bind 撞车，失败落点随
+    用例执行顺序漂移（实测：全量偶发、单跑 8 次全绿）。
+
+    现在的做法：从固定基址起，按**进程内唯一序号**切片，每个窗口互不相交；
+    窗口内的端口仍逐个做 bind 探测，被占用的跳过（见 find_available_port）。
+    基址取回调函数里的 ``instance_port_start`` 默认区间之外，避免与用户
+    真实实例（8080-8090）或其它套件冲突。
     """
     import socket
 
-    for _ in range(10):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-            probe.bind(("127.0.0.1", 0))
-            start = probe.getsockname()[1]
+    global _WINDOW_SEQ
+    with _WINDOW_LOCK:
+        index = _WINDOW_SEQ
+        _WINDOW_SEQ += 1
+
+    # 基址 + 序号 * 32：窗口 20 个端口，留 12 个间隔，保证任意两个窗口不相交。
+    for attempt in range(40):
+        start = _WINDOW_BASE + (index * 32) + (attempt * 3200)
         end = start + size - 1
-        if 1024 <= start and end <= 65535:
+        if end > 64000:
+            break
+        free = 0
+        for port in range(start, end + 1):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                try:
+                    probe.bind(("127.0.0.1", port))
+                    free += 1
+                except OSError:
+                    pass
+        # 只要求窗口大体可用：个别被占的端口由 find_available_port 跳过。
+        if free >= size - 2:
             return start, end
-    raise RuntimeError("could not allocate a free port window")
+    raise RuntimeError("could not allocate a free, non-overlapping port window")
+
+
+_WINDOW_BASE = 21000
+_WINDOW_SEQ = 0
+_WINDOW_LOCK = threading.Lock()
 
 
 @pytest.fixture
@@ -371,3 +404,31 @@ def test_restart_through_a_stale_id_cannot_race_the_current_generation(e2e_env):
     finally:
         _stop_everything(pm)
     assert _live_fake_servers(HERE) == []
+
+
+def test_port_windows_never_overlap_each_other():
+    """每个用例的端口窗口必须互不相交。
+
+    历史：``_free_port_window`` 曾用 ``bind(("127.0.0.1", 0))`` 取起点。操作系统的
+    ephemeral 分配是递增的，连续几次调用会拿到 N、N+1、N+2……，于是各用例的
+    20 端口窗口几乎完全重叠（实测连续 6 次：15/15 对全部重叠）。而本模块的用例
+    各自用 ``port_start + 10/11/12/13`` 这种固定偏移，重叠就意味着"上一个用例
+    刚释放的端口正好是下一个用例要绑的端口"——替身服务的孙进程回收比
+    ``instance.process`` 退出晚一步时，bind 就撞车。表现是全量偶发一条红、
+    单跑必绿、失败落点随执行顺序漂移。
+
+    这条测试把"窗口不相交"本身钉住：任何人改回 bind(0) 都会让它变红，
+    而且失败信息会直接指出是哪两个窗口撞了。
+    """
+    windows = [_free_port_window() for _ in range(8)]
+    for start, end in windows:
+        assert end - start == 19, f"窗口大小变了：{start}..{end}"
+    for i in range(len(windows)):
+        for j in range(i + 1, len(windows)):
+            left = set(range(windows[i][0], windows[i][1] + 1))
+            right = set(range(windows[j][0], windows[j][1] + 1))
+            overlap = left & right
+            assert not overlap, (
+                f"窗口 {i}({windows[i]}) 与 {j}({windows[j]}) 重叠 "
+                f"{len(overlap)} 个端口：{sorted(overlap)[:5]}"
+            )

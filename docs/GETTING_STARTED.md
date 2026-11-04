@@ -13,9 +13,12 @@
 
 - Windows 10/11，需要 **WebView2 Runtime**。Win11 通常自带；Win10 如果打开后
   窗口空白，请先安装 Microsoft Edge WebView2 Runtime。
-- 安装版：运行 `LunarShroud_<version>_x64-setup.exe`。
-- 便携版：解压后运行 `LunarShroud.exe`。**不要只复制一个 exe**：
-  `backend\backend.exe` 必须与启动器在同一个目录里配套使用。
+- 便携版（本版提供）：下载 `LunarShroud-<version>-portable-x64.zip`，解压到
+  **一个固定位置**，然后运行里面的 `LunarShroud.exe`。**不要只复制一个 exe**：
+  `backend\backend.exe` 与 `backend\_internal\` 必须与启动器在同一个目录里
+  配套使用 —— 解压整个文件夹，而不是把 exe 拖出来。
+- 安装包：本版**未提供**。`cargo tauri build` 随时可以重新产出 NSIS 安装包
+  （见 [BUILDING.md](BUILDING.md)），但 1.0.0 只发布了便携通道。
 
 ### 2. 获取 llama-server
 
@@ -150,6 +153,5 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools\Restore-UserData.p
 
 - [BUILDING.md](BUILDING.md) — 从源码构建
 - [RELEASE.md](RELEASE.md) — 发布与校验
-- [RISK_ASSESSMENT.md](RISK_ASSESSMENT.md) — 剩余风险与 beta/1.0 判断
 - [SECURITY_MODEL.md](SECURITY_MODEL.md) — 威胁模型
 - [RAG.md](RAG.md) — 嵌入 / 重排 / 工具与 MCP

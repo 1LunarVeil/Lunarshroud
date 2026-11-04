@@ -1,8 +1,14 @@
 # LunarShroud
 
-LunarShroud 是一个面向 Windows 的 llama.cpp 桌面启动器，使用 Tauri、FastAPI 和原生 JavaScript 构建。它提供参数编辑、预设、多实例、实时日志、资源监控、启动历史、原生流式 Chat（可回退到 llama-server WebUI）、本地知识库/RAG、本地备份和托盘生命周期。
+**简体中文** | [English](README.en.md)
 
-> 当前版本：`0.9.0-beta.2`。已经完成进程生命周期与本地接口安全加固，但在标记 1.0 前仍需要多种 GPU、模型和 4–8 小时长稳测试。
+LunarShroud 是一个面向 Windows 的**本地 AI 聊天应用**：自带 llama.cpp 构建与 GGUF 模型，无账号、不联网、所有数据留在本机。使用 Tauri、FastAPI 与原生 JavaScript 构建，内置参数编辑、预设、多实例、实时日志、资源监控、启动历史、原生流式 Chat（可回退到 llama-server WebUI）、本地知识库/RAG、本地备份与托盘生命周期。
+
+> 当前版本：`1.0.0`。**发布通道是便携包**（`LunarShroud-1.0.0-portable-x64.zip`，解压即用）；本版不提供 NSIS 安装包。产物**未做代码签名**，下载后请按发布页给出的 SHA-256 校验再运行；详见 [docs/RELEASE.md](docs/RELEASE.md)。
+>
+> 版本定位：`1.0.0` 表示**功能完整、可日常使用**，不是"生产级稳定"的无保留结论。
+> **8 小时长稳与多硬件矩阵尚未完成**（4 小时真实模型 soak 已通过），未签名的便携包
+> 仍会触发 SmartScreen 未知发布者提示。这两条是已披露的限制，见下方「已知限制」。
 
 ## 主要能力
 
@@ -16,6 +22,10 @@ LunarShroud 是一个面向 Windows 的 llama.cpp 桌面启动器，使用 Tauri
 - 模型库：GGUF 能力探测（原生上下文/MTP/mmproj）、显存预估、配套文件识别，以及可选的 `model.yaml` / `manifest.json` 清单编辑
 - 预设导入、导出、克隆、对比和启动历史
 - 原生 Chat：本地会话（`chats.db`）、SSE 流式、停止/重新生成、消息编辑与分支、上下文占用、本地文本附件、提示词库、会话搜索、Markdown 导出；WebUI 作为回退
+- **Chat 右栏双视图**：`Configuration`（实例/知识库/系统提示/采样/推理/上下文）与 `Integrations`（智能体与工具状态、会话级工具目录授权、常驻 embedding/rerank/OCR 服务、本地 API 网关），宽度可拖拽
+- **一键停止当前模型**：顶栏模型胶囊右侧的停止按钮，无需切到仪表盘
+- **本地 API 服务**：独立端口上的 OpenAI 兼容网关，可开关、设端口与 Bearer 密钥、限制跨域来源，并实时查看 / 导出接口请求日志
+- **设置页 `硬件` / `开发者` 分类**：前者显示 CPU/内存/GPU/显存/温度与 GPU 进程，后者显示版本、平台、数据与日志路径、运行环境探测状态
 - 本机数据备份/恢复：配置、预设、历史与聊天（含附件和提示词）快照，SHA-256 校验，恢复在下次启动应用
 - 托盘图标、可选关闭到托盘、显式退出；Ctrl+K 命令面板
 
@@ -102,7 +112,7 @@ Pop-Location
 cargo test --manifest-path src-tauri\Cargo.toml --locked
 ```
 
-当前工作树基线（2026-10-23）：723 个 Python 测试、57 个前端单元测试、3 个浏览器验收测试、全部前端 JavaScript 语法检查通过；产品代码覆盖率由门禁保证 ≥75%。Rust 测试的最近基线为 23 个，但本轮审计环境（VS 2026 + 固定 Rust 1.97.1）无法完成 `ring` 的 C 编译，需在受支持的 MSVC 环境复核；不作为本轮“已通过”证据。测试数量随回归测试增长，门禁始终是 **0 失败 + 覆盖率 ≥75%**，以实际运行为准。测试不替代真实模型和长时间压力测试。当前验证状态见 [docs/STATUS.md](docs/STATUS.md)，未完成风险、证据与 beta/1.0 判断见 [docs/RISK_ASSESSMENT.md](docs/RISK_ASSESSMENT.md)。
+当前工作树基线（2026-11-03）：**903 个 Python 测试（902 通过 + 1 跳过）**、117 个前端单元测试、全部前端 JavaScript 语法检查通过；产品代码覆盖率 **84.92%**（门禁 ≥75%）。Rust 测试 **23 个全部通过（0 失败）**，但**必须把 `CARGO_TARGET_DIR` 指到仓库之外的短路径**（例如盘符根下的短目录）：默认的 `src-tauri/target/` 下 `ring` 的 C 编译会因路径定位问题失败；与 MSVC 安装、SDK 和源码均无关。测试数量随回归测试增长，门禁始终是 **0 失败 + 覆盖率 ≥75%**，以实际运行为准。测试不替代真实模型和长时间压力测试。
 
 ## 构建安装包
 
@@ -138,12 +148,13 @@ frontend/tests/ 前端运行时单元测试
 docs/           架构、构建、发布与安全说明
 ```
 
-文档导航见 [docs/README.md](docs/README.md)，接手/部署说明见 [docs/HANDOVER.md](docs/HANDOVER.md)，完整工作记录见 [docs/HISTORY.md](docs/HISTORY.md)。
+文档导航见 [docs/README.md](docs/README.md)。
 
 ## 已知限制
 
 - 仅支持并验证 Windows 10/11；macOS 和 Linux 尚未支持。
-- 当前安装包未代码签名，Windows SmartScreen 可能提示未知发布者。
+- 便携包未代码签名，Windows SmartScreen 可能提示未知发布者。
+- 1.0.0 只发布了便携包；NSIS 安装包可用 `cargo tauri build` 自行产出，但本版未做安装/卸载往返验证。
 - GPU 监控优先使用 NVML（`nvidia-ml-py`），库或驱动不可用时回退 `nvidia-smi`。
 - 不同 llama.cpp 版本的参数可能变化，升级后应检查生成命令。
 - llama.cpp 默认 `--cache-ram 8192` 会启用宿主侧提示词缓存。实测 4B 模型运行 10 分钟后 llama-server 内存从 5.2 GB 升至 11.4 GB 并平台化；这不是启动器泄漏。内存较小的机器请把 `--cache-ram` 调低或设为 0（代价是重复提示词不再复用）。
@@ -158,12 +169,30 @@ docs/           架构、构建、发布与安全说明
 - 命令行备份/恢复工具要求应用与 `backend.exe` 均已关闭；备份清单统一为 UTF-8。应用内备份可在运行中通过 SQLite 快照完成。
 - 恢复前会创建 `pre-restore-*` 快照；如果恢复过程中失败，当前版本需要从该快照手动恢复，尚未实现自动回滚。
 - 启动历史按 `history_max_records` 保留最近记录；超过上限会裁剪最旧诊断记录，不影响聊天/预设。
-- 4 小时真实模型 soak 已通过；8 小时长稳和多硬件矩阵仍未完成，因此版本仍为 beta。
+- 4 小时真实模型 soak 已通过；**8 小时长稳与多硬件矩阵仍未完成**，因此 `1.0.0` 不宣称"生产级稳定"。这两项是发布前明确披露的未验证项。
 
 ## 参与和许可
 
 提交改动前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)。项目使用 [MIT License](LICENSE)，第三方说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 当前依赖安全审计基线见 [DEPENDENCY_AUDIT.md](DEPENDENCY_AUDIT.md)。
+
+## 致谢与来源
+
+### AI 辅助开发
+
+本项目的开发过程由 **DeepSeek-V4.1-Flash**（`deepseek-v4.1-flash-10-17`）作为编码代理全程辅助：缺陷定位、回归测试编写、文档整理与发布验证均有人机协作的环节。所有由辅助工具提出的结论都经过实际复现才被采纳——本仓库的 `AGENTS.md` §6「验证纪律」与 `CHANGELOG.md` 中标注"实测/measured"的条目，就是这条约定的产物。
+
+代码本身不包含任何联网推理调用：运行时无账号、无遥测、不访问网络。
+
+### 前端审美规范
+
+界面的设计令牌、间距刻度、层级与配色规则参考了 **frontend-aesthetics** 插件：
+
+<https://github.com/1LunarVeil/frontend-aesthetics.git>
+
+该插件提供的是**规范与方法**（令牌层先行、对比度门槛、视觉层级检查清单），不是运行时依赖，也不进入发布产物。具体实现见 `frontend/css/tokens.css` 与 [docs/DESIGN_1.0.md](docs/DESIGN_1.0.md)。
+
+### 开源项目
 
 感谢 [llama.cpp](https://github.com/ggml-org/llama.cpp)、[Tauri](https://tauri.app/) 和 [FastAPI](https://fastapi.tiangolo.com/) 社区。

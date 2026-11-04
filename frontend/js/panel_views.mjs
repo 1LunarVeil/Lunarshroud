@@ -124,13 +124,21 @@ export function renderInstanceList(el, ctx, opts) {
   const sorted = [...list].sort((a, b) => (STATUS_ORDER[a.status] ?? 9) - (STATUS_ORDER[b.status] ?? 9));
 
   renderList(el, ctx, {
-    items: sorted.map((i) => ({
-      key: String(i.id),
-      label: i.name || ctx.basename(i.model_path) || i.id,
-      badge: ctx.statusBadge(i.status),
-      meta: `${t('dash.port')} ${i.port || '-'} · PID ${i.pid || '-'}`,
-      raw: i,
-    })),
+    items: sorted.map((i) => {
+      // 非致命提示（例如"ROCm 构建退回了 CPU"）：实例是 running 的、不该标红，
+      // 但用户需要知道它没在加速运行。列表里只放一个短标记，完整文案在
+      // dashboard 卡片的 warnings 行与实例日志里。
+      const hasWarning = Array.isArray(i.warnings) && i.warnings.length > 0;
+      return {
+        key: String(i.id),
+        label: i.name || ctx.basename(i.model_path) || i.id,
+        badge: ctx.statusBadge(i.status),
+        meta: `${t('dash.port')} ${i.port || '-'} · PID ${i.pid || '-'}${
+          hasWarning ? ` · ⚠ ${t('dash.warning')}` : ''
+        }`,
+        raw: i,
+      };
+    }),
     activeKey: activeId,
     onSelect: (key, item) => {
       if (typeof onSelect === 'function') onSelect(key, item && item.raw);
@@ -146,7 +154,14 @@ export function renderInstanceList(el, ctx, opts) {
 export function instanceSignature(instances, activeId) {
   const list = Array.isArray(instances) ? instances : [];
   const body = list
-    .map((i) => `${i.id}:${i.status}:${i.port}:${i.pid}`)
+    // warnings 必须进签名：实例变成 running 之后才可能追加 warning（ROCm 回退
+    // 提示是在就绪时判定的），只看 status/port/pid 会让列表永远不显示该标记。
+    .map(
+      (i) =>
+        `${i.id}:${i.status}:${i.port}:${i.pid}:${
+          Array.isArray(i.warnings) ? i.warnings.length : 0
+        }`
+    )
     .sort()
     .join('|');
   return `${body}#${activeId || ''}`;

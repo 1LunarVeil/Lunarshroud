@@ -94,6 +94,8 @@ def test_portable_runtime_deployer_stages_matching_launcher_and_backend(tmp_path
             str(destination),
             "-SkipDesktopShortcut",
             "-SkipSigning",
+            # 目标是临时目录里的假运行时；见 _run_deployer 的说明。
+            "-AllowRunning",
         ],
         capture_output=True,
         text=True, errors="replace",
@@ -137,6 +139,8 @@ def test_portable_runtime_deployer_copies_the_onedir_runtime(tmp_path):
             "-Destination", str(destination),
             "-SkipDesktopShortcut",
             "-SkipSigning",
+            # 目标是临时目录里的假运行时；见 _run_deployer 的说明。
+            "-AllowRunning",
         ],
         capture_output=True,
         text=True, errors="replace",
@@ -150,6 +154,13 @@ def test_portable_runtime_deployer_copies_the_onedir_runtime(tmp_path):
 
 
 def _run_deployer(deployer, launcher_source, backend_source, destination):
+    # -AllowRunning：这些用例的目标是**临时目录里的一个假运行时**，与用户机器上
+    # 真正在跑的应用毫无关系；但部署器的"别覆盖正在运行的安装"守卫是按**进程名**
+    # 全局检查的（Get-Process LunarShroud, backend），所以用户只要开着应用，
+    # 这 5 条用例就全红。2026-10-28 实测：安装版跑着一个实例（含 6.8 GB 的
+    # llama-server）时套件报 5 failed，而代码没有任何改动。
+    # 守卫本身是对的（真实部署确实不能覆盖正在使用的文件），所以这里不放松
+    # 部署器，只让测试显式声明"我知道有进程在跑，但我的目标是临时目录"。
     return subprocess.run(
         [
             "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -159,6 +170,7 @@ def _run_deployer(deployer, launcher_source, backend_source, destination):
             "-Destination", str(destination),
             "-SkipDesktopShortcut",
             "-SkipSigning",
+            "-AllowRunning",
         ],
         capture_output=True,
         text=True, errors="replace",
@@ -363,10 +375,12 @@ def test_portable_runtime_deployer_rejects_an_incomplete_onedir_build(tmp_path):
             "-Destination", str(destination),
             "-SkipDesktopShortcut",
             "-SkipSigning",
+            # 目标是临时目录里的假运行时；见 _run_deployer 的说明。
+            "-AllowRunning",
         ],
         capture_output=True,
         text=True, errors="replace",
-        timeout=60,
+        timeout=120,
     )
 
     assert result.returncode != 0
@@ -399,7 +413,7 @@ def test_deployer_resolves_relative_destination_from_powershell_location(tmp_pat
         f"Set-Location -LiteralPath '{target_parent}'; "
         f"& '{deployer}' -LauncherSource '{launcher_source}' "
         f"-BackendSource '{backend_source}' -Destination 'portable' "
-        f"-SkipDesktopShortcut -SkipSigning"
+        f"-SkipDesktopShortcut -SkipSigning -AllowRunning"
     )
     result = subprocess.run(
         [
@@ -645,6 +659,11 @@ def test_deployer_fails_loudly_when_signing_cannot_succeed(tmp_path):
             "-BackendSource", str(backend_source),
             "-Destination", str(destination),
             "-SkipDesktopShortcut",
+            # 刻意不传 -SkipSigning：本用例要验证"签名失败必须中止部署"。
+            # 但必须传 -AllowRunning：部署器的"别覆盖正在运行的安装"守卫按进程名
+            # 全局检查，用户开着应用时会在签名之前就 throw，于是本用例测到的是
+            # 进程守卫而不是签名路径（2026-10-28 实测 5 条部署器用例因此全红）。
+            "-AllowRunning",
         ],
         capture_output=True,
         text=True, errors="replace",
@@ -763,7 +782,13 @@ def test_cli_restore_reads_an_in_app_utf8_backup_without_bom(tmp_path):
 
 
 def test_deployer_refuses_while_a_backend_process_is_running(tmp_path):
-    """Replacing _internal under a live backend can mix versions; fail closed."""
+    """Replacing _internal under a live backend can mix versions; fail closed.
+
+    **本用例不能传 -AllowRunning**：它验证的正是那个守卫。它自己起一个名为
+    ``backend.exe`` 的假进程触发拦截，因此也依赖"机器上没有别的真实实例"。
+    若用户正开着 LunarShroud，本用例仍应通过（守卫照样拒绝），但副作用是
+    目标目录的 OLD launcher 断言不受影响 —— 因为拒绝发生在任何写入之前。
+    """
     import shutil
     import subprocess
     import time
@@ -780,7 +805,23 @@ def test_deployer_refuses_while_a_backend_process_is_running(tmp_path):
     )
     try:
         time.sleep(0.3)
-        result = _run_deployer(deployer, launcher_source, backend_source, destination)
+        # 刻意用不带 -AllowRunning 的调用方式（不能复用 _run_deployer，后者带该开关）。
+        result = subprocess.run(
+            [
+                "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", str(deployer),
+                "-LauncherSource", str(launcher_source),
+                "-BackendSource", str(backend_source),
+                "-Destination", str(destination),
+                "-SkipDesktopShortcut",
+                "-SkipSigning",
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            encoding="utf-8",
+            timeout=120,
+        )
         assert result.returncode != 0
         assert "backend" in (result.stdout + result.stderr).lower()
         assert (destination / "LunarShroud.exe").read_bytes() == b"OLD launcher"

@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import types
+import uuid
 from collections import deque
 from pathlib import Path
 
@@ -106,7 +107,14 @@ def test_frontend_file_resolution_rejects_a_junction_escape(monkeypatch, tmp_pat
     created = subprocess.run(
         ["cmd", "/c", "mklink", "/J", str(link), str(outside_dir)],
         capture_output=True,
+        # `cmd` 的输出走 OEM 代码页（中文 Windows = cp936），不指定
+        # `encoding/errors` 时 subprocess 的读线程会抛 UnicodeDecodeError。
+        # 那不是断言失败，而是**未处理线程异常** —— pytest 会把它报成
+        # `PytestUnhandledThreadExceptionWarning`，让每次全量运行都带着一条
+        # 看起来像产品缺陷的噪声（测试卫生问题，不是被测代码的问题）。
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if created.returncode != 0:
         pytest.skip(f"junction creation unavailable: {created.stderr.strip()}")
@@ -3542,6 +3550,287 @@ def test_chat_reasoning_config_is_validated():
         )
 
 
+def test_chat_identity_names_are_length_capped_and_reject_control_chars():
+    """显示名称：空串是合法默认值，但长度与控制字符必须挡住。
+
+    为什么控制字符要单独拦：这个名字会被写进聊天记录、随 Markdown 导出外发，
+    还要在气泡里渲染。U+202E（RTL override）能把整行文字视觉顺序反转，
+    \\r\\n 能在导出的 Markdown 里伪造结构。校验层挡掉比在渲染层补救可靠。
+    """
+    import config as backend_config
+
+    for field in ("chat_assistant_name", "chat_user_name"):
+        assert backend_config.DEFAULT_CONFIG[field] == "", f"{field} 默认必须是空串"
+        limit = backend_config.CHAT_IDENTITY_LIMITS[field]
+
+        assert backend_config.validate_config(
+            {**backend_config.DEFAULT_CONFIG, field: ""}
+        )[field] == ""
+        assert backend_config.validate_config(
+            {**backend_config.DEFAULT_CONFIG, field: "a" * limit}
+        )[field] == "a" * limit
+
+        with pytest.raises(ValueError, match=field):
+            backend_config.validate_config(
+                {**backend_config.DEFAULT_CONFIG, field: "a" * (limit + 1)}
+            )
+        with pytest.raises(ValueError, match=field):
+            backend_config.validate_config(
+                {**backend_config.DEFAULT_CONFIG, field: "bad\nname"}
+            )
+        with pytest.raises(ValueError, match=field):
+            backend_config.validate_config(
+                {**backend_config.DEFAULT_CONFIG, field: "  padded  "}
+            )
+        with pytest.raises(ValueError, match=field):
+            backend_config.validate_config(
+                {**backend_config.DEFAULT_CONFIG, field: 123}
+            )
+
+
+def test_chat_avatars_accept_emoji_text_or_image_data_url():
+    """头像有两套额度：短文本（emoji）或 data:image base64。
+
+    分开是因为两者差三个数量级 —— 混用一条上限会要么把 emoji 卡死、
+    要么让 config.json 无限膨胀（每张图 base64 后几十 KB）。
+
+    拒绝非 data: 的 URL 是**安全要求**：http(s) 会让界面去请求远程地址
+    （隐私泄漏 + 断网裂图），javascript: 是注入面。
+    """
+    import config as backend_config
+
+    for field in ("chat_assistant_avatar", "chat_user_avatar"):
+        assert backend_config.DEFAULT_CONFIG[field] == ""
+
+        # emoji 与短文本
+        assert backend_config.validate_config(
+            {**backend_config.DEFAULT_CONFIG, field: "🦙"}
+        )[field] == "🦙"
+        text_limit = backend_config.CHAT_AVATAR_TEXT_MAX
+        assert backend_config.validate_config(
+            {**backend_config.DEFAULT_CONFIG, field: "a" * text_limit}
+        )[field] == "a" * text_limit
+        with pytest.raises(ValueError, match=field):
+            backend_config.validate_config(
+                {**backend_config.DEFAULT_CONFIG, field: "a" * (text_limit + 1)}
+            )
+
+        # 合法的图片 data URL（远超文本上限，但仍在图片额度内）
+        image = "data:image/png;base64," + "A" * 5000
+        assert backend_config.validate_config(
+            {**backend_config.DEFAULT_CONFIG, field: image}
+        )[field] == image
+
+        # 非图片的 data URL
+        with pytest.raises(ValueError, match=field):
+            backend_config.validate_config(
+                {**backend_config.DEFAULT_CONFIG, field: "data:text/html;base64,AAA"}
+            )
+        # 远程地址与伪协议
+        for bad in ("https://example.com/a.png", "javascript:alert(1)"):
+            with pytest.raises(ValueError, match=field):
+                backend_config.validate_config(
+                    {**backend_config.DEFAULT_CONFIG, field: bad}
+                )
+        # 超过图片额度
+        with pytest.raises(ValueError, match=field):
+            backend_config.validate_config(
+                {
+                    **backend_config.DEFAULT_CONFIG,
+                    field: "data:image/png;base64,"
+                    + "A" * (backend_config.CHAT_AVATAR_MAX_BYTES + 100),
+                }
+            )
+        # 双向文本覆盖符在文本头像里也必须拒
+        with pytest.raises(ValueError, match=field):
+            backend_config.validate_config(
+                {**backend_config.DEFAULT_CONFIG, field: "\u202eevil"}
+            )
+
+
+def test_chat_background_image_is_a_bounded_local_data_url():
+    """背景图：空串 = 无背景；非空必须是 data:image 的 base64 且不超额度。
+
+    为什么拒绝远程 URL：界面为一个纯本地装饰去联网，既泄露"谁在用这个启动器"，
+    又在断网时变成一张裂图。为什么单独设额度：这张图铺满整页，头像那 64 KiB
+    会把它糊成色块；但也不能无上限 —— GET /api/system/config 是每个页面都会
+    调的热路径，每次都要拖着这个字符串。
+    """
+    import config as backend_config
+
+    field = "chat_background_image"
+    assert backend_config.DEFAULT_CONFIG[field] == ""
+
+    image = "data:image/jpeg;base64," + "A" * 5000
+    assert backend_config.validate_config(
+        {**backend_config.DEFAULT_CONFIG, field: image}
+    )[field] == image
+
+    for bad in (
+        "https://example.com/bg.jpg",
+        "javascript:alert(1)",
+        "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=",  # SVG 可带脚本
+        "data:text/html;base64,AAA",
+    ):
+        with pytest.raises(ValueError, match=field):
+            backend_config.validate_config({**backend_config.DEFAULT_CONFIG, field: bad})
+
+    with pytest.raises(ValueError, match=field):
+        backend_config.validate_config(
+            {
+                **backend_config.DEFAULT_CONFIG,
+                field: "data:image/jpeg;base64,"
+                + "A" * (backend_config.CHAT_BACKGROUND_MAX_BYTES + 100),
+            }
+        )
+    with pytest.raises(ValueError, match=field):
+        backend_config.validate_config({**backend_config.DEFAULT_CONFIG, field: 123})
+
+
+def test_config_missing_new_keys_are_filled_with_defaults_on_upgrade():
+    """旧版 config.json 缺新键时，校验必须补默认值，而不是返回 None。
+
+    真实形态（2026-10-30 实测）：本机 ``%LOCALAPPDATA%\\LunarShroud\\config.json``
+    是旧版本写的，完全没有 ``chat_background_*`` 三个键。``validate_config``
+    对它们完全无感（那些 ``candidate.get(field, default)`` 只在"键存在但值坏"
+    时生效），于是读出来三个值都是 ``None``：设置页渲染成空输入框，用户点保存
+    才在服务端报错 —— 而用户根本不知道自己做错了什么。
+
+    补默认值让"升级后第一次启动"与"全新安装"拿到同一份形状。
+    """
+    import config as backend_config
+
+    # 模拟升级：去掉所有本轮新增的键
+    legacy = {
+        key: value
+        for key, value in backend_config.DEFAULT_CONFIG.items()
+        if not key.startswith("chat_background") and key != "pinned"
+    }
+    assert "chat_background_image" not in legacy
+
+    validated = backend_config.validate_config(dict(legacy))
+    assert validated["chat_background_image"] == ""
+    assert validated["chat_background_opacity"] == 0.35
+    assert validated["chat_background_blur"] == 0
+    # 旧值必须原样保留，不能被默认值覆盖
+    for key, value in legacy.items():
+        assert validated[key] == value, f"{key} lost its stored value"
+
+    # 损坏的值仍然要被抓（补默认值不能变成"什么都放过"）
+    bad = {**backend_config.DEFAULT_CONFIG, "chat_background_opacity": 9}
+    with pytest.raises(ValueError, match="chat_background_opacity"):
+        backend_config.validate_config(bad)
+
+    # 未知键仍然拒绝写入（补全只作用于 DEFAULT_CONFIG 里已有的键）
+    with pytest.raises(ValueError, match="unsupported config key"):
+        backend_config.update_config({"not_a_real_key": 1})
+
+
+def test_chat_background_opacity_and_blur_are_ranged():
+    """不透明度 0–1、模糊 0–40 px。
+
+    布尔必须拒：``True`` 在 Python 里等于 1，一个"忘记填"会静默变成"完全不
+    透明"，界面上表现为背景图完全不显示 —— 看不出是配置错误。
+    """
+    import config as backend_config
+
+    assert backend_config.DEFAULT_CONFIG["chat_background_opacity"] == 0.35
+    assert backend_config.DEFAULT_CONFIG["chat_background_blur"] == 0
+
+    for value in (0, 0.35, 0.5, 1):
+        assert backend_config.validate_config(
+            {**backend_config.DEFAULT_CONFIG, "chat_background_opacity": value}
+        )["chat_background_opacity"] == value
+    for bad in (-0.01, 1.01, True, "0.5", None, float("inf")):
+        with pytest.raises(ValueError, match="chat_background_opacity"):
+            backend_config.validate_config(
+                {**backend_config.DEFAULT_CONFIG, "chat_background_opacity": bad}
+            )
+
+    for value in (0, 1, 40):
+        assert backend_config.validate_config(
+            {**backend_config.DEFAULT_CONFIG, "chat_background_blur": value}
+        )["chat_background_blur"] == value
+    for bad in (-1, 41, 1.5, True, "4"):
+        with pytest.raises(ValueError, match="chat_background_blur"):
+            backend_config.validate_config(
+                {**backend_config.DEFAULT_CONFIG, "chat_background_blur": bad}
+            )
+
+
+def test_chat_sidebar_widths_are_ranged_or_zero():
+    """侧栏宽度：0 表示未设置（前端用默认），非 0 必须在区间内。
+
+    刻意报错而不是静默夹取：这个值是用户拖出来的，越界说明前端或配置被改
+    坏了。悄悄改成边界值会让"设置没生效"看起来像"设置生效了一点点"。
+    """
+    import config as backend_config
+
+    for field, (low, high) in (
+        ("chat_sidebar_width", backend_config.CHAT_SIDEBAR_WIDTH_RANGE),
+        ("chat_panel_width", backend_config.CHAT_PANEL_WIDTH_RANGE),
+    ):
+        assert backend_config.DEFAULT_CONFIG[field] == 0
+        # 0 与边界值合法
+        for value in (0, low, high, (low + high) // 2):
+            assert backend_config.validate_config(
+                {**backend_config.DEFAULT_CONFIG, field: value}
+            )[field] == value
+        # 越界与类型错误都拒
+        for bad in (low - 1, high + 1, -5, "abc", 3.5, True):
+            with pytest.raises(ValueError, match=field):
+                backend_config.validate_config(
+                    {**backend_config.DEFAULT_CONFIG, field: bad}
+                )
+
+
+def test_a_stale_sidebar_width_is_clamped_when_loading_not_fatal():
+    """加载旧配置时，越界宽度必须**夹取**而不是抛异常。
+
+    2026-11-02 实测事故：区间从 (160,420) 提到 (200,420) 后，一个存着
+    ``chat_sidebar_width=220`` 的旧 config.json 在 ``repair=True``（加载路径）
+    下仍然走 ``raise`` 分支 —— 打包后端在 lifespan 之前就以 exit 3 退出，
+    启动器只显示"后端启动失败"，而用户什么也没做错。
+
+    版本升级调整区间是正常运维。"越界就报错"只对**运行期更新**成立
+    （那时越界说明前端或手工编辑把配置改坏了），加载时必须容错。
+    """
+    import config as backend_config
+
+    for field, (low, high) in (
+        ("chat_sidebar_width", backend_config.CHAT_SIDEBAR_WIDTH_RANGE),
+        ("chat_panel_width", backend_config.CHAT_PANEL_WIDTH_RANGE),
+    ):
+        # 低于下限 → 夹到 low；高于上限 → 夹到 high。
+        below = backend_config.validate_config(
+            {**backend_config.DEFAULT_CONFIG, field: low - 1}, repair=True
+        )
+        assert below[field] == low
+        above = backend_config.validate_config(
+            {**backend_config.DEFAULT_CONFIG, field: high + 1}, repair=True
+        )
+        assert above[field] == high
+        # 类型坏了 → 回落到 0（"未设置"），而不是让启动失败。
+        broken = backend_config.validate_config(
+            {**backend_config.DEFAULT_CONFIG, field: "abc"}, repair=True
+        )
+        assert broken[field] == 0
+        # 合法值原样保留。
+        kept = backend_config.validate_config(
+            {**backend_config.DEFAULT_CONFIG, field: low}, repair=True
+        )
+        assert kept[field] == low
+
+    # 反例护栏：**运行期**更新仍然必须拒绝越界值 —— 夹取只对加载路径生效。
+    with pytest.raises(ValueError, match="chat_sidebar_width"):
+        backend_config.validate_config(
+            {
+                **backend_config.DEFAULT_CONFIG,
+                "chat_sidebar_width": backend_config.CHAT_SIDEBAR_WIDTH_RANGE[0] - 1,
+            }
+        )
+
+
 # ---------------------------------------------------------------------------
 # 4.1 「有没有可用构建」只留一份真相
 # ---------------------------------------------------------------------------
@@ -3733,3 +4022,525 @@ def test_restart_dead_failed_instance_is_allowed(monkeypatch):
 
     assert result.id == "replacement"
     assert launched and launched[0]["restarted_from"] == dead.id
+
+
+def test_instance_reports_vision_support_only_when_mmproj_is_passed():
+    """图片附件只在实例真的带视觉编码器时可用。
+
+    实测依据（llama-server b11698）：不带 ``--mmproj`` 时 ``/props`` 返回
+    ``modalities: {vision: false}`` —— **即使同目录躺着 mmproj 文件**。
+    所以判据只能是"启动参数里给了没有"，不能看文件存在性，也不能看模型名字
+    里有没有 "vl"/"vision"（那只是命名习惯，不是能力承诺）。
+
+    让用户传了图才收到 400，比按钮一开始就不可用差得多。
+    """
+    from core.process_manager import supports_vision
+
+    assert supports_vision({"mmproj": "D:/m/mmproj-Q8_0.gguf"}) is True
+    assert supports_vision({"mmproj": ""}) is False
+    assert supports_vision({}) is False
+    assert supports_vision(None) is False
+    # 纯空白不是"给了路径"
+    assert supports_vision({"mmproj": "   "}) is False
+    # 显式禁用 mmproj 与"没给"同结论
+    assert supports_vision({"mmproj": "D:/m/x.gguf", "no_mmproj": True}) is False
+    # 类型不对的配置不能让接口 500
+    assert supports_vision({"mmproj": 123}) is False
+    assert supports_vision("not-a-mapping") is False
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-03 审计回归
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        # 每个值都能被 json.loads 解析（配置不是"损坏"，只是值不对）。
+        ("chat_background_opacity", 3.0),
+        ("chat_assistant_name", None),
+        ("chat_background_blur", None),
+        ("api_server_key", None),
+        ("api_server_cors_origins", None),
+        # 不可哈希 → 未加保护的 `value in {...}` 抛 TypeError 而不是 False。
+        ("theme", []),
+        ("launch_guardrail", []),
+        ("chat_reasoning", {}),
+        ("log_buffer_lines", "many"),
+        ("instance_port_start", None),
+    ],
+)
+def test_a_parseable_but_invalid_config_value_never_bricks_the_startup(
+    key, value
+):
+    """`validate_config(repair=True)` 的契约是"绝不抛"，一个坏值修成默认值。
+
+    它自己的 docstring 与 AGENTS §2.12 都这么写，但 chat/appearance 区块里有
+    一大片无条件 `raise`，于是手工改坏一个字段就让 `get_config()` 抛异常，
+    而 `main.py` 在**导入期**就会调用它（`_configured_launcher_port`）——
+    打包后端在 uvicorn 之前、在任何日志出现之前以 exit 3 退出，用户只看到
+    "后端启动失败"。`.corrupt` 隔离也不触发，因为 JSON 本身解析得很好。
+
+    2026-11-02 那次 sidebar-width 事故就是这个形状，当时的修复只覆盖了宽度。
+
+    红-绿：把 `reject()` 的 repair 分支改回 `raise`，本测试必红。
+    """
+    import config
+
+    merged = dict(config.DEFAULT_CONFIG)
+    merged[key] = value
+    repaired = config.validate_config(merged, repair=True)
+    assert repaired[key] == config.DEFAULT_CONFIG[key]
+
+    # 运行期更新仍然必须失败（不能悄悄改成默认值）。
+    with pytest.raises((ValueError, TypeError)):
+        config.validate_config(merged, repair=False)
+
+
+def test_the_backend_loads_a_hostile_but_parseable_config(monkeypatch, tmp_path):
+    """端到端：写一份"值坏但能解析"的 config.json，加载必须成功。
+
+    只测纯函数不够 —— 真正的事故路径是 `main.py` 在模块级调用
+    `get_config()`，所以这里真的写文件、真的走 `_load_config_from_file`。
+    """
+    import config
+
+    target = tmp_path / "config.json"
+    hostile = dict(config.DEFAULT_CONFIG)
+    hostile["chat_background_opacity"] = 3.0
+    hostile["theme"] = []
+    hostile["api_server_key"] = None
+    target.write_text(json.dumps(hostile), encoding="utf-8")
+
+    monkeypatch.setattr(config, "CONFIG_FILE", target)
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "PRESETS_DIR", tmp_path / "presets")
+
+    loaded = config._load_config_from_file()
+    assert (
+        loaded["chat_background_opacity"]
+        == config.DEFAULT_CONFIG["chat_background_opacity"]
+    )
+    assert loaded["theme"] == config.DEFAULT_CONFIG["theme"]
+
+
+def test_a_frozen_backend_starts_even_when_no_temp_directory_is_usable(
+    monkeypatch, tmp_path
+):
+    """`tempfile.gettempdir()` 会抛 —— 而它在 `config` 的**导入期**被调用。
+
+    `gettempdir()` 在候选目录（`%TEMP%`/`%TMP%`/`/tmp`…）里逐个试写，一个都
+    不可写时抛 `FileNotFoundError("No usable temporary directory found in
+    [...]")`。`_frozen_data_dir()` 是模块级执行的一部分，所以这条异常会从
+    `import config` 冒出去 —— 打包后端在任何日志建立之前就死掉，用户只看到
+    "后端进程启动失败"（2026-11-03 把 TEMP/TMP 指向不存在路径实测到）。
+
+    §2.16 要求"可写才用；打不开只能降级"——降级的前提是不抛。
+    红-绿：把 `_safe_temp_dir` 里的 try/except 去掉（或改回裸
+    `tempfile.gettempdir()`），本测试必红。
+    """
+    import tempfile as _tempfile
+
+    import config
+
+    def exploding_gettempdir():
+        raise FileNotFoundError(
+            "No usable temporary directory found in ['C:\\\\nope']"
+        )
+
+    monkeypatch.setattr(_tempfile, "gettempdir", exploding_gettempdir)
+
+    assert config._safe_temp_dir() is None
+    # 整条选目录路径仍然必须给出一个结果，而不是抛。
+    chosen = config._frozen_data_dir()
+    assert chosen is not None
+    assert str(chosen)
+
+
+def test_a_readonly_database_becomes_a_readable_503_with_cors_headers(monkeypatch):
+    """存储不可写必须是 503 + CORS 头，而不是裸 500。
+
+    2026-11-03 实测缺陷：三个 SQLite 库同时只读，`PATCH /api/chats/{id}` 抛
+    `sqlite3.OperationalError` 没有任何 handler 接住 → Starlette 在
+    `CORSMiddleware` 之外生成 500，**不带 Access-Control-Allow-Origin** →
+    WebView 跨域 fetch 只能抛 `TypeError: Failed to fetch`。用户看到
+    "网络请求失败"，真实原因是"数据目录不可写"，日志里 readonly 出现 116 次
+    而界面一次都没说对。
+
+    **必须走真实请求**：直接调 `_storage_error_response()` 只能证明那个函数
+    自己会返回什么，证不了异常**真的会被它接住** —— 我第一版就是这么写的，
+    把 handler 换成 `raise` 之后测试照样绿（假绿）。
+
+    红-绿：删掉 `main.py` 的 `sqlite_error_handler` 注册，本测试必红。
+    """
+    import sqlite3 as _sqlite3
+
+    import main as backend_main
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(backend_main, "SESSION_TOKEN", "test-token")
+
+    readonly = _sqlite3.OperationalError("attempt to write a readonly database")
+
+    def boom(*args, **kwargs):
+        raise readonly
+
+    # 让真实的写路由去撞只读错误，走完整中间件链。
+    monkeypatch.setattr(backend_main.chat_store, "update_conversation", boom)
+
+    client = TestClient(backend_main.app, raise_server_exceptions=False)
+    response = client.patch(
+        "/api/chats/chat_whatever",
+        json={"title": "x"},
+        headers={
+            "X-LunarShroud-Token": "test-token",
+            "Origin": "http://tauri.localhost",
+        },
+    )
+
+    assert response.status_code == 503, (
+        f"只读必须翻译成 503，实际 {response.status_code}："
+        "裸 500 会让跨源客户端只看到 Failed to fetch"
+    )
+    body = response.json()
+    assert body.get("code") == "storage_readonly"
+    assert "not writable" in body.get("error", "")
+    # 跨源客户端必须读得到它。
+    assert response.headers.get("access-control-allow-origin")
+
+
+def test_every_error_response_carries_cors_headers_for_cross_origin_clients():
+    """跨源客户端必须能读到错误状态码，而不是只看到 `Failed to fetch`。
+
+    打包态页面源是 `tauri.localhost`，对后端是跨源 fetch。一旦错误响应缺
+    CORS 头，浏览器把所有 4xx/5xx 都变成 `TypeError`，状态码与错误体全部丢失
+    —— 这次就是这样把"数据库只读"藏了 116 次。
+
+    这里直接调响应构造函数是**合适的**：它测的是三个分支各自的头部，
+    而"异常是否真的走到这里"由上一条真实请求的测试证明。
+    """
+    import sqlite3 as _sqlite3
+
+    import main as backend_main
+
+    for error in (
+        _sqlite3.OperationalError("attempt to write a readonly database"),
+        _sqlite3.OperationalError("database is locked"),
+        _sqlite3.OperationalError("disk I/O error"),
+    ):
+        reply = backend_main._storage_error_response(error)
+        origin = reply.headers.get("access-control-allow-origin")
+        assert origin, f"{error} 的响应缺 CORS 头，跨源客户端读不到状态码"
+
+
+def test_the_system_config_endpoint_never_returns_the_gateway_key(monkeypatch):
+    """`GET /api/system/config` 不得回传网关 Bearer 密钥。
+
+    前端 `settings.js` 把该字段渲染成 `value=""` 并注明"后端也不回传它"，
+    `api_server_admin.py` 的状态端点也只回 `key_configured` 布尔。但配置端点
+    一直直接返回 `get_config()`，于是同一份密钥经另一条路径进了 WebView 的
+    JS 内存。协议也明确要求"API 密钥不得写入 API 响应"。
+
+    红-绿：把端点改回 `return get_config()`，本测试必红。
+    """
+    import config
+    import main as backend_main
+    from fastapi.testclient import TestClient
+
+    secret = "s" + uuid.uuid4().hex
+    config.update_config({"api_server_key": secret})
+    monkeypatch.setattr(backend_main, "SESSION_TOKEN", "test-token")
+
+    client = TestClient(backend_main.app)
+    response = client.get(
+        "/api/system/config", headers={"X-LunarShroud-Token": "test-token"}
+    )
+    assert response.status_code == 200
+    assert secret not in response.text
+    body = response.json()
+    assert body["api_server_key"] == ""
+    # 不得新增键：设置页按 DEFAULT_CONFIG 的形状渲染，deep-paths 的浏览器
+    # 测试要求"每个配置键都有可编辑的 data-field"。多一个键会让那条断言变红。
+    assert "api_server_key_configured" not in body
+    assert set(body) == set(config.DEFAULT_CONFIG)
+
+
+def test_search_tools_never_follow_a_windows_junction_out_of_the_root(tmp_path):
+    """junction 是 `read_file` 与两个搜索工具之间的**边界不一致**。
+
+    `os.walk(followlinks=False)` 不挡 Windows junction（`model_scanner`
+    早就为此写了 `_is_link_entry`）。`read_file` 走 `resolve_inside`，正确报
+    "path escapes the authorized root"；`grep_search` / `file_glob_search`
+    以前直接把 junction 下的文件列出来并读到了内容 —— 只读工具的那条边界
+    只挡住了一个工具。
+
+    红-绿：把 `_iter_files` 的 `_is_link_entry` 过滤去掉，本测试必红。
+    """
+    if os.name != "nt":
+        pytest.skip("junctions are Windows-only")
+
+    import subprocess
+
+    from core import chat_tools
+
+    root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (outside / "secret.txt").write_text("SECRET_TOKEN_ABC\n", encoding="utf-8")
+
+    created = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(root / "portal"), str(outside)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if created.returncode != 0:
+        pytest.skip(f"junction creation unavailable: {created.stderr.strip()}")
+
+    with pytest.raises(chat_tools.ToolError):
+        chat_tools.read_file(str(root), "portal/secret.txt")
+
+    grep = chat_tools.grep_search(str(root), "SECRET_TOKEN_ABC")
+    assert grep["matches"] == []
+    globbed = chat_tools.file_glob_search(str(root), "*")
+    assert globbed["matches"] == []
+
+
+def test_grep_search_output_always_fits_the_message_content_budget(tmp_path):
+    """搜索结果必须放得进 `role="tool"` 消息的内容上限。
+
+    100 条 × 2000 字符 = 200,000，正好等于 `chat_store.MAX_CONTENT_CHARS`，
+    而前端渲染时每条还要加 `path:line: ` 前缀 —— 实测 201,089 字符，
+    于是"工具真的执行了、结果写不进库"。
+
+    红-绿：去掉 `MAX_RESULT_CHARS` 预算，本测试必红。
+    """
+    from core import chat_store, chat_tools
+
+    root = tmp_path / "root"
+    root.mkdir()
+    line = "NEEDLE" + "x" * 1993
+    for index in range(100):
+        (root / f"f{index}.txt").write_text(line + "\n", encoding="utf-8")
+
+    result = chat_tools.grep_search(str(root), "NEEDLE")
+    rendered = "\n".join(
+        f"{m['path']}:{m['line']}: {m['text']}" for m in result["matches"]
+    )
+    assert len(rendered) <= chat_store.MAX_CONTENT_CHARS
+    assert result["truncated"] is True
+
+
+def test_server_reported_listening_survives_concurrent_appends():
+    """监控线程不得直接迭代正在被读线程 append 的 deque。
+
+    `RuntimeError: deque mutated during iteration` 从
+    `describe_probe_failure` 冒出去会跳过监控线程里的
+    `_terminate_process_tree` / `_release_port` / `_finalize_process_resources`：
+    留下一个活的 llama-server、一条免于裁剪的 FAILED 记录，和一个永不释放的
+    端口预留。
+
+    红-绿：把 `list(instance.logs)` 改回 `instance.logs`，本测试必红。
+    """
+    from core import process_manager as pm
+
+    instance = pm.Instance(
+        id="deque-1",
+        name="deque",
+        preset_id=None,
+        preset_name=None,
+        params={},
+        argv=["stub"],
+        command_string="stub",
+    )
+    stop = threading.Event()
+
+    def writer():
+        index = 0
+        while not stop.is_set():
+            instance.logs.append(
+                pm.LogEntry(timestamp=0.0, source="output", line=f"line {index}")
+            )
+            index += 1
+
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        for _ in range(2000):
+            pm.server_reported_listening(instance)  # 不得抛
+    finally:
+        sys.setswitchinterval(previous)
+        stop.set()
+        thread.join(timeout=2)
+
+
+def test_the_instance_log_byte_budget_holds_under_concurrent_writers():
+    """`_append_log` 的"追加 + 计数 + 裁剪"必须原子。
+
+    stdout 读线程、监控线程与 `stop_instance`（`asyncio.to_thread`）会并发
+    追加同一个实例。无锁时字节计数漂移一个数量级：少计一侧让缓冲装到
+    `max_lines × 16 KiB`（§2.21 的字节预算失效），多计一侧每追加一行就清空
+    缓冲；裁剪循环还可能 `popleft()` 到空 deque 抛 IndexError。
+
+    红-绿：去掉 `_log_buffer_lock`，本测试必红。
+    """
+    from core import process_manager as pm
+
+    manager = pm.ProcessManager()
+    instance = pm.Instance(
+        id="log-1",
+        name="log",
+        preset_id=None,
+        preset_name=None,
+        params={},
+        argv=["stub"],
+        command_string="stub",
+    )
+    instance._log_buffer_max_lines = 50
+    instance._log_persist_enabled = False
+
+    body = "y" * 3000
+    barrier = threading.Barrier(8)
+    errors: list[BaseException] = []
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+
+    def worker(number):
+        try:
+            barrier.wait()
+            for index in range(200):
+                manager._append_log(instance, "output", f"{number}-{index}-{body}")
+        except BaseException as error:  # noqa: BLE001 - 记录线程内异常
+            errors.append(error)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    sys.setswitchinterval(previous)
+
+    assert errors == []
+    assert len(instance.logs) <= 50
+    actual = sum(len(entry.line.encode("utf-8")) for entry in instance.logs)
+    assert instance._log_buffer_bytes == actual
+    assert instance._log_buffer_bytes <= pm.MAX_LOG_BUFFER_BYTES
+
+
+def test_gateway_key_check_returns_401_for_non_ascii_credentials():
+    """`hmac.compare_digest` 对含非 ASCII 字符的 `str` 抛 TypeError，不是 False。
+
+    于是 `Authorization: Bearer u-umlaut` 会变成 500 而不是 401；而配置里可以
+    存非 ASCII 密钥（只校验类型/长度/控制字符），那种配置下**每一个**请求都
+    500，用户被锁在自己的网关外面且看不到原因。
+
+    红-绿：把比较改回字符串版 `compare_digest`，本测试必红。
+    """
+    from api import gateway
+    from fastapi import HTTPException
+
+    class FakeRequest:
+        def __init__(self, headers):
+            self.headers = headers
+
+    ascii_key = "k" + "1" * 12
+    non_ascii = chr(0xFC)  # U+00FC
+    cjk = chr(0x5BC6) + chr(0x94A5)
+
+    cfg = {"api_server_key": ascii_key}
+    cases = [
+        ({"x-api-key": non_ascii}, False),
+        ({"authorization": f"Bearer {cjk}"}, False),
+        ({"authorization": f"Bearer {ascii_key}"}, True),
+    ]
+    for headers, should_pass in cases:
+        try:
+            gateway.check_key(FakeRequest(headers), cfg)
+            accepted = True
+        except HTTPException as error:
+            assert error.status_code == 401, error
+            accepted = False
+        except TypeError as error:  # pragma: no cover - 修复前就是这条
+            pytest.fail(f"compare_digest raised instead of returning False: {error}")
+        assert accepted is should_pass
+
+    # 非 ASCII 密钥本身也必须可用（否则用户改完设置就再也进不来）。
+    gateway.check_key(
+        FakeRequest({"authorization": f"Bearer {cjk}"}),
+        {"api_server_key": cjk},
+    )
+
+
+@pytest.mark.parametrize("payload", [{"model": {"a": 1}}, {"model": None}, {"model": 5}])
+def test_manifest_routes_reject_a_non_string_model_with_400(monkeypatch, payload):
+    """JSON body 里的 `model` 没有类型约束，`Path(dict)` 抛 TypeError → 500。
+
+    Query 参数由 FastAPI 强制成 str，所以 DELETE 那条是安全的；这个不对称
+    正是缺陷所在。红-绿：去掉 `_manifest_model_arg`，本测试必红。
+    """
+    import main as backend_main
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(backend_main, "SESSION_TOKEN", "test-token")
+    client = TestClient(backend_main.app, raise_server_exceptions=False)
+    headers = {"X-LunarShroud-Token": "test-token"}
+
+    validated = client.post(
+        "/api/models/manifest/validate", json=payload, headers=headers
+    )
+    assert validated.status_code == 400
+
+    written = client.put("/api/models/manifest", json=payload, headers=headers)
+    assert written.status_code == 400
+
+
+def test_manifest_overwrite_accepts_a_string_only_when_it_says_true(
+    monkeypatch, tmp_path
+):
+    """`bool("false")` 是 True —— 一个"不要覆盖"的请求会静默覆盖文件。
+
+    拒绝覆盖的既有契约是 400（"manifest already exists; pass overwrite=true"），
+    所以这里断言：`"false"` 得到 400 **且文件字节不变**，`"true"` 才真的写入。
+
+    红-绿：把 `_overwrite_flag` 改回 `bool(body.get(...))`，本测试必红
+    （`"false"` 会变成 200 + 文件被替换）。
+    """
+    import main as backend_main
+    from fastapi.testclient import TestClient
+
+    model = tmp_path / "m.gguf"
+    model.write_bytes(b"GGUF")
+
+    monkeypatch.setattr(backend_main, "SESSION_TOKEN", "test-token")
+    client = TestClient(backend_main.app, raise_server_exceptions=False)
+    headers = {"X-LunarShroud-Token": "test-token"}
+
+    first = client.put(
+        "/api/models/manifest",
+        json={"model": str(model), "content": "model: a/b\n"},
+        headers=headers,
+    )
+    assert first.status_code == 200
+    before = Path(first.json()["path"]).read_bytes()
+
+    refused = client.put(
+        "/api/models/manifest",
+        json={"model": str(model), "content": "model: c/d\n", "overwrite": "false"},
+        headers=headers,
+    )
+    assert refused.status_code == 400
+    assert "overwrite" in refused.text
+    assert Path(first.json()["path"]).read_bytes() == before
+
+    accepted = client.put(
+        "/api/models/manifest",
+        json={"model": str(model), "content": "model: c/d\n", "overwrite": "true"},
+        headers=headers,
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["written"] is True

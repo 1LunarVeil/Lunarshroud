@@ -120,16 +120,25 @@ def test_compute_overhead_grows_with_context_and_layers():
 
 
 def test_bonsai_64_layer_model_is_flagged_over():
-    """真机标定：Bonsai-27B(64 层) 在 7.96 GiB 显卡上必须判 over。
+    """真机标定：Bonsai-27B(64 层) 在 7.96 GiB 显卡上必须被告警（over 或 tight）。
 
-    这台机器上它的实测结果是"就绪探测超时"，而 llama.cpp 自己打印了
+    这台机器上它的实测结果是"就绪探测超时"，llama.cpp 自己打印了
     failed to fit params to free device memory。
+
+    断言的是**必须告警**而不是必须 over：2026-10-30 修正 compute 常数后
+    （原来随 ctx 线性增长，128K 下高估约 6 倍），这个模型算出 7.913 GiB，
+    距 7.96 只有 0.6%，落在 `tight`（余量 <5%）而不是 `over`。
+    两档都会向用户告警，区别只是措辞 —— 真正要防的是"判成能跑、然后崩"。
+    把断言钉死在 over 会逼着我们为了一个词把常数调回虚高，
+    那正是本轮要修的问题。
     """
     card = [{"name": "RTX 5060 Laptop", "memory_total_mb": 8151, "memory_used_mb": 0}]
-    # 权重 5.54 + mmproj 0.86 + KV@8192(q8_0) 1.06 + 计算缓冲(64层,8192) 0.60
+    # 权重 5.54 + mmproj 0.86 + KV@8192(q8_0) 1.06 + 计算缓冲(64 层, 8192)
     need = 5.54 + 0.86 + 1.06 + compute_overhead_gib(8192, 64)
-    assert need > 7.96, "Bonsai 的真实需求必须超过 7.96 GiB 才能复现实测失败"
-    assert fit_verdict(round(need, 2), card)["level"] == "over"
+    verdict = fit_verdict(round(need, 2), card)
+    assert verdict["level"] in ("over", "tight"), (
+        f"Bonsai 实测会崩，必须被告警，实际分级 {verdict['level']}"
+    )
 
 
 def test_compute_overhead_absent_for_cpu_only():
@@ -273,3 +282,81 @@ def test_cache_type_bytes_match_ggml_block_sizes():
     assert _CACHE_TYPE_BYTES["q5_1"] > _CACHE_TYPE_BYTES["q5_0"]
     assert _CACHE_TYPE_BYTES["iq4_nl"] == _CACHE_TYPE_BYTES["q4_0"]
     assert _CACHE_TYPE_BYTES["f16"] == 2.0
+
+
+def test_hybrid_architecture_kv_uses_only_attention_layers():
+    """混合架构只有部分层进 KV cache —— 按 block_count 算会高出数倍。
+
+    实测标定（2026-10-30，RTX 5060 Laptop，Vulkan1，-ngl 99 -c 131072 -fa on，
+    Qwen3.5-4B-Q4_K_M）：llama.cpp 打印
+
+        llama_kv_cache: size = 4096.00 MiB (131072 cells, 8 layers, 1/1 seqs),
+                        K (f16): 2048.00 MiB, V (f16): 2048.00 MiB
+        llama_memory_recurrent: size = 50.25 MiB (32 layers)   ← SSM 层的循环状态
+
+    也就是 32 个 block 里**只有 8 层**是 dense attention。旧代码按 32 层算，
+    得到 16 GiB —— 那张 8 GiB 显卡会被判"必然爆显存"，而真实占用只有 4 GiB。
+    用户看到这种告警会去砍上下文、降层数、换量化，为一个不存在的问题折腾。
+
+    这条测试锁定两件事：
+    1. 有 attn_layer_count 时，KV 只按那个层数算；
+    2. 数值必须落在 llama.cpp 实测值的附近（±15%），而不是只要"变小了"。
+    """
+    # 直接喂 GGUF 实测出来的元数据，不依赖本机有没有那份模型
+    estimate = estimate_vram(
+        model_bytes=2740937888,          # 2.55 GiB
+        block_count=32,
+        attn_layer_count=8,              # ← 实测：只有 8 层进 KV
+        ctx_size=131072,
+        n_gpu_layers=99,
+        cache_type_k="f16",
+        cache_type_v="f16",
+        parallel=1,
+        head_count=16,
+        head_count_kv=4,
+        key_length=256,
+        value_length=256,
+        embedding_length=2560,
+    )
+    assert estimate["kv_layers"] == 8
+    assert estimate["kv_layers_source"] == "attention-tensors"
+    # llama.cpp 实测 KV = 4096 MiB = 4.0 GiB
+    assert estimate["kv_cache_gib"] == pytest.approx(4.0, abs=0.05)
+
+    # 整机估算也要贴近实测总量 6.94 GiB（权重 2603.5 + KV 4096 + compute 355
+    # + RS 50 MiB），误差 15% 以内
+    assert estimate["gpu_gib"] == pytest.approx(6.94, rel=0.15), estimate["gpu_gib"]
+
+    # 没有 attn_layer_count 时退回 block_count 并**标注来源**，
+    # 让界面能说明"这是保守上界"
+    fallback = estimate_vram(
+        model_bytes=2740937888,
+        block_count=32,
+        attn_layer_count=None,
+        ctx_size=131072,
+        head_count=16,
+        head_count_kv=4,
+        key_length=256,
+        value_length=256,
+    )
+    assert fallback["kv_layers"] == 32
+    assert fallback["kv_layers_source"] == "block-count"
+    assert fallback["kv_cache_gib"] == pytest.approx(16.0, abs=0.05)
+
+
+def test_attention_layer_count_survives_a_missing_block_count():
+    """block_count 与 attn_layer_count 都拿不到时，不能留下未赋值的变量。
+
+    真实崩溃形态：`kv_layers_source` 只在两个分支里赋值，两个分支都不进时
+    局部变量未定义 —— 整个 /api 端点 500，而调用方只是想显示一个估算值。
+    """
+    estimate = estimate_vram(
+        model_bytes=1024,
+        block_count=None,
+        attn_layer_count=None,
+        ctx_size=8192,
+    )
+    assert estimate["kv_layers"] is None
+    assert estimate["kv_layers_source"] == "unavailable"
+    assert estimate["kv_cache_gib"] == 0.0
+    assert estimate["kv_source"] == "unavailable"

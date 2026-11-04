@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -68,6 +69,25 @@ def _seed_fallback_data_dir(preferred: Path, chosen: Path) -> None:
         LOGGER.warning("could not seed fallback data dir from %s: %s", preferred, error)
 
 
+def _safe_temp_dir() -> Path | None:
+    """``tempfile.gettempdir()``，失败时返回 ``None`` 而不是抛。
+
+    ``gettempdir()`` **会抛** ``FileNotFoundError("No usable temporary
+    directory found in [...])``：它在候选目录（``%TEMP%``/``%TMP%``/
+    ``/tmp``…）里逐个试写，一个都不可写时直接放弃。这个调用点在
+    ``_frozen_data_dir`` 里、而后者在**模块导入期**执行 —— 异常会从
+    ``import config`` 冒出去，打包后端在任何日志建立之前就死掉，用户只看到
+    "后端进程启动失败"（2026-11-03 实测：把 ``TEMP``/``TMP`` 指向不存在路径
+    后，``config.py:93`` 抛 ``FileNotFoundError`` 并终止进程）。
+
+    §2.16 的要求是"可写才用，打不开只能降级"——降级的前提是**不抛**。
+    """
+    try:
+        return Path(tempfile.gettempdir())
+    except (OSError, FileNotFoundError):
+        return None
+
+
 def _frozen_data_dir() -> Path:
     """选一个真正可写的用户数据目录，而不是盲目信任 %APPDATA%。
 
@@ -89,7 +109,9 @@ def _frozen_data_dir() -> Path:
     if home and home != "~":
         candidates.append(Path(home) / "LunarShroud")
     candidates.append(Path(sys.executable).resolve().parent / "data")
-    candidates.append(Path(tempfile.gettempdir()) / "LunarShroud")
+    temp = _safe_temp_dir()
+    if temp is not None:
+        candidates.append(temp / "LunarShroud")
     for candidate in candidates:
         if _dir_is_writable(candidate):
             preferred = Path(appdata) / "LunarShroud" if appdata else None
@@ -101,7 +123,13 @@ def _frozen_data_dir() -> Path:
                 )
                 _seed_fallback_data_dir(preferred, candidate)
             return candidate
-    return Path(tempfile.gettempdir()) / "LunarShroud"
+    # 走到这里说明连 exe 同目录都不可写。临时目录也可能拿不到（见
+    # `_safe_temp_dir`），此时返回 exe 旁的 `data`：它多半也不可写，
+    # 但那是启动后 `ensure_dirs()` 能报出的、带路径的具体错误，
+    # 比在 import 期直接抛一句 "No usable temporary directory" 可诊断得多。
+    if temp is not None:
+        return temp / "LunarShroud"
+    return Path(sys.executable).resolve().parent / "data"
 
 
 if is_frozen():
@@ -175,7 +203,82 @@ DEFAULT_CONFIG: dict[str, Any] = {
     #   collapse 始终折叠
     # 用户手动点过某一条之后，那一条以他的选择为准，不再被这个偏好覆盖。
     "chat_reasoning": "auto",
+    # 原生 Chat 的显示身份。名字是短文本；头像既可以是短文本（emoji/首字母），
+    # 也可以是 `data:image/…;base64,…` 图片 —— **不落盘**，避免 CSP 以外的
+    # 路径校验与清理问题。图片尺寸在前端裁剪到 128×128、编码后 ≤ 64 KiB，
+    # 上限见 CHAT_AVATAR_MAX_BYTES。空串 = 用默认值（前端回落到 i18n 文案
+    # 与首字母头像），不是错误。
+    "chat_assistant_name": "",
+    "chat_user_name": "",
+    "chat_assistant_avatar": "",
+    "chat_user_avatar": "",
+    # 两个侧栏的宽度（像素）。0 = 未设置，前端用各自默认值（220 / 252）。
+    # 存后端而不是 localStorage：换机器/清缓存后布局不该丢。
+    "chat_sidebar_width": 0,
+    "chat_panel_width": 0,
+    # Chat 页的整页背景图。data URL，**不落盘**（与头像同一取舍：接真文件通道
+    # 要同时解决路径校验、孤儿文件回收与清理，而这里只是一张装饰图）。
+    # 前端缩放到 ≤1920×1080 再按 JPEG 0.82 编码，上限见
+    # CHAT_BACKGROUND_MAX_BYTES；空串 = 无背景（默认）。
+    "chat_background_image": "",
+    # 背景图上叠的那层主题色遮罩的不透明度。0 = 完全透出图片，1 = 完全盖住
+    # （等于没有背景）。默认 0.35 是"看得出是图、但白字仍读得清"的折中。
+    "chat_background_opacity": 0.35,
+    # 背景图模糊半径（px）。0 = 不模糊。大图直接铺满会让正文难读，
+    # 轻模糊是常见解法。
+    "chat_background_blur": 0,
+    # ---------- 本地 API 服务（OpenAI 兼容网关） ----------
+    # 是否开启对外网关。关闭时网关路由一律 503（不是 404：路由确实存在，
+    # 只是服务没开，客户端据此能给出"去设置里打开"的提示）。
+    #
+    # **默认关闭**：开启意味着除启动器之外的程序也能花用户的显卡，
+    # 那是一次明确的授权动作，不该在首次启动时静默发生。
+    "api_server_enabled": False,
+    # 网关监听端口。必须与 launcher_port 不冲突（校验里会拒绝）。
+    "api_server_port": 1234,
+    # 允许跨域的来源，逗号分隔；空串 = 只允许同源/回环页面。
+    # 与 llama-server 的 --cors-origins 是同名概念，但作用在网关自己身上。
+    "api_server_cors_origins": "",
+    # 网关的访问密钥。空串 = 不校验（仅本机）。非空时要求
+    # `Authorization: Bearer <key>`。**不给默认值**：任何预置密钥都会变成
+    # 一份公开的"可用凭据"（与 llama_server_path 默认留空同一个理由）。
+    "api_server_key": "",
+    # 是否把每个经过网关的请求记进请求日志（内存环形缓冲，不落盘）。
+    "api_server_log_requests": True,
 }
+
+# 这些字段的唯一约束是长度。上限是防御性的 —— 再长的名字在气泡里也放不下。
+CHAT_IDENTITY_LIMITS = {
+    "chat_assistant_name": 32,
+    "chat_user_name": 32,
+}
+
+# 头像既可能是 emoji（≤8 码位），也可能是 data URL。分开限额，因为两者的
+# 合理上限差三个数量级，混用一条会要么把小 emoji 卡死、要么让 config.json 爆掉。
+CHAT_AVATAR_TEXT_MAX = 8
+CHAT_AVATAR_MAX_BYTES = 64 * 1024
+
+# 背景图额度比头像高两个数量级：它是铺满整页的图，128×128 那套参数会把它糊成
+# 色块。前端按 1920×1080 / JPEG 0.82 编码，实测落在 150–350 KiB；这里给
+# 400 KiB，正好卡住"前端编码失败但仍被提交"的情况。超过这个值后
+# config.json 每次 GET 都要拖着它，而 GET /api/system/config 是每个页面都会
+# 调的热路径。
+CHAT_BACKGROUND_MAX_BYTES = 400 * 1024
+# 不透明度与模糊半径的合法区间。与前端 chat_background.mjs 保持一致；
+# 后端再夹一次是因为配置文件可被手工编辑。
+CHAT_BACKGROUND_OPACITY_RANGE = (0.0, 1.0)
+CHAT_BACKGROUND_BLUR_RANGE = (0, 40)
+
+# 宽度范围。与前端 resizable.mjs 的 SIDEBAR_LIMITS/PANEL_LIMITS 保持一致；
+# 后端再夹一次是因为配置可以被手工编辑，前端不该是唯一的守门人。
+#
+# 1.0 第二轮语义变化：
+#   chat_sidebar_width → 左侧单列导航栏（导航项 + 当前页列表）。列表搬进侧栏后
+#     下限从 160 提到 200：更窄的话列表项标题只剩几个字。
+#   chat_panel_width   → Chat 右侧参数面板（实例/知识库/系统提示/采样/工具）。
+#     键名保留，避免旧配置失效与"每个键都能从 UI 改"的门禁变红。
+CHAT_SIDEBAR_WIDTH_RANGE = (200, 420)
+CHAT_PANEL_WIDTH_RANGE = (260, 420)
 
 
 def _is_integer(value: Any) -> bool:
@@ -193,6 +296,21 @@ def _is_positive_number(value: Any) -> bool:
     )
 
 
+def _is_one_of(value: Any, allowed: frozenset[str] | set[str]) -> bool:
+    """Membership test that never raises on unhashable values.
+
+    ``value in {"a", "b"}`` raises ``TypeError: unhashable type: 'list'`` for a
+    JSON array, which used to escape ``validate_config(repair=True)`` and brick
+    the startup (a hand-edited ``"theme": []`` was enough). A config value of
+    the wrong *type* is a validation failure, not an internal error, so it must
+    come back as ``False`` and let the caller repair or report it.
+    """
+    try:
+        return value in allowed
+    except TypeError:
+        return False
+
+
 def validate_config(cfg: dict[str, Any], *, repair: bool = False) -> dict[str, Any]:
     """Validate persisted/runtime settings.
 
@@ -202,11 +320,38 @@ def validate_config(cfg: dict[str, Any], *, repair: bool = False) -> dict[str, A
     current config untouched.
     """
     candidate = dict(cfg)
+    # 缺失的键补成默认值。
+    #
+    # 这不是"顺手清理"：``DEFAULT_CONFIG`` 会随版本增长（本轮加了
+    # ``chat_background_*``），而用户机器上的 ``config.json`` 是旧版本写的。
+    # 校验里那些 ``candidate.get(field, default)`` 只对**该键存在但值坏**生效，
+    # 键**整个缺失**时流程走到最后会把 None 原样返回 —— 实测旧配置读出来
+    # ``chat_background_opacity is None``，设置页渲染成空输入框，保存时才炸。
+    # 补默认值让"升级后第一次启动"与"全新安装"拿到同一份形状。
+    for key, value in DEFAULT_CONFIG.items():
+        candidate.setdefault(key, value)
     errors: list[str] = []
 
     def check(key: str, valid: bool, message: str) -> None:
         if valid:
             return
+        if repair:
+            candidate[key] = DEFAULT_CONFIG[key]
+        else:
+            errors.append(message)
+
+    def reject(key: str, message: str) -> None:
+        """Record a bad value, repairing it on the load path.
+
+        ``repair=True`` promises "one bad JSON value must not prevent startup"
+        (see the docstring). The chat/appearance block used to raise
+        unconditionally instead, so a single hand-edited value — a
+        ``chat_background_opacity: 3.0``, a ``chat_assistant_name: null`` —
+        escaped ``_load_config_from_file`` and killed the packaged backend with
+        exit 3 *before* uvicorn and before any log line. That is exactly the
+        shape of the 2026-11-02 sidebar-width incident; this helper applies the
+        same clamp/replace policy to the rest of the block.
+        """
         if repair:
             candidate[key] = DEFAULT_CONFIG[key]
         else:
@@ -302,12 +447,12 @@ def validate_config(cfg: dict[str, Any], *, repair: bool = False) -> dict[str, A
     )
     check(
         "launch_guardrail",
-        candidate.get("launch_guardrail") in {"off", "warn", "strict"},
+        _is_one_of(candidate.get("launch_guardrail"), {"off", "warn", "strict"}),
         "launch_guardrail must be 'off', 'warn' or 'strict'",
     )
     check(
         "theme",
-        candidate.get("theme") in {"light", "dark", "system"},
+        _is_one_of(candidate.get("theme"), {"light", "dark", "system"}),
         "theme must be 'light', 'dark' or 'system'",
     )
     check(
@@ -315,11 +460,182 @@ def validate_config(cfg: dict[str, Any], *, repair: bool = False) -> dict[str, A
         isinstance(candidate.get("close_to_tray"), bool),
         "close_to_tray must be a boolean",
     )
+    # ---------- 本地 API 服务 ----------
+    check(
+        "api_server_enabled",
+        isinstance(candidate.get("api_server_enabled"), bool),
+        "api_server_enabled must be a boolean",
+    )
+    check(
+        "api_server_log_requests",
+        isinstance(candidate.get("api_server_log_requests"), bool),
+        "api_server_log_requests must be a boolean",
+    )
+    api_port = candidate.get("api_server_port")
+    check(
+        "api_server_port",
+        _is_integer(api_port) and 1 <= api_port <= 65535,
+        "api_server_port must be an integer between 1 and 65535",
+    )
+    # 网关不能与启动器自己抢端口：两者都监听回环，占同一个地址时后起的
+    # 那个绑定失败，而失败方是悄悄降级的（uvicorn 报 exit 3）。这里在写入
+    # 配置时就拒绝，用户能在设置页看到明确原因。
+    if not repair and _is_integer(api_port) and api_port == candidate.get("launcher_port"):
+        errors.append("api_server_port must differ from launcher_port")
+    origins = candidate.get("api_server_cors_origins", "")
+    if not isinstance(origins, str):
+        reject("api_server_cors_origins", "api_server_cors_origins must be a string")
+    elif len(origins) > 2048:
+        reject(
+            "api_server_cors_origins",
+            "api_server_cors_origins must be at most 2048 characters",
+        )
+    key = candidate.get("api_server_key", "")
+    if not isinstance(key, str):
+        reject("api_server_key", "api_server_key must be a string")
+    elif len(key) > 256:
+        reject("api_server_key", "api_server_key must be at most 256 characters")
+    elif any(ch in key for ch in ("\x00", "\r", "\n")):
+        reject(
+            "api_server_key", "api_server_key must not contain control characters"
+        )
     check(
         "chat_reasoning",
-        candidate.get("chat_reasoning") in {"auto", "expand", "collapse"},
+        _is_one_of(candidate.get("chat_reasoning"), {"auto", "expand", "collapse"}),
         "chat_reasoning must be 'auto', 'expand' or 'collapse'",
     )
+    # 显示身份：只校验类型与长度。控制字符必须拒绝——它们能把名字渲染成
+    # 不可见内容（U+202E 之类还能把整行视觉顺序反转），而这个名字会被写进
+    # 聊天记录并随导出外发。
+    for field, limit in CHAT_IDENTITY_LIMITS.items():
+        value = candidate.get(field, "")
+        if not isinstance(value, str):
+            reject(field, f"{field} must be a string")
+            continue
+        if len(value) > limit:
+            reject(field, f"{field} must be at most {limit} characters")
+            continue
+        if any(ch in value for ch in ("\x00", "\r", "\n", "\u2028", "\u2029")):
+            reject(field, f"{field} must not contain control characters")
+            continue
+        if value != value.strip():
+            reject(field, f"{field} must not have leading or trailing whitespace")
+
+    # 头像：短文本（emoji）或 data:image 的 base64。两种格式分开校验 ——
+    # 混用一条长度上限会要么把小 emoji 卡死、要么让 config.json 无限膨胀。
+    # 拒绝非 data: 的 URL：那会让界面去请求远程地址（隐私泄漏 + 断网即失效），
+    # 而头像这种纯本地装饰没有理由联网。
+    for field in ("chat_assistant_avatar", "chat_user_avatar"):
+        value = candidate.get(field, "")
+        if not isinstance(value, str):
+            reject(field, f"{field} must be a string")
+            continue
+        if value.startswith("data:"):
+            if not value.startswith("data:image/"):
+                reject(field, f"{field} must be a data:image/* URL")
+                continue
+            if len(value.encode("utf-8")) > CHAT_AVATAR_MAX_BYTES:
+                reject(
+                    field,
+                    f"{field} image must be at most {CHAT_AVATAR_MAX_BYTES} bytes",
+                )
+                continue
+        else:
+            if len(value) > CHAT_AVATAR_TEXT_MAX:
+                reject(
+                    field,
+                    f"{field} must be at most {CHAT_AVATAR_TEXT_MAX} characters "
+                    "(or a data:image URL)",
+                )
+                continue
+            # 控制字符 + 双向文本覆盖符（U+202A-U+202E / U+2066-U+2069）。
+            # 后者不在 C0 区间里，但能把整行文字的视觉顺序反转；头像字段
+            # 没有任何理由需要它。前端 avatar.mjs 有同一份判断，两处都拦
+            # 是因为配置可被手工编辑，不能只信任一侧。
+            if any(
+                ch in value
+                for ch in (
+                    "\x00", "\r", "\n", "\u2028", "\u2029",
+                    "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",
+                    "\u2066", "\u2067", "\u2068", "\u2069",
+                )
+            ):
+                reject(field, f"{field} must not contain control characters")
+
+    # 侧栏宽度：0 = 未设置（前端用默认）。非 0 必须在区间内；
+    # 静默夹取比报错好还是坏，取决于意图 —— 这里是用户拖出来的值，
+    # 超出区间说明前端/配置被改坏了，报错比悄悄改成边界更容易被发现。
+    # 超出区间：运行期更新报错（用户拖出来的值，越界说明前端/配置被改坏了，
+    # 报错比悄悄改成边界更容易被发现）；**加载旧配置时必须夹取**。
+    #
+    # 2026-11-02 实测事故：区间从 (160,420) 提到 (200,420) 后，一个存着
+    # chat_sidebar_width=220 的旧配置在 repair=True 下仍然走 raise 分支，
+    # 打包后端在 lifespan 前就以 exit 3 退出，启动器只显示"后端启动失败"。
+    # 版本升级改变区间是正常运维，不能让老配置变成砖头 —— 夹到最近边界即可。
+    for field, (low, high) in (
+        ("chat_sidebar_width", CHAT_SIDEBAR_WIDTH_RANGE),
+        ("chat_panel_width", CHAT_PANEL_WIDTH_RANGE),
+    ):
+        value = candidate.get(field, 0)
+        if not _is_integer(value):
+            if repair:
+                candidate[field] = 0
+                continue
+            errors.append(f"{field} must be an integer")
+            continue
+        if value != 0 and not (low <= value <= high):
+            if repair:
+                candidate[field] = min(high, max(low, value))
+                continue
+            errors.append(f"{field} must be 0 or within {low}-{high}")
+
+    # 背景图：空串（无背景）或 data:image/* 的 base64。与头像同样拒绝远程
+    # URL —— 界面没有理由为一个纯本地装饰去联网（隐私 + 断网即失效）。
+    # 这里只放 img/jpeg/png/webp：前端编码器只产出这两种，其余格式留着
+    # 只会让"配置里能存、界面上显示不出"的组合成为可能。
+    background = candidate.get("chat_background_image", "")
+    if not isinstance(background, str):
+        reject("chat_background_image", "chat_background_image must be a string")
+    elif background:
+        if not re.match(
+            r"^data:image/(?:jpeg|jpg|png|webp);base64,[A-Za-z0-9+/=\s]+$", background
+        ):
+            reject(
+                "chat_background_image",
+                "chat_background_image must be a data:image/(jpeg|png|webp) URL",
+            )
+        elif len(background.encode("utf-8")) > CHAT_BACKGROUND_MAX_BYTES:
+            reject(
+                "chat_background_image",
+                "chat_background_image must be at most "
+                f"{CHAT_BACKGROUND_MAX_BYTES} bytes",
+            )
+
+    # 不透明度：0–1 的有限浮点。布尔要拒（True 在 Python 里等于 1，
+    # 会让"忘记填"变成"完全不透明"这种看不出来的错）。
+    opacity = candidate.get("chat_background_opacity", 0.35)
+    if isinstance(opacity, bool) or not isinstance(opacity, (int, float)):
+        reject("chat_background_opacity", "chat_background_opacity must be a number")
+    elif not math.isfinite(float(opacity)):
+        reject("chat_background_opacity", "chat_background_opacity must be finite")
+    else:
+        low, high = CHAT_BACKGROUND_OPACITY_RANGE
+        if not (low <= float(opacity) <= high):
+            reject(
+                "chat_background_opacity",
+                f"chat_background_opacity must be within {low}-{high}",
+            )
+
+    # 模糊半径：整数像素。超过 40 就等于把图糊成一片，没有实际用途。
+    blur = candidate.get("chat_background_blur", 0)
+    blur_low, blur_high = CHAT_BACKGROUND_BLUR_RANGE
+    if not _is_integer(blur):
+        reject("chat_background_blur", "chat_background_blur must be an integer")
+    elif not (blur_low <= blur <= blur_high):
+        reject(
+            "chat_background_blur",
+            f"chat_background_blur must be within {blur_low}-{blur_high}",
+        )
 
     if errors:
         raise ValueError("; ".join(errors))

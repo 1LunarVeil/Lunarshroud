@@ -155,11 +155,16 @@ function updateInstances(list) {
   const sig = instanceSignature(instanceList, currentInstanceId);
   if (sig === lastPanelSignature) return;
   lastPanelSignature = sig;
-  ctx.refreshPanel();
+  ctx.refreshList?.();
 }
 
 // 二级面板：实例列表（本模块不额外持有列表状态，直接读 instanceList）
-export function renderPanel(el) {
+/** 侧栏列表的标题。 */
+export function sidebarListTitle() {
+  return t('nav.logs');
+}
+
+export function renderSidebarList(el) {
   renderInstanceList(el, ctx, {
     instances: instanceList,
     activeId: currentInstanceId,
@@ -179,7 +184,7 @@ function selectInstance(instanceId) {
   openWs();
   // 面板高亮跟着走
   lastPanelSignature = '';
-  ctx.refreshPanel();
+  ctx.refreshList?.();
 }
 
 function closeWs() {

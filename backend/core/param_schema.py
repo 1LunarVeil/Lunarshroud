@@ -132,6 +132,12 @@ class ParamMeta(BaseModel):
     option_labels: dict | None = None  # 枚举值的中文标签（key->中文）
     placeholder: str | None = None     # 输入框占位提示
     help: str = ""                        # 中文说明（必填）
+    # 英文本地化与中文写在**同一处定义**里。曾经它们是两份平行字典
+    # （PARAM_LABELS_EN / PARAM_HELP_EN），新增参数要改 4 个地方，漏一处
+    # 只能靠奇偶性测试兜底（2026-10-27 加 device 参数时确实漏过英文标签）。
+    # 现在只有这一处真相：新增参数在这里同时写中英，测试断言两者都非空。
+    label_en: str = ""
+    help_en: str = ""
     required: bool = False                # 是否必填
     depends_on: dict | None = None     # 联动依赖，如 {"spec_type": "draft-mtp"} 表示仅当 spec_type=draft-mtp 时启用
     depends_on_any: dict | None = None # 多值联动，如 {"spec_type": ["draft-mtp","draft-simple"]} 表示所选值命中任一即启用
@@ -255,6 +261,17 @@ PARAM_DEFINITIONS: list[ParamMeta] = [
             "ROCm0…（没有 ROCm 兼容显卡时为空）。留空 = 由 llama.cpp 自行选择。"
             "AMD 显卡请用 Vulkan 包（本机若装了 ROCm 兼容驱动则可用 ROCm 包）；"
             "Intel 核显/Arc/NPU 请用 OpenVINO 包。"
+        ),
+        label_en="Compute device",
+        help_en=(
+            "Which backend device(s) to use, comma-separated (e.g. Vulkan0). "
+            "Names must come from what THIS build reports on the Runtime page: "
+            "CPU builds list nothing, Vulkan builds list Vulkan0/1…, OpenVINO "
+            "builds list OPENVINO0/1… (its CPU device usually comes first), "
+            "ROCm builds list ROCm0… (empty without a supported AMD GPU). "
+            "Empty = let llama.cpp choose. OpenVINO takes exactly one device and "
+            "receives it via GGML_OPENVINO_DEVICE. Use the Vulkan build for AMD "
+            "GPUs and the OpenVINO build for Intel iGPU/Arc/NPU."
         ),
         order=3,  # 与 CPU 线程数同序：定义顺序决定展示位置（排序是稳定的）
     ),
@@ -1610,8 +1627,8 @@ def get_schema_for_frontend(exe_path: str | None = None) -> dict:
                 "options": p.options, "option_labels": p.option_labels,
                 "option_labels_en": OPTION_LABELS_EN.get(p.key),
                 "placeholder": p.placeholder, "help": p.help,
-                "label_en": PARAM_LABELS_EN.get(p.key, p.label),
-                "help_en": PARAM_HELP_EN.get(p.key, p.help),
+                "label_en": p.label_en or PARAM_LABELS_EN.get(p.key, p.label),
+                "help_en": p.help_en or PARAM_HELP_EN.get(p.key, p.help),
                 "required": p.required, "depends_on": p.depends_on,
                 "depends_on_any": p.depends_on_any,
                 "depends_on_nonempty": p.depends_on_nonempty,

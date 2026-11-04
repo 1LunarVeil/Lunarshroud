@@ -5,17 +5,19 @@
 import Api from './api.js?v=1';
 import { createSingleFlight } from './runtime.mjs';
 import { initTooltips } from './tooltip.mjs';
-import { getLocale, setLocale, t, LOCALE_NAMES } from './i18n.mjs';
+import { getLocale, setLocale, t, localizeBackendError, LOCALE_NAMES } from './i18n.mjs';
 import { open as openModelPicker } from './model_picker.mjs';
 import { openCommandPalette } from './command_palette.mjs';
 import { escapeHtml } from './html.mjs';
 import { closeModal, showConfirm, showModal } from './modal.mjs';
+import { attachResizer, readSidebarWidths, SIDEBAR_LIMITS } from './resizable.mjs';
 
 export { escapeHtml };
 
 // 导入所有页面模块
 import * as dashboard from './dashboard.js?v=1';
 import * as chat from './chat.js?v=1';
+import * as apiServer from './api_server.js?v=1';
 import * as workspace from './workspace.js?v=1';
 import * as knowledge from './knowledge.js?v=1';
 import * as observability from './observability.js?v=1';
@@ -27,6 +29,7 @@ import * as settings from './settings.js?v=1';
 const PAGES = [
   dashboard,
   chat,
+  apiServer,
   workspace,
   knowledge,
   observability,
@@ -36,10 +39,18 @@ const PAGES = [
 ];
 
 // 侧栏分组：目的地与动作分开；参数编辑器/设置是模态动作，不是路由页面。
+// 分组顺序对齐 LM Studio 的信息架构：会话 → 服务 → 资源 → 工具。
+// 「服务」单独成组（而不是并进「会话」）：本地 API 服务是"把模型开放出去"的
+// 一件事，与"自己跟自己聊"是两种不同的使用意图；混在一组里，用户要在
+// Chat 与 API 服务之间来回时得先读组名猜它归哪儿。
+//
+// `settings` 不在这里：它属于侧栏底部的固定动作（与"收起导航"同一区），
+// 放进分组会让同一个入口在侧栏出现两次。
 const NAV_GROUPS = [
   { key: 'run', labelKey: 'nav.groupRun', pages: ['dashboard', 'chat'] },
+  { key: 'serving', labelKey: 'nav.groupServing', pages: ['api_server'] },
   { key: 'resources', labelKey: 'nav.groupResources', pages: ['workspace', 'knowledge', 'observability'] },
-  { key: 'tools', labelKey: 'nav.groupTools', pages: ['param_editor', 'help', 'settings'] },
+  { key: 'tools', labelKey: 'nav.groupTools', pages: ['param_editor', 'help'] },
 ];
 
 // 当前激活页面
@@ -349,8 +360,91 @@ function setBackendBanner(state) {
 
 let lastInstances = [];
 
+/**
+ * 顶栏中央的"当前模型"胶囊。
+ *
+ * 这是整窗唯一使用强调色实心填充的元素（见 docs/DESIGN_1.0.md 的 signature
+ * 说明）：其余地方强调色只出现在焦点环、激活项左缘和链接上。
+ *
+ * 文案分两种语义：没有运行中实例时是**邀请动作**（"未加载模型"），有实例时
+ * 是**陈述状态**（模型名）。以前两者都是 "选择要加载的模型"，于是"已经加载
+ * 了 qwen3.5-4b"这个事实在顶栏上永远看不见 —— 用户只能去 Chat 页或仪表盘确认。
+ *
+ * 模型名取 `model_path` 的文件名（实例列表里没有更短的显示名），多个实例时
+ * 用 "+N" 收口。全部按钮内容重建（innerHTML）后重新套上 kbd 提示，因为
+ * `Ctrl+L` 是发现性信息，不该只在空态出现。
+ */
+/**
+ * 顶栏模型胶囊：显示"当前在跟哪个模型说话"，并提供一键停止。
+ *
+ * 结构约束（改之前先读）：外壳是 `<div id="btn-model-picker" role="group">`
+ * 而不是 `<button>` —— 胶囊里要放"停止"按钮，HTML 不允许 button 套 button；
+ * 而且外层若是 button，点在停止上会冒泡成"打开模型选择器"。
+ *
+ * 另一个坑：这个函数在每次实例 WS 推送时都会重写 innerHTML，
+ * 所以**事件必须委托在外层容器上绑一次**（见 initLayout），不能绑在内部节点。
+ */
+export function renderModelCapsule(instances) {
+  const btn = document.getElementById('btn-model-picker');
+  if (!btn) return;
+  const list = Array.isArray(instances) ? instances : [];
+  // stopping 也要显示：点完停止后实例先进 stopping，若这时胶囊立刻跳回
+  // "选择要加载的模型"，用户会以为没生效。等它真的 stopped 再回空态。
+  const active = list.filter(
+    (item) => item && (item.status === 'running' || item.status === 'stopping')
+  );
+  const kbd = `<span class="kbd">Ctrl+L</span>`;
+  if (!active.length) {
+    btn.classList.remove('is-loaded');
+    btn.innerHTML = `<button type="button" class="model-capsule-open">${escapeHtml(
+      t('app.pickModel')
+    )} ${kbd}</button>`;
+    btn.title = t('app.pickModel');
+    return;
+  }
+  const primary = active[0];
+  const stopping = primary.status === 'stopping';
+  const path = String(primary.model_path || primary.name || '');
+  const base = path.split(/[\\/]/).pop() || primary.name || '';
+  const label =
+    active.length > 1
+      ? t('app.modelCapsuleRunningMany', { name: base, count: active.length - 1 })
+      : base;
+  btn.classList.add('is-loaded');
+  btn.classList.toggle('is-stopping', stopping);
+  btn.innerHTML = `
+    <button type="button" class="model-capsule-open">
+      <span class="model-capsule-dot" aria-hidden="true"></span>
+      <span class="model-capsule-name"></span>
+      ${kbd}
+    </button>
+    <button type="button" class="model-capsule-stop" data-capsule-stop="${escapeHtml(
+      String(primary.id || '')
+    )}"${stopping ? ' disabled' : ''}
+      title="${escapeHtml(t(stopping ? 'app.modelCapsuleStopping' : 'app.modelCapsuleStop'))}"
+      aria-label="${escapeHtml(t(stopping ? 'app.modelCapsuleStopping' : 'app.modelCapsuleStop'))}">
+      <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+    </button>`;
+  const nameEl = btn.querySelector('.model-capsule-name');
+  // 模型名来自文件系统，一律走 textContent —— 这里绝不拼 HTML。
+  if (nameEl) nameEl.textContent = label;
+  btn.title = stopping ? t('app.modelCapsuleStopping') : t('app.modelCapsuleHint');
+}
+
+/** 停止胶囊里那个实例。id 从 data 属性取（DOM 每次推送都会重建）。 */
+async function stopCapsuleInstance(instanceId) {
+  if (!instanceId) return;
+  try {
+    await Api.stopInstance(instanceId, false);
+    showToast(t('dash.stopSent'), 'info');
+  } catch (error) {
+    showToast(`${t('dash.stopFailed')}: ${localizeBackendError(error.message)}`, 'error');
+  }
+}
+
 function renderHeaderStatus(instances) {
   lastInstances = Array.isArray(instances) ? instances : [];
+  renderModelCapsule(lastInstances);
   const dot = document.getElementById('header-status-dot');
   const text = document.getElementById('header-status-text');
   if (!dot || !text) return;
@@ -400,136 +494,223 @@ function renderSidebarStatus(instances) {
     </div>`;
 }
 
-// ========== 上下文面板（二级左栏） ==========
-// 页面模块可选导出 renderPanel(el, ctx) 来提供面板内容：
-//   - 未导出（或用户收起）→ 整列隐藏，主内容自动占满
+// ---------- 侧栏底部硬件芯片（LM Studio 式常驻读数） ----------
+//
+// 为什么放在侧栏底部而不是仪表盘：这两个数字（内存 / 显存占用）在**整个会话
+// 期间**都要能瞥见，而仪表盘是一个要主动跳过去的页面。LM Studio 把同样的
+// 读数钉在左下角，用户随时知道"还够不够再开一个实例"。
+//
+// 数据源是 /api/system/overview（已有接口，monitor 页在用）。轮询 8s：
+// 比 monitor 页的实时曲线慢，因为这里只需要"大致水位"，不需要波形。
+const HARDWARE_POLL_MS = 8000;
+let hardwareTimer = null;
+
+function formatPercent(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  return `${Math.round(n)}%`;
+}
+
+function formatGb(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  return n >= 10 ? String(Math.round(n)) : n.toFixed(1);
+}
+
+function renderHardwareChips(overview) {
+  const el = document.getElementById('sidebar-hardware');
+  if (!el) return;
+  if (!overview || typeof overview !== 'object') {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  const cpu = formatPercent(overview.cpu_percent);
+  const memUsed = formatGb(overview.memory_used_gb);
+  const memTotal = formatGb(overview.memory_total_gb);
+  const gpus = Array.isArray(overview.gpus) ? overview.gpus : [];
+  // 显存取**已用/总量**最大的那块卡（多卡时其余在仪表盘）。没有 GPU 数据
+  // 时整块不显示 —— 编一个 0% 比留白更误导。
+  //
+  // 字段名实测是 `memory_used_mb` / `memory_total_mb`（见
+  // `core/gpu_monitor.py` 的 snapshot）：早期代码按 `_gb` 读，于是显存芯片
+  // 永远显示"无 GPU 数据"，而机器其实有卡 —— 这类"字段名猜错"的静默降级
+  // 只有真跑一次 overview 才看得出来。
+  let vram = null;
+  for (const gpu of gpus) {
+    const usedMb = Number(gpu.memory_used_mb);
+    const totalMb = Number(gpu.memory_total_mb);
+    if (Number.isFinite(usedMb) && Number.isFinite(totalMb) && totalMb > 0) {
+      const ratio = usedMb / totalMb;
+      if (!vram || ratio > vram.ratio) {
+        vram = { used: usedMb / 1024, total: totalMb / 1024, ratio };
+      }
+    }
+  }
+  const vramText = vram
+    ? `${formatGb(vram.used)}/${formatGb(vram.total)} GB`
+    : t('sidebar.chipNoGpu');
+  const memText = `${memUsed}/${memTotal} GB`;
+  el.innerHTML = `
+    <span class="hardware-chip" title="${escapeHtml(t('sidebar.chipCpu'))}">
+      <span class="hardware-chip-key">${escapeHtml(t('sidebar.chipCpu'))}</span>
+      <span class="hardware-chip-value">${escapeHtml(cpu)}</span>
+    </span>
+    <span class="hardware-chip" title="${escapeHtml(t('sidebar.chipRam'))}">
+      <span class="hardware-chip-key">${escapeHtml(t('sidebar.chipRam'))}</span>
+      <span class="hardware-chip-value">${escapeHtml(memText)}</span>
+    </span>
+    <span class="hardware-chip${vram ? '' : ' is-empty'}" title="${escapeHtml(t('sidebar.chipVram'))}">
+      <span class="hardware-chip-key">${escapeHtml(t('sidebar.chipVram'))}</span>
+      <span class="hardware-chip-value">${escapeHtml(vramText)}</span>
+    </span>`;
+}
+
+async function pollHardware() {
+  try {
+    const overview = await Api.getSystemOverview();
+    renderHardwareChips(overview);
+  } catch {
+    // 后端重启/离线：保留上一次读数而不是清空（清空会让芯片闪一下）。
+    // 真正的"后端不可用"由顶栏状态点与横幅表达 —— 同一件事不报两遍。
+  }
+}
+
+function startHardwareChips() {
+  if (hardwareTimer) return;
+  pollHardware();
+  hardwareTimer = setInterval(pollHardware, HARDWARE_POLL_MS);
+}
+
+function stopHardwareChips() {
+  if (hardwareTimer) {
+    clearInterval(hardwareTimer);
+    hardwareTimer = null;
+  }
+}
+
+// ========== 侧栏列表（当前页面的列表直接长在导航栏里） ==========
+//
+// 1.0 第二轮把"二级列表列"整列删掉了。旧结构是：
+//
+//     [图标轨道] [列表列] [内容区]
+//
+// 三个分区各用一条边框分开，窗口被切成三条互不相干的带子；而"列表列"还要
+// 一个顶栏开关去控制显隐 —— 那个开关藏在右上角第三个位置，关掉之后没人知道
+// 怎么再打开。LM Studio 的做法是单列：导航项在上、当前页面的列表在下。
+// 于是窗口只剩"导航栏 + 内容"两条带子，也不需要任何"显示/隐藏列表"的开关。
+//
+// 页面模块可选导出 renderSidebarList(el, ctx) 来提供列表区内容：
+//   - 未导出 → 列表区为空并收起，只显示导航项
 //   - 导出后由 navigateTo() 在每次切页时重新渲染
-// 面板与页面共用同一个 ctx 对象，其中 ctx.refreshPanel() 可让页面在数据变化后
-// 主动重绘面板（例如参数 schema 异步加载完成后）。
+//
+// 列表项**不能**复用 .sidebar-item：core-paths 的"9 个导航项"断言与
+// renderSidebar() 的 navigateTo 绑定都按 .sidebar-item 选择，混用会让列表项
+// 被当成页面入口。列表项用 .sidebar-list-item + [data-list-key]。
 
-const PANEL_STATE_KEY = 'lunarshroud_panel_collapsed';
-const PANEL_DRAWER_QUERY = '(max-width: 900px)';
+/** 列表区宿主的 id。app.js 在 renderSidebar 里创建，各页面往里面渲染。 */
+const SIDEBAR_LIST_ID = 'sidebar-list-body';
 
-function isPanelDrawerMode() {
-  return window.matchMedia(PANEL_DRAWER_QUERY).matches;
-}
-
-function getPanelCollapsed() {
-  try {
-    return localStorage.getItem(PANEL_STATE_KEY) === '1';
-  } catch {
-    return false;
-  }
-}
-
-function pageHasPanel(pageId) {
+/**
+ * 当前页是否提供列表区内容。
+ *
+ * 与旧 pageHasPanel 的区别：现在没有"整列隐藏"这回事（列总是存在），
+ * 这里只决定列表区**占不占高度**。
+ */
+function pageHasList(pageId) {
   const entry = pageId ? pageInstances.get(pageId) : null;
-  if (!entry || typeof entry.module.renderPanel !== 'function') return false;
-  return entry.module.hasPanel ? entry.module.hasPanel() : true;
+  if (!entry || typeof entry.module.renderSidebarList !== 'function') return false;
+  return entry.module.hasSidebarList ? entry.module.hasSidebarList() : true;
 }
 
-function renderContextPanel(pageId) {
-  const panel = document.getElementById('context-panel');
-  const body = document.getElementById('context-panel-body');
-  const title = document.getElementById('context-panel-title');
-  if (!panel || !body) return;
+/**
+ * 重绘当前页面的列表区。
+ *
+ * 为什么每次都 `replaceChildren()` 而不是增量更新：列表内容由页面模块全权
+ * 生成（自己带搜索框、过滤器、分组），app.js 不该知道它们的结构。代价是
+ * 页面必须在数据没变时**不调用**它 —— 各页面已有这份判断（models 用
+ * searchKeyword 局部重绘、logs 用 instanceSignature 去重、knowledge 用轮询
+ * 节流）。
+ */
+function renderSidebarList(pageId) {
+  const host = document.getElementById(SIDEBAR_LIST_ID);
+  const wrap = document.getElementById('sidebar-list');
+  if (!host || !wrap) return;
 
   const entry = pageId ? pageInstances.get(pageId) : null;
-  // 窄屏下面板是抽屉：桌面端的"收起"偏好不应让页面列表彻底消失，
-  // 否则模型库/预设/日志在窄窗口里没有切换入口。
-  const usable = pageHasPanel(pageId) && (isPanelDrawerMode() || !getPanelCollapsed());
+  const usable = pageHasList(pageId);
 
+  // 列表区在无列表的页面整个收起（不占高度、不画分隔线）。
+  wrap.hidden = !usable;
   if (!usable) {
-    panel.hidden = true;
-    body.replaceChildren();
-  } else {
-    panel.hidden = false;
-    if (title) title.textContent = t('nav.' + pageId);
-    body.replaceChildren();
-    try {
-      entry.module.renderPanel(body, appCtx);
-    } catch (e) {
-      console.error(`[renderPanel ${pageId} failed]`, e);
-      body.replaceChildren();
-    }
-  }
-  syncPanelToggles();
-}
-
-function syncPanelToggles() {
-  const panel = document.getElementById('context-panel');
-  const toggle = document.getElementById('btn-panel-toggle');
-  const collapse = document.getElementById('btn-panel-collapse');
-  const visible = !!panel && !panel.hidden;
-  const drawerMode = isPanelDrawerMode();
-  const drawerOpen = document.body.classList.contains('panel-drawer-open');
-  if (panel) {
-    // 抽屉关闭时移出可访问树与 Tab 顺序；宽屏下面板始终可访问。
-    panel.inert = drawerMode && !drawerOpen;
-  }
-  if (toggle) {
-    // 当前页没有面板时置灰而不是隐藏：隐藏会让顶栏按钮左右跳动
-    const available = pageHasPanel(activePage);
-    toggle.disabled = !available;
-    const open = drawerMode ? drawerOpen : visible;
-    toggle.setAttribute('aria-pressed', String(available && open));
-    toggle.title = available ? t('panel.toggle') : t('panel.unavailable');
-  }
-  if (collapse) {
-    collapse.title = t('panel.collapse');
-  }
-}
-
-function closePanelDrawer({ restoreFocus = false } = {}) {
-  if (!document.body.classList.contains('panel-drawer-open')) return;
-  document.body.classList.remove('panel-drawer-open');
-  const backdrop = document.getElementById('sidebar-backdrop');
-  const sidebar = document.getElementById('sidebar');
-  if (backdrop && !(sidebar && sidebar.classList.contains('show'))) {
-    backdrop.classList.remove('show');
-  }
-  syncPanelToggles();
-  if (restoreFocus) {
-    const toggle = document.getElementById('btn-panel-toggle');
-    if (toggle && toggle.isConnected) toggle.focus({ preventScroll: true });
-  }
-}
-
-function openPanelDrawer() {
-  if (!isPanelDrawerMode()) return;
-  closeMobileSidebar();
-  document.body.classList.add('panel-drawer-open');
-  const backdrop = document.getElementById('sidebar-backdrop');
-  if (backdrop) backdrop.classList.add('show');
-  syncPanelToggles();
-  const collapse = document.getElementById('btn-panel-collapse');
-  if (collapse && collapse.isConnected) collapse.focus({ preventScroll: true });
-}
-
-function setPanelCollapsed(collapsed) {
-  if (isPanelDrawerMode()) {
-    if (collapsed) closePanelDrawer({ restoreFocus: true });
+    host.replaceChildren();
     return;
   }
-  try {
-    localStorage.setItem(PANEL_STATE_KEY, collapsed ? '1' : '0');
-  } catch {
-    // 忽略持久化失败（隐私模式等）
-  }
-  renderContextPanel(activePage);
-}
 
-function togglePanel() {
-  if (isPanelDrawerMode()) {
-    if (document.body.classList.contains('panel-drawer-open')) {
-      closePanelDrawer({ restoreFocus: true });
+  // 标题与主行动由**页面自己**声明，而不是在这里猜 `t('nav.' + pageId)`：
+  // workspace / observability 是聚合页，标题必须跟着当前 tab 走
+  // （"模型工作区"下切到运行环境时，标题该是"运行环境"）。
+  const titleEl = document.getElementById('sidebar-list-title');
+  const actionEl = document.getElementById('sidebar-list-action');
+  const declaredTitle =
+    (typeof entry.module.sidebarListTitle === 'function' && entry.module.sidebarListTitle()) ||
+    (entry.module.sidebarListTitleKey ? t(entry.module.sidebarListTitleKey) : '') ||
+    t('nav.' + pageId);
+  if (titleEl) titleEl.textContent = declaredTitle;
+
+  const action =
+    typeof entry.module.sidebarListAction === 'function' ? entry.module.sidebarListAction() : null;
+  if (actionEl) {
+    if (action) {
+      actionEl.hidden = false;
+      actionEl.textContent = action.label || '+';
+      actionEl.title = action.title || action.label || '';
+      actionEl.setAttribute('aria-label', action.title || action.label || '');
+      // onclick 直接覆盖：每次重绘都重新赋值，不会累积监听器。
+      actionEl.onclick = () => action.onClick();
     } else {
-      openPanelDrawer();
+      actionEl.hidden = true;
+      actionEl.textContent = '';
+      actionEl.onclick = null;
     }
-    return;
   }
-  setPanelCollapsed(!getPanelCollapsed());
+
+  host.replaceChildren();
+  try {
+    entry.module.renderSidebarList(host, appCtx);
+  } catch (e) {
+    console.error(`[renderSidebarList ${pageId} failed]`, e);
+    host.replaceChildren();
+  }
 }
+
+/**
+ * 逐字符输入时重绘列表，但保留搜索框的焦点与光标。
+ *
+ * 列表整块重建会把 <input> 换掉，焦点随之丢失 —— 用户敲第二个字时键盘
+ * 事件就落到 body 上了。models 与 chat 的搜索框都会踩这个坑，所以统一
+ * 在这里做：记住 activeElement 的 id 与 selectionStart，重建后恢复。
+ */
+function refreshSidebarListPreservingFocus() {
+  const active = document.activeElement;
+  const focusId = active && active.id ? active.id : '';
+  const caret =
+    focusId && typeof active.selectionStart === 'number' ? active.selectionStart : null;
+  renderSidebarList(activePage);
+  if (!focusId) return;
+  const restored = document.getElementById(focusId);
+  if (!restored || typeof restored.focus !== 'function') return;
+  restored.focus({ preventScroll: true });
+  if (caret !== null && typeof restored.setSelectionRange === 'function') {
+    try {
+      restored.setSelectionRange(caret, caret);
+    } catch {
+      // 非文本输入（number 等）不支持 setSelectionRange，忽略即可
+    }
+  }
+}
+
+// ========== 路由 ==========
 
 // ========== 路由 ==========
 
@@ -538,6 +719,7 @@ function renderSidebar() {
     dashboard: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>',
     models: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>',
     chat: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
+    api_server: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></svg>',
     param_editor: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>',
     presets: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>',
     knowledge: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/><line x1="9" y1="7" x2="15" y2="7"/><line x1="9" y1="11" x2="15" y2="11"/></svg>',
@@ -551,45 +733,73 @@ function renderSidebar() {
   };
   const sidebar = document.getElementById('sidebar');
   const pageById = new Map(PAGES.map((p) => [p.id, p]));
-  sidebar.innerHTML =
-    NAV_GROUPS.map((group, index) => {
-      const items = group.pages
-        .map((id) => {
-          const p = pageById.get(id);
-          if (!p) return '';
-          const label = t('nav.' + id);
-          const modal = isModalPage(p);
-          return `
+
+  // 三段结构：导航项（自然高度）/ 列表区（flex:1 可滚）/ 底部动作（固定）。
+  // 导航项单独包一层 .sidebar-nav，这样列表区滚动时不会把导航项一起滚走。
+  const navHtml = NAV_GROUPS.map((group) => {
+    const items = group.pages
+      .map((id) => {
+        const p = pageById.get(id);
+        if (!p) return '';
+        const label = t('nav.' + id);
+        const modal = isModalPage(p);
+        return `
         <button type="button" class="sidebar-item" data-page="${escapeHtml(id)}"
           title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}"
           ${modal ? 'aria-haspopup="dialog"' : ''}>
           <span class="icon" aria-hidden="true">${icons[id] || ''}</span>
           <span class="label">${escapeHtml(label)}</span>
         </button>`;
-        })
-        .join('');
-      return `${index === NAV_GROUPS.length - 1 ? '<div class="sidebar-spacer"></div>' : ''}
+      })
+      .join('');
+    return `
       <div class="sidebar-group" data-group="${escapeHtml(group.key)}">
         <div class="sidebar-group-label">${escapeHtml(t(group.labelKey))}</div>
         ${items}
       </div>`;
-    })
-    .join('') +
-    `
+  }).join('');
+
+  sidebar.innerHTML = `
+    <div class="sidebar-nav">${navHtml}</div>
+    <!-- 当前页面的列表。没有列表的页面整块 hidden（样式与 DOM 都不占位）。 -->
+    <section class="sidebar-list" id="sidebar-list" hidden>
+      <div class="sidebar-list-head">
+        <span class="sidebar-list-title" id="sidebar-list-title"></span>
+        <button type="button" class="btn btn-ghost btn-icon btn-sm" id="sidebar-list-action"
+          hidden aria-label="" title=""></button>
+      </div>
+      <div class="sidebar-list-body" id="${SIDEBAR_LIST_ID}"></div>
+    </section>
     <div class="sidebar-footer">
-      <div class="sidebar-status" id="sidebar-status" role="status"></div>
-      <button type="button" class="sidebar-collapse" id="btn-sidebar-collapse">
+      <!-- 设置是**动作**而不是导航目的地：它打开浮层、不改变路由。
+           刻意用 .sidebar-action 而不是 .sidebar-item —— 后者是页面入口的
+           选择器（navigateTo 绑定、导航计数、aria-current 都按它查询），
+           混用会让"点设置"被当成一次路由跳转。 -->
+      <button type="button" class="sidebar-action" id="btn-sidebar-settings"
+        aria-haspopup="dialog"
+        title="${escapeHtml(t('nav.settings'))}" aria-label="${escapeHtml(t('nav.settings'))}">
+        <span class="icon" aria-hidden="true">${icons.settings}</span>
+        <span class="label">${escapeHtml(t('nav.settings'))}</span>
+      </button>
+      <button type="button" class="sidebar-collapse" id="btn-sidebar-collapse"
+        title="${escapeHtml(t('sidebar.collapse'))}" aria-label="${escapeHtml(t('sidebar.collapse'))}">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="11 17 6 12 11 7"/><polyline points="18 17 13 12 18 7"/></svg>
         <span class="label">${escapeHtml(t('sidebar.collapse'))}</span>
       </button>
     </div>`;
   sidebar.setAttribute('aria-label', t('nav.label'));
-  sidebar.querySelectorAll('.sidebar-item').forEach((el) => {
+  // 只给真正的页面入口绑 navigateTo。列表项由页面模块自己绑事件。
+  sidebar.querySelectorAll('.sidebar-item[data-page]').forEach((el) => {
     el.addEventListener('click', () => navigateTo(el.dataset.page));
   });
   const collapseBtn = sidebar.querySelector('#btn-sidebar-collapse');
   if (collapseBtn) {
-    collapseBtn.addEventListener('click', () => setSidebarCollapsed(!getSidebarCollapsed()));
+    collapseBtn.addEventListener('click', () => setSidebarCollapsed(true));
+  }
+  // 设置是模态动作，但它在这套布局里属于"底部动作"，不是导航分组里的一项。
+  const settingsBtn = sidebar.querySelector('#btn-sidebar-settings');
+  if (settingsBtn) {
+    settingsBtn.addEventListener('click', () => navigateTo('settings'));
   }
   applySidebarState();
 }
@@ -618,30 +828,52 @@ function applySidebarState() {
   const sidebar = document.getElementById('sidebar');
   if (!sidebar) return;
   const collapsed = getSidebarCollapsed();
+  // 收起 = **整列隐藏**。刻意没有"图标轨道"中间态：68px 的窄条里图标没地方
+  // 放文字，收起来必然难看（这是上一轮被指出的问题之一）。
   sidebar.classList.toggle('collapsed', collapsed);
-  const btn = document.getElementById('btn-sidebar-collapse');
-  if (btn) {
-    const label = t(collapsed ? 'sidebar.expand' : 'sidebar.collapse');
-    btn.title = label;
-    btn.setAttribute('aria-label', label);
-    btn.setAttribute('aria-pressed', String(collapsed));
-    const svg = btn.querySelector('svg');
-    if (svg) svg.classList.toggle('flipped', collapsed);
+  document.body.classList.toggle('sidebar-collapsed', collapsed);
+
+  // 内联宽度必须先清掉再交给 CSS：拖拽手柄写的是 `style.width`，内联样式的
+  // 优先级高于 `.sidebar.collapsed { width: 0 }`，不清的话收起后仍是原宽度。
+  if (collapsed) {
+    sidebar.style.removeProperty('width');
   }
+
+  syncSidebarToggle();
+
+  // 拖拽手柄在收起态没有意义（列是 0 宽），一并隐藏。
+  const resizer = document.querySelector('.sidebar-resizer-wrap');
+  if (resizer) resizer.hidden = collapsed;
+}
+
+/** 顶栏汉堡按钮的可见性：侧栏不可见时才出现（桌面收起 / 窄屏抽屉关闭）。 */
+function syncSidebarToggle() {
+  const toggle = document.getElementById('btn-sidebar-toggle');
+  if (!toggle) return;
+  const sidebar = document.getElementById('sidebar');
+  const drawerOpen = Boolean(sidebar && sidebar.classList.contains('show'));
+  toggle.hidden = !(getSidebarCollapsed() || (isMobileDrawerMode() && !drawerOpen));
+}
+
+/** 窄屏（≤900px）时侧栏是抽屉而不是常驻列。 */
+function isMobileDrawerMode() {
+  return window.matchMedia('(max-width: 900px)').matches;
 }
 
 function closeMobileSidebar() {
-  document.getElementById('sidebar').classList.remove('show');
+  const sidebar = document.getElementById('sidebar');
+  if (sidebar) sidebar.classList.remove('show');
   const backdrop = document.getElementById('sidebar-backdrop');
-  if (backdrop && !document.body.classList.contains('panel-drawer-open')) {
-    backdrop.classList.remove('show');
-  }
+  if (backdrop) backdrop.classList.remove('show');
+  syncSidebarToggle();
 }
 
 function openMobileSidebar() {
-  closePanelDrawer();
-  document.getElementById('sidebar').classList.add('show');
-  document.getElementById('sidebar-backdrop').classList.add('show');
+  const sidebar = document.getElementById('sidebar');
+  if (sidebar) sidebar.classList.add('show');
+  const backdrop = document.getElementById('sidebar-backdrop');
+  if (backdrop) backdrop.classList.add('show');
+  syncSidebarToggle();
 }
 
 function toggleMobileSidebar() {
@@ -672,7 +904,6 @@ function openModalPage(mod) {
 
 function navigateTo(pageId) {
   const target = PAGES.find((p) => p.id === pageId);
-  closePanelDrawer();
   if (isModalPage(target)) {
     closeMobileSidebar();
     openModalPage(target);
@@ -699,8 +930,8 @@ function navigateTo(pageId) {
   entry.root.classList.add('active');
   activePage = pageId;
   document.title = `${t('nav.' + pageId)} · LunarShroud`;
-  // 二级左栏内容随页面切换
-  renderContextPanel(pageId);
+  // 侧栏列表区随页面切换（没有列表的页面整块收起）
+  renderSidebarList(pageId);
   // 窄屏下点击导航后自动收起侧边栏
   closeMobileSidebar();
   if (typeof entry.module.onShow === 'function') {
@@ -749,66 +980,61 @@ function initLayout() {
     langBtn.addEventListener('click', cycleLocale);
   }
 
-  // 窄屏侧边栏切换
+  // 侧栏开关：桌面端"从收起恢复"与窄屏"打开抽屉"是同一件事，共用一个按钮。
   const sidebarToggle = document.getElementById('btn-sidebar-toggle');
   const sidebarBackdrop = document.getElementById('sidebar-backdrop');
   if (sidebarToggle) {
-    // index.html 静态留空（写死中文会漏翻），文案在这里注入
     const label = t('app.sidebarToggle');
     sidebarToggle.title = label;
     sidebarToggle.setAttribute('aria-label', label);
-    sidebarToggle.addEventListener('click', toggleMobileSidebar);
+    sidebarToggle.addEventListener('click', () => {
+      if (isMobileDrawerMode()) toggleMobileSidebar();
+      else setSidebarCollapsed(false);
+    });
   }
   if (sidebarBackdrop) {
-    sidebarBackdrop.addEventListener('click', () => {
+    sidebarBackdrop.addEventListener('click', () => closeMobileSidebar());
+  }
+  // 视口跨过 900px 时要重算汉堡按钮的显隐：拖窄窗口后侧栏变抽屉、按钮必须
+  // 出现，否则用户没有任何入口打开导航。用媒体查询监听而不是 resize 事件，
+  // 因为后者每次拖动都触发、而这里只在跨断点时才需要做事。
+  const drawerMedia = window.matchMedia('(max-width: 900px)');
+  const onDrawerModeChange = () => {
+    if (!drawerMedia.matches) {
+      // 从窄屏拖回宽屏：抽屉状态必须清掉，否则侧栏会带着 .show 停在那里。
       closeMobileSidebar();
-      closePanelDrawer({ restoreFocus: true });
-    });
-  }
-
-  // 二级左栏：顶栏按钮负责"收起/展开"，面板头部按钮负责"收起"
-  const panelToggle = document.getElementById('btn-panel-toggle');
-  const panelCollapse = document.getElementById('btn-panel-collapse');
-  if (panelToggle) panelToggle.addEventListener('click', togglePanel);
-  if (panelCollapse) {
-    panelCollapse.addEventListener('click', () => {
-      if (isPanelDrawerMode()) closePanelDrawer({ restoreFocus: true });
-      else setPanelCollapsed(true);
-    });
-  }
-  // 抽屉里选中模型/预设/实例后自动收起，避免遮住刚打开的内容。
-  const panelBody = document.getElementById('context-panel-body');
-  if (panelBody) {
-    panelBody.addEventListener('click', (event) => {
-      if (!isPanelDrawerMode()) return;
-      if (event.target.closest('button, a')) closePanelDrawer();
-    });
-  }
-  // 从窄屏拖宽后，抽屉状态与 inert 必须归零，否则面板会被永久隔离。
-  const panelModeMedia = window.matchMedia(PANEL_DRAWER_QUERY);
-  const onPanelModeChange = () => {
-    if (!panelModeMedia.matches) closePanelDrawer();
-    syncPanelToggles();
+      applySidebarState();
+    }
+    syncSidebarToggle();
   };
-  if (typeof panelModeMedia.addEventListener === 'function') {
-    panelModeMedia.addEventListener('change', onPanelModeChange);
-  } else if (typeof panelModeMedia.addListener === 'function') {
-    panelModeMedia.addListener(onPanelModeChange);
+  if (typeof drawerMedia.addEventListener === 'function') {
+    drawerMedia.addEventListener('change', onDrawerModeChange);
+  } else if (typeof drawerMedia.addListener === 'function') {
+    drawerMedia.addListener(onDrawerModeChange);
   }
 
   // 居中模型选择器：按钮文案在这里注入（index.html 是静态的，写死中文会漏翻）
   const pickerBtn = document.getElementById('btn-model-picker');
   if (pickerBtn) {
-    pickerBtn.innerHTML = `${escapeHtml(t('app.pickModel'))} <span class="kbd">Ctrl+L</span>`;
-    pickerBtn.title = t('app.pickModel');
-    pickerBtn.addEventListener('click', () => openModelPicker(appCtx));
+    // 先用空态文案占位；实例列表到达后 renderModelCapsule() 会改成当前模型名。
+    renderModelCapsule([]);
+    // **委托一次**：renderModelCapsule 在每次实例推送时重写 innerHTML，
+    // 绑在内部节点上的监听器下一次推送就没了。
+    pickerBtn.addEventListener('click', (event) => {
+      const stopBtn = event.target.closest('[data-capsule-stop]');
+      if (stopBtn) {
+        event.stopPropagation();
+        void stopCapsuleInstance(stopBtn.dataset.capsuleStop);
+        return;
+      }
+      openModelPicker(appCtx);
+    });
   }
 
   // 全局 ESC 关闭 Modal 与窄屏侧边栏
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       closeModal();
-      closePanelDrawer({ restoreFocus: true });
       closeMobileSidebar();
       return;
     }
@@ -829,6 +1055,8 @@ function initLayout() {
 
   // 实例状态中心（WS 推送 + 轮询兜底），顶栏状态指示由它驱动
   startInstanceFeed();
+  // 侧栏底部常驻硬件读数（内存 / 显存 / CPU）
+  startHardwareChips();
 }
 
 function showAbout() {
@@ -916,12 +1144,76 @@ function boot() {
   initTooltips(document);
   appCtx = buildAppContext();
   // 让页面能在自己的数据变化后重绘二级面板
-  appCtx.refreshPanel = () => renderContextPanel(activePage);
+  // 页面在数据变化后主动重绘侧栏列表（例如参数 schema 异步加载完成）。
+  // 保留 refreshPanel 作为别名：15 处既有调用点还没全部改名，
+  // 而漏改一处就会在浏览器 console 留下 TypeError（测试会因此变红）。
+  appCtx.refreshList = () => renderSidebarList(activePage);
+  appCtx.refreshPanel = appCtx.refreshList;
+  // 逐字符输入时重绘列表并保留搜索框焦点（models / chat 的搜索框用）。
+  appCtx.refreshListKeepFocus = () => refreshSidebarListPreservingFocus();
   initLayout();
+  initSidebarResizers();
   renderSidebar();
   initPages();
   navigateTo('dashboard');
   console.log('[LunarShroud] frontend ready');
+}
+
+/**
+ * 接上侧栏的拖拽手柄，并把宽度存进配置。
+ *
+ * 存配置而不是 localStorage：换机器、清缓存、换 WebView 数据目录后布局都
+ * 应该还在（打包态下 WebView 数据目录是可被清理的，见 AGENTS §2.18）。
+ * 写回走防抖且只在松手时提交，避免拖动过程中每一帧都发一个 PUT。
+ *
+ * 1.0 第二轮只剩一个手柄：独立的列表列被删掉了，`chat_panel_width` 现在
+ * 由 Chat 自己的右侧参数面板使用（见 chat.js 的 initInspectorResizer）。
+ */
+function initSidebarResizers() {
+  const sidebar = document.getElementById('sidebar');
+  const sidebarHandle = document.getElementById('sidebar-resizer');
+  if (!sidebar || !sidebarHandle) return;
+
+  let commitTimer = null;
+  let pendingWidth = null;
+
+  const commit = (width) => {
+    pendingWidth = width;
+    if (commitTimer) clearTimeout(commitTimer);
+    commitTimer = setTimeout(async () => {
+      const value = pendingWidth;
+      pendingWidth = null;
+      commitTimer = null;
+      if (value === null) return;
+      try {
+        await Api.updateSystemConfig({ chat_sidebar_width: value });
+      } catch (error) {
+        // 保存失败不回滚视觉：宽度立即生效是用户的操作预期，
+        // "重新打开回到旧值"才是没保存的真实表现。
+        console.warn('[LunarShroud] 保存侧栏宽度失败:', error && error.message);
+      }
+    }, 500);
+  };
+
+  attachResizer({
+    handle: sidebarHandle,
+    target: sidebar,
+    startWidth: SIDEBAR_LIMITS.default,
+    limits: SIDEBAR_LIMITS,
+    onCommit: commit,
+  });
+
+  // 配置到达后应用保存过的宽度。失败就用 CSS 默认值 —— 布局是纯装饰，
+  // 不该因为一次配置请求失败而挡住界面。
+  (async () => {
+    try {
+      const config = await Api.getSystemConfig();
+      const widths = readSidebarWidths(config);
+      sidebar.style.width = `${widths.sidebar}px`;
+    } catch {
+      /* 保持 CSS 默认值 */
+    }
+  })();
 }
 
 // DOM 就绪后启动

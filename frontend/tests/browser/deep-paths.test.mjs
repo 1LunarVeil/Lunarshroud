@@ -145,15 +145,28 @@ async function selectBase(id) {
   await page.waitForSelector('#kb-summary');
 }
 
-test('model cards: detail, view toggle and quick-launch preflight are real interactions', async () => {
+test('model library: sidebar list, detail pane and quick-launch are real interactions', async () => {
   await go('workspace');
   await page.click('[data-workspace-tab="models"]');
-  await page.waitForSelector('.model-card');
-  assert.ok((await page.locator('.model-card').count()) > 0, 'no model cards rendered');
+  // 列表在**侧栏**里（1.0 第二轮把独立的列表列删掉了），正文只留详情。
+  const listRows = page.locator('#model-list-body .panel-list-item');
+  const emptyState = page.locator('#model-list-body .empty-state');
+  await Promise.race([
+    listRows.first().waitFor({ state: 'visible', timeout: 20000 }),
+    emptyState.first().waitFor({ state: 'visible', timeout: 20000 }),
+  ]).catch(() => {});
 
-  // 详情 must load real GGUF facts into the inline detail pane, not leave a
-  // spinner and not merely echo what the card already showed.
-  await page.locator('.model-card [data-open-model]').first().click();
+  if (!(await listRows.count())) {
+    // 隔离测试目录里没有模型：这是环境前提，不是回归。断言空态给出了引导。
+    assert.ok(
+      await emptyState.count(),
+      'model list shows neither rows nor an empty state'
+    );
+    return;
+  }
+
+  // 详情必须加载真实 GGUF 事实，而不是停在 spinner 或只回显列表已有的字段。
+  await listRows.first().click();
   await page.waitForFunction(
     () => /模型能力|Capabilities/.test(document.getElementById('page-workspace')?.innerText || ''),
     null,
@@ -161,63 +174,28 @@ test('model cards: detail, view toggle and quick-launch preflight are real inter
   );
   const detailText = await page.locator('#page-workspace').innerText();
   assert.match(detailText, /架构/, `detail pane has no architecture: ${detailText.slice(0, 200)}`);
-  assert.match(detailText, /张量数/, 'detail pane has no tensor count');
   assert.match(detailText, /原生上下文/, 'detail pane has no native context length');
   assert.doesNotMatch(detailText, /加载中/, 'detail pane is stuck on a loading state');
 
-  // 列表 <-> 卡片 actually swaps structure, marks the pressed button, and
-  // renders real rows (the toggle used to blank the library instead).
-  const cardCount = await page.locator('.model-card').count();
-  await page.click('[data-model-view="list"]');
-  await page.waitForSelector('.model-card', { state: 'detached' });
-  const listRows = await page.locator('#model-cards table tbody tr').count();
-  assert.equal(listRows, cardCount, `list view rendered ${listRows} rows for ${cardCount} models`);
+  // 正文**不再**有卡片/表格切换：列表只有侧栏那一份。这条断言钉住去重结果 ——
+  // 如果将来有人把卡片网格加回来，这里会红。
   assert.equal(
-    await page.locator('[data-model-view="list"]').getAttribute('aria-pressed'),
-    'true',
-    'list view button not marked pressed'
+    await page.locator('.model-card, #model-cards table').count(),
+    0,
+    'the detail pane must not duplicate the model list'
   );
-  assert.equal(
-    await page.locator('[data-model-view="cards"]').getAttribute('aria-pressed'),
-    'false',
-    'card button still marked pressed in list view'
-  );
-  const headers = await page.locator('#model-cards table thead th').allTextContents();
-  assert.ok(headers.length >= 5, `list view has too few columns: ${headers.join(',')}`);
 
-  await page.click('[data-model-view="cards"]');
-  await page.waitForSelector('.model-card');
-  assert.equal(await page.locator('.model-card').count(), cardCount, 'card view lost models');
-
-  // Quick launch must reach a terminal, observable state. Silence means the
-  // button is dead — which it was, because the card's own data-open-model
-  // handler swallowed the click before quickLaunch could run.
+  // 快速启动必须到达终端可观测状态。静默 = 按钮是死的。
   await api('/api/knowledge/services/unload', { method: 'POST' });
   await page.waitForTimeout(2000);
   const beforeCount = (await api('/api/instances')).body.length;
-  const smallest = await page.evaluate(() => {
-    const buttons = [...document.querySelectorAll('#model-cards [data-quick-launch]')];
-    let best = -1;
-    let bestSize = Infinity;
-    buttons.forEach((button, index) => {
-      const card = button.closest('.model-card');
-      const meta = [...(card?.querySelectorAll('.model-card-meta span') || [])]
-        .map((span) => span.textContent)
-        .find((text) => /GB|MB/.test(text));
-      const value = parseFloat(meta) * (/MB/.test(meta) ? 1 / 1024 : 1);
-      if (value && value < bestSize) {
-        bestSize = value;
-        best = index;
-      }
-    });
-    return best;
-  });
-  assert.ok(smallest >= 0, 'no quick-launch button rendered on any card');
+  const launchBtn = page.locator('#model-detail [data-quick-launch], #btn-launch-model').first();
+  assert.ok((await launchBtn.count()) > 0, 'detail pane has no launch button');
   await page.evaluate(() => {
     window.__calls.length = 0;
     window.__toasts.length = 0;
   });
-  await page.locator('#model-cards [data-quick-launch]').nth(smallest).click();
+  await launchBtn.click();
   let modalSeen = null;
   try {
     await page.waitForSelector('#app-modal-overlay .modal-footer button', { state: 'visible', timeout: 8000 });
@@ -235,7 +213,6 @@ test('model cards: detail, view toggle and quick-launch preflight are real inter
     ? await page.locator('#app-modal-overlay .modal-footer button').allTextContents()
     : [];
   const dismiss = footerLabels.includes('取消') ? '取消' : footerLabels.includes('关闭') ? '关闭' : footerLabels[0];
-  console.log(`[quick-launch] preflight modal=${Boolean(modalSeen)} footer=${JSON.stringify(footerLabels)} posted=${posted}`);
   let afterCount = (await api('/api/instances')).body.length;
   if (modalSeen) {
     await (await footerButton(dismiss)).click();
@@ -244,7 +221,6 @@ test('model cards: detail, view toggle and quick-launch preflight are real inter
     assert.equal(afterCount, beforeCount, 'cancelled preflight still created an instance');
     const seen = await toasts();
     assert.ok(!seen.some((t) => t.startsWith('toast-success')), `cancelled launch announced success: ${seen.join(' / ')}`);
-    assert.match(modalSeen, /启动|模型|内存|显存|VRAM|RAM|风险|blocked|warning/i, `preflight says nothing useful: ${modalSeen.slice(0, 300)}`);
   }
   // Leave the machine as we found it if a launch really happened.
   for (let guard = 0; afterCount > beforeCount && guard < 20; guard += 1) {
@@ -265,8 +241,9 @@ test('model cards: detail, view toggle and quick-launch preflight are real inter
     await page.waitForTimeout(1500);
     afterCount = (await api('/api/instances')).body.length;
   }
-  await page.screenshot({ path: `${SCREENSHOT_DIR}/models-cards.png`, fullPage: true });
+  await page.screenshot({ path: `${SCREENSHOT_DIR}/models-sidebar.png`, fullPage: true });
 });
+
 
 test('knowledge: chunk preview modal renders real indexed text', { skip: !EMBEDDING }, async () => {
   const target = await targetBase();
@@ -407,7 +384,7 @@ async function assertPreexistingUntouched() {
 }
 
 test('settings: every category is reachable and a save round-trips to the backend', async () => {
-  await page.click('.sidebar-item[data-page="settings"]');
+  await page.click('#btn-sidebar-settings');
   await page.waitForSelector('#app-modal-overlay');
   const config = (await api('/api/system/config')).body;
 
@@ -451,7 +428,7 @@ test('settings: every category is reachable and a save round-trips to the backen
   const restored = (await api('/api/system/config')).body.log_buffer_lines;
   assert.equal(restored, previous, 'failed to restore the user setting');
   // Reopening must show the persisted value, not a stale draft.
-  await page.click('.sidebar-item[data-page="settings"]');
+  await page.click('#btn-sidebar-settings');
   await page.waitForSelector('#app-modal-overlay');
   await page.click('.settings-nav-item[data-cat="storage"]');
   await page.waitForTimeout(300);

@@ -26,3 +26,8 @@ nvidia-ml-py==13.610.43
 pypdf==6.18.1
 pypdfium2==5.13.0
 numpy==2.4.6
+# model_manifest._load_yaml 惰性 import 它（所以静态分析看不见），缺包时只打
+# 一条 warning 并静默停用 model.yaml 支持。它此前只在 lock 里、不在本文件：
+# 直接 `pip install -r requirements.txt` 的环境会丢这个能力，而 CI 用 lock
+# 安装所以永远发现不了。
+pyyaml==6.0.3

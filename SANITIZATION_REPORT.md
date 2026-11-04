@@ -1,6 +1,6 @@
 # Sanitization Report
 
-Last reviewed: 2026-10-17 (Asia/Shanghai), release candidate `0.9.0-beta.2`.
+Last reviewed: 2026-11-03 (Asia/Shanghai), release `1.0.0`.
 
 This report describes the **current** public-source mirror. Earlier sections of
 this file described snapshots with 86 and 131 files and, at one point, built-in
@@ -13,7 +13,7 @@ tree.
   working directory. `tools/check_release_mirror.py` is the gate and the only
   supported way to refresh it (`--apply`), and it is fail-closed: missing,
   drifted, stale, forbidden and privacy-unscanned files all fail the check.
-- At this revision the mirror contains 154 source and documentation files. It
+- At this revision the mirror contains 244 source and documentation files. It
   contains no executables, installers, archives, logs, databases, coverage
   artifacts, virtual environments, screenshots, build outputs or runtime data.
 - `data/` is excluded as an entire directory: `config.json`, `history.db` (and

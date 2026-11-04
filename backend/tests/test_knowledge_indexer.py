@@ -25,16 +25,38 @@ def _fake_embedding(url, texts, **kwargs):
     return np.asarray(rows, dtype=np.float32)
 
 
+# OCR 是否经 `lease()` 取用（而不是裸 `acquire()`）。独立于 `calls`，
+# 因为现有用例用整体相等断言 `{embedding, ocr}`。
+_LEASE_CALLS: dict[str, int] = {"ocr": 0}
+
+
 @pytest.fixture
 def fake_services(monkeypatch):
     calls = {"embedding": 0, "ocr": 0}
+    # 单独记录，不污染 `calls` —— 现有用例按 {embedding, ocr} 的比较断言。
+    _LEASE_CALLS["ocr"] = 0
 
     def acquire(kind, model_path, mmproj=""):
         calls[kind] += 1
         return SimpleNamespace(kind=kind, base_url=f"http://127.0.0.1/{kind}",
                                model_path=model_path, mmproj=mmproj)
 
+    @contextlib.contextmanager
+    def lease(kind, model_path, mmproj=""):
+        # 真实 `lease()` 就是 acquire + 活跃计数，退出时减回去。
+        # 索引器对 OCR 与 embedding 都走 lease，所以替身必须两者都提供 ——
+        # 只 stub `acquire` 会让"OCR 必须用租约"这条修复在测试里直接
+        # AttributeError（替身形状与真实模块不一致导致的假绿/假红）。
+        handle = acquire(kind, model_path, mmproj)
+        if kind == "ocr":
+            _LEASE_CALLS["ocr"] += 1
+        try:
+            yield handle
+        finally:
+            pass
+
     monkeypatch.setattr(knowledge_services, "acquire", acquire)
+    monkeypatch.setattr(knowledge_services, "lease", lease)
     monkeypatch.setattr(knowledge_services, "release_kind", lambda kind: None)
     monkeypatch.setattr(llama_services, "embed_texts", _fake_embedding)
     return calls
@@ -137,6 +159,74 @@ def test_scanned_pdf_uses_ocr_once_and_caches_pages(store, fake_services, tmp_pa
     indexer._index_base(base["id"], force=True)
     assert ocr_calls == ["Text Recognition:"]
     assert fake_services == {"embedding": 2, "ocr": 1}
+    # OCR 必须经 lease() 取用，不能是裸 acquire()：裸 acquire 不会把 `_ACTIVE`
+    # 加一，而 acquire() 自己会启动空闲回收线程，于是超过
+    # IDLE_UNLOAD_SECONDS 的 OCR 作业会被自己的回收线程停掉（扫描版 PDF 单页
+    # 允许 300 s，三页就跨过 600 s）。红-绿：把 `_ocr_callback` 改回
+    # `knowledge_services.acquire(...)`，本断言必红。
+    assert _LEASE_CALLS["ocr"] >= 1
+
+
+def test_cancelling_mid_document_does_not_leave_it_stuck_at_indexing(
+    store, fake_services, tmp_path, monkeypatch
+):
+    """取消后不得留下一条永远 `indexing` 的文档。
+
+    `_stage_document` 先把行 upsert 成 `status="indexing"`，然后在提取后（或
+    提取中）抛 `IndexCancelled`。`_finish_cancelled` 只遍历 `staged`，而这条
+    文档还没被 staged —— 于是库状态是 "indexing cancelled"，文档却永远是
+    `indexing`、chunk_count=0；重启后 `mark_interrupted()` 还会把它改写成
+    "interrupted by a previous app session"，把原因也说错。
+
+    红-绿：把 `_finish_cancelled` 的 `in_flight_id` 分支去掉，本测试必红。
+    """
+    base = _base(store, chunk_chars=200, chunk_overlap=0)
+    path = tmp_path / "a.txt"
+    path.write_text("甲条款 " * 20, encoding="utf-8")
+    _add_document(store, base, path)
+    indexer = knowledge_indexer.KnowledgeIndexer()
+
+    original = knowledge_extract.extract_file
+
+    def cancelling_extract(*args, **kwargs):
+        indexer.cancel(base["id"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(knowledge_extract, "extract_file", cancelling_extract)
+    indexer._index_base(base["id"], force=True)
+
+    documents = store.list_documents(base["id"])
+    assert documents, "the document row must still exist"
+    statuses = [doc["status"] for doc in documents]
+    assert "indexing" not in statuses
+    assert "queued" not in statuses
+
+
+def test_growing_a_file_in_place_cannot_bypass_the_source_size_budget(
+    store, fake_services, tmp_path, monkeypatch
+):
+    """额度必须按本次将要入库的字节判定，而不是"库里旧大小 + 新增文件"。
+
+    一个已入库 100 MiB 的文件被原地换成 900 MiB（更高 DPI 重扫、日志追加）时，
+    `new_bytes` 只统计**新文件**，`existing_bytes` 用的是库里记录的旧值 ——
+    于是超限文件被接受，`_stage_document` 随后把真实大小写回去。§2.24 的
+    "写入前拒绝"只对新文件成立。
+
+    红-绿：把额度算回 `existing_bytes + new_bytes`，本测试必红。
+    """
+    base = _base(store)
+    source = tmp_path / "doc.txt"
+    source.write_bytes(b"a" * 100)
+
+    budget = 500
+    monkeypatch.setattr(knowledge_indexer, "MAX_SOURCE_BYTES_PER_KB", budget)
+    indexer = knowledge_indexer.KnowledgeIndexer()
+    indexer.add_sources(base["id"], [str(source)])
+
+    # 原地增长到远超预算（仍在该 base 里同一条记录）。
+    source.write_bytes(b"b" * (budget * 4))
+    with pytest.raises(ValueError, match="size budget"):
+        indexer.add_sources(base["id"], [str(source)])
 
 
 def test_chunk_cap_errors_without_deleting_previous_chunks(store, fake_services, tmp_path, monkeypatch):

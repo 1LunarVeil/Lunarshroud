@@ -332,6 +332,51 @@ def test_unfinished_history_rows_are_marked_interrupted(monkeypatch, tmp_path):
     assert history_store.mark_unfinished_as_interrupted() == 0
 
 
+def test_core_module_logs_reach_the_file_handler(monkeypatch, tmp_path):
+    """`core.*` 模块的日志必须真的写进 backend.log。
+
+    2026-11-02 实测缺陷：`core/*` 多数模块用 `logging.getLogger(__name__)`，
+    得到 `core.chat_store` 这类名字，**不是** `lunarshroud.backend` 的后代；
+    而 handler 挂在后者上并设了 `propagate=False`、root 又没有 handler ——
+    于是知识库索引失败、聊天库损坏、备份失败、预设损坏这些消息全部被丢弃。
+    用户安装目录的 backend.log 里只有 probe-warmup 一类走 main.LOGGER 的行。
+
+    这条测试不看 logger 配置的表面，而是**真的写一行日志再读文件**。
+    """
+    import logging
+
+    import main as backend_main
+
+    log_dir = tmp_path / "logs"
+    backend_main.configure_file_logging(log_dir)
+    try:
+        # 三个代表性模块：core（DB）、core（索引）、以及非 core 前缀的 presets
+        for name, message in (
+            ("core.chat_store", "MARKER-chat-store-warning"),
+            ("core.knowledge_indexer", "MARKER-indexer-warning"),
+            ("lunarshroud.presets", "MARKER-presets-warning"),
+        ):
+            logging.getLogger(name).warning(message)
+
+        for handler in logging.getLogger(backend_main.LOGGER_ROOT_NAME).handlers:
+            handler.flush()
+
+        text = (log_dir / "backend.log").read_text(encoding="utf-8")
+        for _name, message in (
+            ("core.chat_store", "MARKER-chat-store-warning"),
+            ("core.knowledge_indexer", "MARKER-indexer-warning"),
+            ("lunarshroud.presets", "MARKER-presets-warning"),
+        ):
+            assert message in text, f"{message} never reached backend.log; got:\n{text[:500]}"
+    finally:
+        # 清理：把本测试装的 handler 摘掉，避免污染后续用例的日志断言。
+        root = logging.getLogger(backend_main.LOGGER_ROOT_NAME)
+        for handler in list(root.handlers):
+            if getattr(handler, "_lunarshroud_managed", False):
+                root.removeHandler(handler)
+                handler.close()
+
+
 def test_startup_log_does_not_include_session_id(monkeypatch, tmp_path, caplog):
     """session_id 不是管理令牌，但也不该被写进可被分享的日志。
 
@@ -774,11 +819,22 @@ def test_schema_and_presets_expose_english_fields():
     for group in schema["groups"]:
         assert group["label_en"]
 
-    # 翻译覆盖必须与参数定义一一对应（无多余/缺失）
+    # 英文来源的**唯一性**由两条互补断言保证：
+    #  1) 每个参数在 schema 里都必须有非空 label_en/help_en（上面的循环）；
+    #  2) 两份过渡字典不得比定义多出孤儿条目，也不得漏掉任何定义。
+    # 单源化的终态是把英文写进 ParamMeta（`label_en`/`help_en` 字段已就位，
+    # schema 读取时优先取内联值）。迁移是逐参数进行的：已完成内联的参数
+    # 不再依赖字典，仍靠字典的参数由第 2 条钉住"字典必须覆盖它"。
+    # docs/ROADMAP.md §P2 记录了完整迁移步骤与 JSON diff 验收方式。
     from core.param_schema import PARAM_HELP_EN, PARAM_LABELS_EN
+
     defined = {p.key for p in PARAM_DEFINITIONS}
-    assert set(PARAM_LABELS_EN) == defined
-    assert set(PARAM_HELP_EN) == defined
+    inline = {p.key for p in PARAM_DEFINITIONS if p.label_en and p.help_en}
+    for key in defined - inline:
+        assert key in PARAM_LABELS_EN, f"{key} 既没内联英文，字典里也没有"
+        assert key in PARAM_HELP_EN, f"{key} 既没内联英文帮助，字典里也没有"
+    assert not (set(PARAM_LABELS_EN) - defined), "PARAM_LABELS_EN 有孤儿条目"
+    assert not (set(PARAM_HELP_EN) - defined), "PARAM_HELP_EN 有孤儿条目"
 
 
 def test_history_database_path_that_is_a_directory_is_quarantined(monkeypatch, tmp_path):
@@ -888,3 +944,39 @@ def test_database_quarantine_keeps_previous_corrupt_evidence(tmp_path):
     assert not source.exists()
     assert previous.read_bytes() == b"older evidence"
     assert any(p.name.startswith("history.db.corrupt.") for p in tmp_path.iterdir())
+
+
+def test_probe_warmup_resolves_every_main_attribute_it_uses():
+    """`api/lifecycle.py` 经 `import main` 取的每个名字都必须真的存在于 main。
+
+    2026-10-30 在打包态日志里实测到：
+
+        ERROR probe-warmup llama-server 能力探测预热失败（本轮降级为 schema 标记）
+        AttributeError: module 'main' has no attribute 'resolve_server_path'
+
+    它不是崩溃，只是**静默降级**：启动正常、聊天正常，只有参数界面失去
+    "按本机构建裁剪"的能力。既有的 lifespan 测试都把 `_warm_server_probe`
+    整个 patch 掉（`monkeypatch.setattr(backend_main, "_warm_server_probe", lambda: None)`），
+    所以真实实现从未被执行到 —— "被 patch 掉的路径"最容易漏检。
+
+    这里不跑真实探测（那要外部 exe），只静态核对名字存在性：lifecycle 引用了
+    main 的某属性，main 就必须有它。
+    """
+    import re
+
+    import main as backend_main
+
+    lifecycle_source = (
+        Path(__file__).resolve().parents[1] / "api" / "lifecycle.py"
+    ).read_text(encoding="utf-8-sig")
+
+    referenced = {
+        name
+        for name in re.findall(r"main\.([A-Za-z_][A-Za-z0-9_]*)", lifecycle_source)
+        if name not in {"py", "app"}
+    }
+    missing = sorted(name for name in referenced if not hasattr(backend_main, name))
+    assert not missing, (
+        "api/lifecycle.py 引用了 main 上不存在的名字，运行时会抛 AttributeError "
+        f"并被吞成'预热失败'降级：{missing}"
+    )

@@ -33,9 +33,7 @@ const SHOW_ALL_KEY = 'lunarshroud_models_show_all';
 const GROUP_MODELS_KEY = 'lunarshroud_models_group_by_model';
 let showAll = readShowAll();
 let groupByModel = readGroupByModel();
-let viewMode = readViewMode();
 let recentPaths = new Set();
-let viewButtons = [];
 
 function readShowAll() {
   try {
@@ -45,23 +43,6 @@ function readShowAll() {
   }
 }
 
-const VIEW_KEY = 'lunarshroud_models_view';
-
-function readViewMode() {
-  try {
-    return localStorage.getItem(VIEW_KEY) === 'list' ? 'list' : 'cards';
-  } catch {
-    return 'cards';
-  }
-}
-
-function writeViewMode(value) {
-  try {
-    localStorage.setItem(VIEW_KEY, value);
-  } catch {
-    /* storage unavailable */
-  }
-}
 
 function readGroupByModel() {
   try {
@@ -161,44 +142,19 @@ export function init(el, appCtx) {
         <div class="page-subtitle" id="models-subtitle">${ctx.escapeHtml(t('models.subtitle'))}</div>
       </div>
       <div class="page-actions">
-        <div class="segmented-control" role="group" aria-label="${ctx.escapeHtml(t('models.viewLabel'))}">
-          <button type="button" class="segmented-btn" data-model-view="cards" aria-pressed="true">${ctx.escapeHtml(t('models.viewCards'))}</button>
-          <button type="button" class="segmented-btn" data-model-view="list" aria-pressed="false">${ctx.escapeHtml(t('models.viewList'))}</button>
-        </div>
         <button class="btn btn-secondary" id="btn-models-rescan">${ctx.escapeHtml(t('models.rescan'))}</button>
       </div>
     </div>
-    <div id="model-cards" class="model-card-grid"></div>
     <div id="model-detail"></div>
   `;
   root.querySelector('#btn-models-rescan').addEventListener('click', () => refresh());
-  // workspace.js 会把 .page-actions 整块搬进共享工具栏，节点因此脱离本模块的
-  // root 子树：委托在 root 上永远收不到点击，也不再用 root 去查它们。
-  viewButtons = [...root.querySelectorAll('[data-model-view]')];
-  const viewGroup = root.querySelector('.segmented-control');
-  viewGroup.addEventListener('click', (event) => {
-    const view = event.target.closest('[data-model-view]');
-    if (!view) return;
-    viewMode = view.dataset.modelView;
-    writeViewMode(viewMode);
-    renderCards();
-  });
+  // 正文不再有模型列表：列表在侧栏。旧版的"卡片 / 表格"切换随重复列表一起
+  // 删掉了 —— 同一批模型在左栏和正文各列一遍，用户要点两次才知道哪份可操作。
+  // 详情里的"快速启动"按钮仍走委托（它嵌在详情卡里，与旧卡片无关）。
   root.addEventListener('click', (event) => {
-    // 快速启动 的按钮嵌在带 data-open-model 的卡片里：先匹配卡片就会把它吞掉，
-    // 所以更具体的动作必须排在前面。
     const quick = event.target.closest('[data-quick-launch]');
-    if (quick) {
-      quickLaunch(quick.dataset.quickLaunch, quick);
-      return;
-    }
-    const card = event.target.closest('[data-open-model]');
-    if (card) {
-      selectedPath = card.dataset.openModel;
-      ctx.refreshPanel();
-      renderDetail();
-    }
+    if (quick) quickLaunch(quick.dataset.quickLaunch, quick);
   });
-  syncViewControls();
 }
 
 export function onShow() {
@@ -233,9 +189,7 @@ async function refresh() {
     if (!models.some((m) => m.path === selectedPath)) {
       selectedPath = models.length ? models[0].path : null;
     }
-    ctx.refreshPanel();
-    syncViewControls();
-    renderCards();
+    ctx.refreshList?.();
     await renderDetail();
   } catch (e) {
     ctx.showToast(`${t('models.scanFailed')}: ${localizeBackendError(e.message)}`, 'error');
@@ -246,7 +200,12 @@ async function refresh() {
 
 // ========== 二级面板：模型列表 ==========
 
-export function renderPanel(el) {
+/** 侧栏列表的标题。 */
+export function sidebarListTitle() {
+  return t('nav.models');
+}
+
+export function renderSidebarList(el) {
   const hiddenCount = models.filter((m) => !isLoadable(m)).length;
   const groupable = hasGroupableModels(showAll ? models : models.filter(isLoadable));
   el.innerHTML = `
@@ -284,7 +243,7 @@ export function renderPanel(el) {
     toggle.addEventListener('change', (e) => {
       showAll = e.target.checked;
       writeShowAll(showAll);
-      renderPanel(el);
+      renderSidebarList(el);
     });
   }
   const groupToggle = el.querySelector('#model-group-toggle');
@@ -300,7 +259,6 @@ export function renderPanel(el) {
   input.addEventListener('input', () => {
     searchKeyword = input.value.trim().toLowerCase();
     renderListInto(el.querySelector('#model-list-body'));
-    renderCards();
   });
   renderListInto(el.querySelector('#model-list-body'));
 }
@@ -317,91 +275,6 @@ function visibleModels() {
     : base;
 }
 
-function syncViewControls() {
-  viewButtons.forEach((button) => {
-    const selected = button.dataset.modelView === viewMode;
-    button.setAttribute('aria-pressed', String(selected));
-    button.classList.toggle('active', selected);
-  });
-}
-
-function renderCards() {
-  syncViewControls();
-  const container = root.querySelector('#model-cards');
-  if (!container) return;
-  const visible = visibleModels();
-  container.hidden = false;
-  if (!visible.length) {
-    container.className = 'model-card-grid';
-    container.innerHTML = emptyStateHtml(ctx, {
-      icon: 'layers',
-      title: t(directory ? 'models.empty' : 'models.noDir'),
-      sub: t(directory ? 'models.emptySub' : 'models.noDirSub'),
-    });
-    return;
-  }
-  if (viewMode !== 'cards') {
-    container.className = 'table-wrap';
-    container.innerHTML = modelTableHtml(visible);
-    return;
-  }
-  container.className = 'model-card-grid';
-  container.innerHTML = visible.map((model) => {
-    const caps = model.capabilities || {};
-    const loadable = isLoadable(model);
-    const meta = [model.quant, model.size_human, caps.architecture].filter(Boolean);
-    if (caps.probed && caps.context_length) meta.push(`${ctx.escapeHtml(t('models.contextLabel'))} ${caps.context_length}`);
-    return `
-      <article class="model-card ${selectedPath === model.path ? 'selected' : ''}" data-open-model="${ctx.escapeHtml(model.path)}" tabindex="0" role="button" aria-label="${ctx.escapeHtml(model.filename)}">
-        <div class="model-card-head">
-          <div class="model-card-title" title="${ctx.escapeHtml(model.path)}">${ctx.escapeHtml(model.filename)}</div>
-          ${recentPaths.has(model.path) ? `<span class="tag">${ctx.escapeHtml(t('models.recent'))}</span>` : ''}
-        </div>
-        <div class="model-card-meta">${meta.map((item) => `<span>${ctx.escapeHtml(String(item))}</span>`).join('')}</div>
-        <div class="model-card-tags">${badgeHtml(caps)}</div>
-        <div class="model-card-actions">
-          <button class="btn btn-sm btn-secondary" data-open-model="${ctx.escapeHtml(model.path)}">${ctx.escapeHtml(t('models.details'))}</button>
-          ${loadable ? `<button class="btn btn-sm btn-primary" data-quick-launch="${ctx.escapeHtml(model.path)}">${ctx.escapeHtml(t('models.quickLaunch'))}</button>` : ''}
-        </div>
-      </article>`;
-  }).join('');
-}
-
-// 列表视图：一个目录里几十个 GGUF 时，卡片要把文件名截断到认不出来，
-// 表格能按列对齐比较量化/大小/上下文，所以保留它而不是删掉开关。
-function modelTableHtml(list) {
-  const rows = list
-    .map((model) => {
-      const caps = model.capabilities || {};
-      const loadable = isLoadable(model);
-      return `<tr${selectedPath === model.path ? ' class="selected"' : ''}>
-        <td class="models-name" title="${ctx.escapeHtml(model.path)}">${ctx.escapeHtml(model.filename)}${
-          recentPaths.has(model.path) ? ` <span class="tag">${ctx.escapeHtml(t('models.recent'))}</span>` : ''
-        }</td>
-        <td>${ctx.escapeHtml(String(model.quant || '-'))}</td>
-        <td>${ctx.escapeHtml(model.size_human || '-')}</td>
-        <td>${ctx.escapeHtml(String(caps.architecture || '-'))}</td>
-        <td>${caps.probed && caps.context_length ? ctx.escapeHtml(String(caps.context_length)) : '-'}</td>
-        <td class="models-actions">
-          <button class="btn btn-sm btn-secondary" data-open-model="${ctx.escapeHtml(model.path)}">${ctx.escapeHtml(t('models.details'))}</button>
-          ${loadable ? `<button class="btn btn-sm btn-primary" data-quick-launch="${ctx.escapeHtml(model.path)}">${ctx.escapeHtml(t('models.quickLaunch'))}</button>` : ''}
-        </td>
-      </tr>`;
-    })
-    .join('');
-  return `<table class="table">
-    <thead><tr>
-      <th scope="col">${ctx.escapeHtml(t('models.colFile'))}</th>
-      <th scope="col">${ctx.escapeHtml(t('models.colQuant'))}</th>
-      <th scope="col">${ctx.escapeHtml(t('models.colSize'))}</th>
-      <th scope="col">${ctx.escapeHtml(t('models.colArch'))}</th>
-      <th scope="col">${ctx.escapeHtml(t('models.colContext'))}</th>
-      <th scope="col">${ctx.escapeHtml(t('models.colActions'))}</th>
-    </tr></thead>
-    <tbody>${rows}</tbody>
-  </table>`;
-}
-
 async function quickLaunch(path, button) {
   const model = models.find((item) => item.path === path);
   if (!model || !isLoadable(model)) return;
@@ -413,8 +286,7 @@ async function quickLaunch(path, button) {
     const caps = (payload && payload.model) || model.capabilities || {};
     if (selectedPath !== path) {
       selectedPath = path;
-      ctx.refreshPanel();
-      renderCards();
+      ctx.refreshList?.();
       await renderDetail();
     }
     await launch(model, caps.probed ? caps : null, button);
@@ -479,7 +351,7 @@ function renderListInto(container) {
     activeKey: selectedPath,
     onSelect: (key) => {
       selectedPath = key;
-      ctx.refreshPanel();
+      ctx.refreshList?.();
       renderDetail();
     },
     emptyText: t('models.empty'),

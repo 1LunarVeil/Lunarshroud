@@ -1,16 +1,20 @@
 /* ==========================================================================
-   LunarShroud 设计令牌（Design Tokens）
+   LunarShroud 设计令牌（Design Tokens）— 1.0
 
-   这是主题的唯一真相源。规则只有一条：
    **其它样式文件只能引用这里的变量，不许再写死 hex / rgba / px 常量。**
+   （backend/tests/test_design_tokens.py 钉住这条，先加令牌再写规则。）
 
-   有了它，"审美"退化成"选对变量"，风格漂移会断崖式下降 —— 改主题只需要
-   动这一个文件。
+   1.0 的方向是「LM Studio 的信息架构 + macOS 原生软件的质感」：
 
-   分层：
-     1. 原始色阶（primitive）   —— 纯色板，不直接用于组件
-     2. 语义色（semantic）      —— 组件唯一允许引用的颜色
-     3. 尺寸 / 字体 / 动效 / 层级
+   - 表面分成三层，靠**明度差**分层而不是靠边框：画布（最外圈）→ 面板
+     （侧栏/检查器/列表列）→ 内容面（卡片、对话区、浮层）。旧版三个区域各用
+     自己的底色和边框，窗口被切成几条互不相干的带子；这里只有一套表面阶梯。
+   - 强调色是系统蓝（systemBlue 一族），不是品牌紫。LM Studio 用蓝紫是因为
+     它要区分品牌；对 Windows 上的桌面工具而言，系统蓝读起来像"系统的一部分"，
+     而紫在中文界面里容易被读成"AI 产品的营销色"。
+   - 文字四档：primary / secondary / tertiary / quaternary。桌面工具里大量
+     12px 元信息，只有分档够细才不会全部糊成一片灰。
+   - 动效一律 120/180/280ms 三档，只动 background/color/opacity/transform。
 
    亮暗主题：`:root` 是浅色，body.theme-dark 覆盖同一批变量名。
    ========================================================================== */
@@ -18,93 +22,116 @@
 :root {
   /* 原生控件（select 弹层、checkbox、滚动条）跟随主题 */
   color-scheme: light;
-  /* ---------- 1. 原始色阶（oklch，便于按明度等差扩展） ---------- */
-  --p-indigo-50: oklch(96% 0.03 275);
-  --p-indigo-100: oklch(93% 0.05 275);
-  --p-indigo-300: oklch(75% 0.14 275);
-  --p-indigo-500: oklch(56% 0.21 275);
-  --p-indigo-600: oklch(50% 0.22 275);
-  --p-indigo-700: oklch(45% 0.21 275);
 
-  --p-emerald-300: oklch(80% 0.14 160);
-  --p-emerald-500: oklch(65% 0.15 160);
-  --p-emerald-600: oklch(58% 0.14 160);
-  --p-amber-300: oklch(84% 0.15 75);
-  --p-amber-500: oklch(72% 0.16 70);
-  --p-red-300: oklch(72% 0.18 25);
-  --p-red-500: oklch(63% 0.22 25);
-  --p-red-600: oklch(55% 0.22 25);
-  --p-blue-300: oklch(76% 0.14 250);
-  --p-blue-500: oklch(63% 0.19 255);
-  --p-gray-300: oklch(72% 0.01 275);
-  --p-gray-400: oklch(64% 0.01 275);
-  --p-gray-500: oklch(56% 0.01 275);
-  --p-gray-700: oklch(38% 0.01 275);
+  /* ---------- 1. 原始色阶（primitive，不直接用于组件） ---------- */
+  --p-blue-50: #EEF4FF;
+  --p-blue-100: #DCE8FC;
+  --p-blue-200: #BBD2F8;
+  --p-blue-300: #8FB4F1;
+  --p-blue-500: #2F7BF0;
+  --p-blue-600: #0B5FCC;
+  --p-blue-700: #0A52B3;
+
+  --p-green-50: #E9F8F0;
+  --p-green-600: #14804A;
+  --p-green-700: #0F6B3D;
+  --p-amber-50: #FFF6E5;
+  --p-amber-600: #A15C00;
+  --p-amber-700: #8A4F00;
+  --p-red-50: #FDEDEC;
+  --p-red-600: #C42A25;
+  --p-red-700: #A8221F;
+
+  --p-gray-25: #FAFAFB;
+  --p-gray-50: #F4F4F6;
+  --p-gray-100: #ECECEF;
+  --p-gray-200: #E1E1E6;
+  --p-gray-300: #C9C9D1;
+  --p-gray-400: #A5A5AE;
+  --p-gray-500: #82828C;
+  --p-gray-600: #63636C;
+  --p-gray-700: #48484F;
+  --p-gray-800: #2C2C31;
+  --p-gray-900: #1C1C1F;
 
   /* ---------- 2. 语义色 ---------- */
-  --color-primary: #4F46E5;
-  --color-primary-hover: #4338CA;
-  /* 实心主按钮的底色与文字色分开：白字只有在足够深的填充上才达到 4.5:1。 */
-  --color-primary-fill: #4F46E5;
-  --color-primary-fill-hover: #4338CA;
+  /* 系统蓝。白字压在 --color-primary-fill 上实测 5.69:1；作文字用
+     --color-accent-text 更深一档（在画布与激活底上均 >5:1）。 */
+  --color-primary: #0B5FCC;
+  --color-primary-hover: #0A52B3;
+  /* 实心主按钮的底与字分开：浅色主题下 --color-primary 作文字已够，
+     但深色主题两者必须不同值（见下方 theme-dark）。 */
+  --color-primary-fill: #0B5FCC;
+  --color-primary-fill-hover: #0A52B3;
   --color-on-primary: #FFFFFF;
-  --color-primary-light: #EEF2FF;
-  /* 主色低饱和底（浅色主题：靛蓝 8%）。此前 style.css 用 fallback 凑合，现在归位 */
-  --color-primary-subtle: rgba(79, 70, 229, 0.08);
-  --color-success: #10B981;
-  --color-warning: #F59E0B;
-  --color-danger: #EF4444;
-  --color-info: #3B82F6;
-  /* 实心危险按钮：白字需要更深填充（#DC2626 = 4.83:1） */
-  --color-danger-fill: #DC2626;
-  --color-danger-fill-hover: #B91C1C;
+  --color-primary-light: #E7EEFC;
+  /* 强调色**当文字**用时（链接、激活项、图标着色）：必须比填充色更深，
+     否则压在浅色激活底上达不到 4.5:1。 */
+  --color-accent-text: #0B5FCC;
+  /* 主色低饱和底（激活行/选中项）。由 primary 派生，亮暗自动跟随。 */
+  --color-primary-subtle: color-mix(in srgb, var(--color-primary) 10%, transparent);
+  --color-focus-ring: color-mix(in srgb, var(--color-primary) 40%, transparent);
+
+  --color-success: #14804A;
+  --color-warning: #A15C00;
+  --color-danger: #C42A25;
+  --color-info: #0B5FCC;
+  --color-danger-fill: #C42A25;
+  --color-danger-fill-hover: #A8221F;
   --color-on-danger: #FFFFFF;
-  --color-focus-ring: color-mix(in srgb, var(--color-primary) 55%, transparent);
 
-  --color-bg: #F9FAFB;
-  --color-bg-elevated: #FFFFFF;
-  --color-card: #FFFFFF;
-  --color-border: #E5E7EB;
-  --color-border-strong: #D1D5DB;
-  /* 更淡的边框档：分组卡片降噪用（从 --color-border 派生，亮暗自动跟随） */
-  --color-border-faint: color-mix(in srgb, var(--color-border) 55%, transparent);
+  /* ---------- 三层表面 ----------
+     1 canvas   ：最外圈窗口底，聊天画布的"远背景"
+     2 panel    ：侧栏 / 检查器 / 列表列（比画布深或浅一档，始终可辨）
+     3 surface  ：内容面（卡片、对话区、浮层）
+     旧版只有 bg / bg-elevated 两档，于是"面板里的卡片"没有第三层可用，
+     只能靠加边框硬分——那正是"每个组件一个框"的由来。 */
+  --color-canvas: #EEEEF1;
+  --color-panel: #F7F7F9;
+  --color-surface: #FFFFFF;
+  /* 兼容既有类名：bg = 画布，card/bg-elevated = 内容面 */
+  --color-bg: var(--color-canvas);
+  --color-bg-elevated: var(--color-surface);
+  --color-card: var(--color-surface);
+  --color-sidebar-bg: var(--color-panel);
 
-  --color-text: #111827;
-  --color-text-secondary: #4B5563;
-  /* tertiary 也必须过 4.5:1（12px 帮助/空态副文案大量使用） */
-  --color-text-tertiary: #5F6672;
+  --color-border: #E3E3E8;
+  --color-border-strong: #CFCFD7;
+  /* 更淡的边框档：分组/卡片降噪用（从 border 派生，亮暗自动跟随） */
+  --color-border-faint: color-mix(in srgb, var(--color-border) 60%, transparent);
+  /* 区域交界处的发丝线：比 border 更淡，避免整窗被几条深线切成带状 */
+  --color-hairline: color-mix(in srgb, var(--color-border) 78%, transparent);
+
+  --color-text: #1C1C1F;
+  --color-text-secondary: #48484F;
+  /* tertiary 也必须过 4.5:1（12px 帮助/空态副文案大量使用），实测 5.33:1 */
+  --color-text-tertiary: #63636C;
+  /* quaternary 只用于 4.5:1 不成立的装饰性分隔文字（如分隔符、极淡计数），
+     **不得承载独立语义**。 */
+  --color-text-quaternary: #8A8A93;
   --color-text-inverse: #FFFFFF;
 
-  --color-hover: #F3F4F6;
-  --color-sidebar-bg: #FFFFFF;
-  --color-sidebar-active: #EEF2FF;
+  --color-hover: #EBEBEF;
+  --color-sidebar-active: color-mix(in srgb, var(--color-primary) 12%, transparent);
+  /* 选中行的"更实"形态：列表里同时存在 hover 与选中时，两者要能区分 */
+  --color-selected: color-mix(in srgb, var(--color-primary) 14%, transparent);
 
-  /* 徽标 / 标签用的低饱和底色（原先散落在 style.css 里的 rgba 常量） */
-  --color-success-subtle: rgba(16, 185, 129, 0.12);
-  --color-warning-subtle: rgba(245, 158, 11, 0.15);
-  --color-code-bg: #0F172A;
-  --color-code-text: #E2E8F0;
-  --chart-cpu: #EF4444;
-  --chart-memory: #10B981;
-  --chart-gpu: #F59E0B;
-  --chart-grid: #E5E7EB;
-  --chart-axis: #9CA3AF;
+  /* 徽标 / 标签用的低饱和底 */
+  --color-success-subtle: #E9F8F0;
+  --color-warning-subtle: #FFF6E5;
+  --color-danger-subtle: #FDEDEC;
+  --color-info-subtle: #EEF4FF;
+  --color-neutral-subtle: #EFEFF2;
+  --color-accent-subtle: color-mix(in srgb, var(--color-primary) 9%, transparent);
 
-  --color-danger-subtle: rgba(239, 68, 68, 0.12);
-  --color-info-subtle: rgba(59, 130, 246, 0.12);
-  --color-neutral-subtle: rgba(107, 114, 128, 0.15);
+  /* 徽标前景（深色主题覆盖为亮色变体） */
+  --color-success-strong: #0F6B3D;
+  --color-info-strong: #0A52B3;
+  --color-neutral-strong: #4E4E56;
+  --color-danger-strong: #A8221F;
+  --color-warning-strong: #8A4F00;
 
-  /* 语义色·强（徽标/标签前景，深色主题覆盖为亮色变体） */
-  --color-success-strong: #047857;
-  --color-info-strong: #1D4ED8;
-  --color-neutral-strong: #4B5563;
-  --color-danger-strong: #B91C1C;
-  --color-warning-strong: #B45309;
-
-  /* 主色的透明衍生。
-     用 color-mix 从 --color-primary 派生，因此亮/暗主题自动跟随；
-     此前这些投影一律写死 rgba(124,124,255,…)（即深色主题的主色），
-     导致浅色主题下按钮投影偏紫。 */
+  /* 主色的透明衍生（从 primary 派生，换主题自动跟随） */
   --color-primary-a08: color-mix(in srgb, var(--color-primary) 8%, transparent);
   --color-primary-a10: color-mix(in srgb, var(--color-primary) 10%, transparent);
   --color-primary-a12: color-mix(in srgb, var(--color-primary) 12%, transparent);
@@ -114,32 +141,40 @@
   --color-primary-a40: color-mix(in srgb, var(--color-primary) 40%, transparent);
 
   /* 遮罩层（弹窗 / 侧边栏 / 半透明面板） */
-  --color-overlay: rgba(0, 0, 0, 0.5);
-  --color-overlay-soft: rgba(0, 0, 0, 0.45);
-  --color-overlay-light: rgba(0, 0, 0, 0.35);
-  --color-overlay-thin: rgba(0, 0, 0, 0.2);
-  --color-surface-glass: rgba(255, 255, 255, 0.95);
+  --color-overlay: rgba(0, 0, 0, 0.42);
+  --color-overlay-soft: rgba(0, 0, 0, 0.36);
+  --color-overlay-light: rgba(0, 0, 0, 0.26);
+  --color-overlay-thin: rgba(0, 0, 0, 0.14);
+  --color-surface-glass: rgba(255, 255, 255, 0.94);
 
-  /* 差异对比行底色 */
-  --color-warning-faint: rgba(245, 158, 11, 0.08);
-  --color-danger-faint: rgba(239, 68, 68, 0.06);
-  --color-success-faint: rgba(16, 185, 129, 0.06);
-  --color-warning-tag: rgba(245, 158, 11, 0.12);
+  /* 差异对比 / 提示行底色 */
+  --color-warning-faint: rgba(161, 92, 0, 0.07);
+  --color-danger-faint: rgba(196, 42, 37, 0.05);
+  --color-success-faint: rgba(20, 128, 74, 0.05);
+  --color-warning-tag: rgba(161, 92, 0, 0.12);
 
   /* 代码块 / 命令行 / 日志面板（固定深色，与主题无关，保证终端观感一致） */
-  --color-code-bg: #0F172A;
-  --color-code-fg: #E2E8F0;
-  --color-code-bg-alt: #1E293B;
-  --color-code-border: #334155;
-  --color-code-hover: #475569;
-  --color-code-dim: #64748B;
-  --color-code-info: #93C5FD;
-  --color-code-muted: #94A3B8;
-  --color-code-mark-fg: #1F2937;
-  --color-code-preview-bg: #1a1b26;
-  --color-code-preview-border: #2a2b3d;
-  --color-code-error: #F87171;
-  --color-code-warn: #FBBF24;
+  --color-code-bg: #1B1B1F;
+  --color-code-fg: #E4E4E9;
+  --color-code-bg-alt: #26262B;
+  --color-code-border: #34343A;
+  --color-code-hover: #45454D;
+  --color-code-dim: #6E6E78;
+  --color-code-info: #8FB4F1;
+  --color-code-muted: #9A9AA3;
+  --color-code-mark-fg: #1C1C1F;
+  --color-code-preview-bg: #1B1B1F;
+  --color-code-preview-border: #34343A;
+  --color-code-error: #FF8F8A;
+  --color-code-warn: #F5C271;
+  --color-code-text: var(--color-code-fg);
+
+  /* 图表 */
+  --chart-cpu: #D9544D;
+  --chart-memory: #14804A;
+  --chart-gpu: #B07500;
+  --chart-grid: var(--color-border-faint);
+  --chart-axis: var(--color-text-quaternary);
 
   /* ---------- 3. 尺寸 ---------- */
   --space-0: 0;
@@ -148,11 +183,14 @@
   --space-0-75: 3px;
   --space-1: 4px;
   --space-1-25: 5px;
+  --space-1-5: 6px;
   --space-2: 6px;
   --space-1-75: 7px;
   --space-3: 8px;
   --space-2-25: 9px;
   --space-2-5: 10px;
+  --space-3-5: 10px;
+  --space-2-2-5: 10px;
   --space-4: 12px;
   --space-5: 14px;
   --space-6: 16px;
@@ -163,73 +201,89 @@
 
   /* 主区留白：需要出血到容器边缘的页面（Chat）用它取负值，不能各自硬编码
      20/24px —— 窄屏下主区留白会变成 14px，硬编码就会溢出视口。 */
-  --main-pad-block: var(--space-7);
+  --main-pad-block: var(--space-6);
   --main-pad-inline: var(--space-8);
 
-  --radius-xxs: 2px;
+  /* 控件高度刻度。桌面 UI 的"手感"很大程度来自这里是否统一：
+     旧版 30/32/26 三种混用，同一行里按钮与输入框差 2px 会看得出来。 */
+  --control-h-sm: 26px;
+  --control-h: 30px;
+  --control-h-lg: 34px;
+
+  /* 圆角收敛成 5 档语义 + 胶囊。旧版 9 档里有 4 对肉眼无法区分的近邻值，
+     导致"每个组件一个圆角"，整体读起来没有统一手感。 */
+  --radius-xxs: 3px;
   --radius-xs: 4px;
   --radius-sm: 6px;
-  --radius-icon: 7px;
+  --radius-icon: 8px;
   --radius-md: 8px;
   --radius-callout: 10px;
   --radius-lg: 12px;
   --radius-xl: 16px;
   --radius-switch: 22px;
   --radius-pill: 999px;
-  /* 提示圈等小圆形元素（值是百分比，不是写死 px） */
   --radius-round: 50%;
 
   /* ---------- 4. 字体 ---------- */
-  --font-sans: "PingFang SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont,
-    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  --font-mono: "JetBrains Mono", "Fira Code", Consolas, "Cascadia Code", Menlo, monospace;
+  /* 先 Apple 栈、再 Windows 栈：两者都是各自平台的"原生感"来源，比引入任何
+     web 字体都更贴题（且离线可用，见 test_offline_contract.py）。
+     CJK 用系统界面字体，行高比正文紧——中文界面字的 default 行高偏松。 */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Text",
+    "Segoe UI", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "SF Mono", "Cascadia Mono", "JetBrains Mono", Consolas, "Cascadia Code",
+    Menlo, monospace;
 
+  /* 字号阶梯：ratio ≈ 1.15。桌面下限 11px（2xs 只给徽标/单位），
+     正文 13px，长文阅读 14px。 */
   --font-size-2xs: 10px;
   --font-size-xs: 11px;
   --font-size-sm: 12px;
   --font-size-base: 13px;
   --font-size-md: 14px;
-  --font-size-lg: 15px;
-  --font-size-xl: 18px;
-  --font-size-2xl: 22px;
+  --font-size-lg: 16px;
+  --font-size-xl: 20px;
+  --font-size-2xl: 26px;
+  --font-size-display: 22px;
 
-  --line-height-tight: 1.4;
-  --line-height-base: 1.6;
+  --line-height-tight: 1.3;
+  --line-height-base: 1.55;
+  /* 长文阅读行高：对话正文与文档正文用它（中文 1.75 才不挤） */
+  --line-height-reading: 1.72;
 
-  /* 排版层级。此前 .page-title(18/600) 与 .card-title(15/600) 只差 3px 和同样的
-     字重，扫读时页面标题不比卡片更"重"，所以整页看起来是平的。 */
-  --font-size-display: 26px;
+  --font-weight-regular: 400;
   --font-weight-medium: 500;
   --font-weight-semibold: 600;
   --font-weight-bold: 700;
-  --tracking-tight: -0.02em;
-  --tracking-caps: 0.08em;
+  --tracking-tight: -0.012em;
+  --tracking-normal: 0;
+  --tracking-caps: 0.06em;
 
-  /* ---------- 5. 阴影 ---------- */
-  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.08);
-  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.10), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
-  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.10), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
-  /* 卡片默认态与可交互态分开：静态卡片不因为悬停而"跳"，可点卡片才抬升。 */
-  --shadow-card: 0 1px 2px rgba(16, 24, 40, 0.05), 0 1px 3px rgba(16, 24, 40, 0.06);
-  --shadow-card-hover: 0 2px 4px rgba(16, 24, 40, 0.06), 0 12px 24px -12px rgba(16, 24, 40, 0.18);
-  --shadow-pop: 0 6px 12px -4px rgba(16, 24, 40, 0.10), 0 24px 48px -16px rgba(16, 24, 40, 0.24);
+  /* ---------- 5. 阴影 ----------
+     三档 + 两档内部描边。全部带色相：纯黑 rgba 在浅灰画布上发灰发脏，
+     往冷色偏一点才像"光被挡出来"。 */
+  --shadow-sm: 0 1px 2px rgba(28, 28, 31, 0.06);
+  --shadow-md: 0 1px 3px rgba(28, 28, 31, 0.07), 0 4px 12px -2px rgba(28, 28, 31, 0.08);
+  --shadow-lg: 0 8px 28px -8px rgba(28, 28, 31, 0.16), 0 2px 8px rgba(28, 28, 31, 0.06);
+  /* 卡片默认态与可交互态分开：静态卡片不因悬停而"跳"，可点卡片才抬升 */
+  --shadow-card: 0 1px 2px rgba(28, 28, 31, 0.05);
+  --shadow-card-hover: 0 2px 6px rgba(28, 28, 31, 0.07), 0 12px 24px -14px rgba(28, 28, 31, 0.18);
+  --shadow-pop: 0 6px 16px -4px rgba(28, 28, 31, 0.12), 0 22px 48px -16px rgba(28, 28, 31, 0.24);
   --ring-focus: 0 0 0 3px var(--color-primary-subtle);
 
   /* ---------- 6. 动效 ---------- */
   --duration-fast: 0.12s;
   --duration-base: 0.18s;
   --duration-slow: 0.28s;
-  --easing-standard: ease;
+  --easing-standard: cubic-bezier(0.32, 0.72, 0, 1);
   --easing-emphasized: cubic-bezier(0.2, 0, 0, 1);
   --transition: var(--duration-base) var(--easing-standard);
 
-  /* 参数说明提示圈（?）：悬停/聚焦后延迟浮现（消失无延迟）；验收反馈 2s 偏长，取 1s */
+  /* 参数说明提示圈（?）：悬停/聚焦后延迟浮现（消失无延迟） */
   --tooltip-delay: 1s;
   --tooltip-max-w: 320px;
 
-  /* ---------- 7. 层级 ----------
-     9000 档此前是 style.css 里写死的裸值（.modal-overlay 9000 / .toast 9999），
-     现收进令牌；tooltip 介于 modal 与 toast 之间 */
+  /* ---------- 7. 层级 ---------- */
   --z-base: 0;
   --z-sticky: 10;
   --z-sidebar: 20;
@@ -238,69 +292,139 @@
   --z-toast: 9999;
 
   /* ---------- 8. 布局常量 ---------- */
-  --sidebar-width: 60px;
-  --sidebar-width-expanded: 220px;
-  --panel-width: 252px;
+  /* 侧栏是**单列**：导航项在上、当前页面的列表在下、底部动作。
+     1.0 第二轮删掉了独立的二级列表列（context panel），因为"每个页面
+     各有一条自己的列表列"会让窗口被切成三条带子，而 LM Studio 的做法是
+     把列表直接长在导航栏里。 */
+  --sidebar-width: 264px;
+  --sidebar-width-min: 200px;
+  --sidebar-width-max: 420px;
+  /* 收起态：整列隐藏，顶栏左侧出现汉堡按钮。刻意**没有**"图标轨道"中间态
+     —— 68px 的窄条里图标没地方放文字，收起来必然难看。 */
+  --sidebar-collapsed-width: 0px;
+  /* Chat 右侧参数面板（实例/知识库/系统提示/采样/工具/笔记）。
+     沿用原 --panel-width 的名字以免大面积改引用，但语义已变。 */
+  --panel-width: 288px;
+  --panel-width-min: 260px;
+  --panel-width-max: 420px;
   --header-height: 48px;
+  /* 底部状态条（LM Studio 式的常驻读数带）。0 = 不显示。 */
+  --statusbar-height: 30px;
+  /* Chat 正文列的阅读宽度：对话流限制在一个可读列内，而不是铺满窗口全宽
+     （全宽下中文一行 60+ 字很难跟读）。 */
+  --chat-column-max: 780px;
+  /* 发丝线宽。桌面 UI 在高 DPI 下 1px 会被放大成 2 物理像素，集中管理便于
+     将来切到 0.5px。 */
+  --hairline: 1px;
+
+  /* 侧栏列表区的高度上限：列表要能滚动，但不能把导航项挤出窗口。
+     这是 flex 布局里的 flex-basis，不是固定高度。 */
+  --sidebar-list-min-height: 96px;
+
+  /* ---------- 9. Chat 整页背景（运行时注入） ----------
+     这三项由 chat.js 从配置读出来后写在内联 style 上，这里声明的是**无背景**
+     时的默认值。必须在这里声明而不是只写 var(--x, fallback)：令牌门禁要求
+     style.css 引用的每个变量都在 tokens.css 里有定义。 */
+  --chat-bg-image: none;
+  --chat-bg-opacity: 0.35;
+  --chat-bg-blur: 0px;
 }
 
 /* ==========================================================================
    深色主题：只覆盖语义色与阴影，变量名保持一致
    ========================================================================== */
 body.theme-dark {
-  --color-code-bg: #0B1120;
-  --color-code-text: #E2E8F0;
-  --chart-grid: rgba(255, 255, 255, 0.08);
-  --chart-axis: rgba(255, 255, 255, 0.15);
   color-scheme: dark;
-  /* 强调色（链接/激活文字）可以亮；实心按钮另用更深的 fill，保证白字对比度。 */
-  --color-primary: #9F9FFF;
-  --color-primary-hover: #B0B0FF;
-  --color-primary-fill: #5B5BD6;
-  --color-primary-fill-hover: #6A63E8;
+
+  /* 深色下的系统蓝必须调亮：白字压在 #0B5FCC 上仍可，但"蓝作文字"在深底上
+     只有 2.9:1。所以文字用 #7FB0FF（7.91:1），填充仍留深一档配白字（4.73:1）。 */
+  --color-primary: #7FB0FF;
+  --color-primary-hover: #9BC3FF;
+  --color-primary-fill: #2F6FDD;
+  --color-primary-fill-hover: #2A64C8;
   --color-on-primary: #FFFFFF;
-  --color-primary-light: rgba(159, 159, 255, 0.14);
-  --color-primary-subtle: rgba(159, 159, 255, 0.10);
-  --color-success: #34D399;
-  --color-warning: #FBBF24;
-  --color-danger: #F87171;
-  --color-info: #60A5FA;
-  --color-danger-fill: #C81E1E;
-  --color-danger-fill-hover: #DC2626;
+  --color-primary-light: rgba(127, 176, 255, 0.14);
+  --color-primary-subtle: rgba(127, 176, 255, 0.12);
+  --color-accent-text: #7FB0FF;
+  --color-focus-ring: color-mix(in srgb, var(--color-primary) 38%, transparent);
+
+  --color-success: #4ADE80;
+  --color-warning: #F5C271;
+  --color-danger: #FF8F8A;
+  --color-info: #7FB0FF;
+  --color-danger-fill: #B3261E;
+  --color-danger-fill-hover: #C8302C;
   --color-on-danger: #FFFFFF;
 
-  --color-bg: #0D0D0F;
-  --color-bg-elevated: #161618;
-  --color-card: #1A1A1E;
-  --color-border: #2A2A30;
-  --color-border-strong: #383840;
+  /* 深色下的三层表面：画布最深，面板略亮，内容面再亮一档。
+     深色主题**不能**靠"更亮的白"分层，必须靠明度阶梯 + 发丝线。 */
+  --color-canvas: #131315;
+  --color-panel: #18181A;
+  --color-surface: #1F1F22;
+  --color-bg: var(--color-canvas);
+  --color-bg-elevated: var(--color-surface);
+  --color-card: var(--color-surface);
+  --color-sidebar-bg: var(--color-panel);
 
-  --color-text: #E6E6EA;
-  --color-text-secondary: #A6A6B0;
-  --color-text-tertiary: #90909C;
-  --color-text-inverse: #FFFFFF;
+  --color-border: #2C2C31;
+  --color-border-strong: #3D3D44;
+  --color-border-faint: color-mix(in srgb, var(--color-border) 65%, transparent);
+  --color-hairline: color-mix(in srgb, var(--color-border) 80%, transparent);
 
-  --color-hover: #232328;
-  --color-sidebar-bg: #131316;
-  --color-sidebar-active: rgba(159, 159, 255, 0.10);
+  --color-text: #ECECF0;
+  --color-text-secondary: #A8A8B0;
+  /* 6.22:1 on canvas，过 AA */
+  --color-text-tertiary: #9A9AA2;
+  --color-text-quaternary: #74747C;
+  --color-text-inverse: #131315;
 
-  /* 强色在深色主题下换成亮色变体（原位是 body.theme-dark .badge-* 的散落覆盖） */
-  --color-success-strong: #34D399;
-  --color-info-strong: #60A5FA;
-  --color-neutral-strong: #9CA3AF;
-  --color-danger-strong: #F87171;
-  --color-warning-strong: #FBBF24;
+  --color-hover: #26262A;
+  --color-sidebar-active: rgba(127, 176, 255, 0.16);
+  --color-selected: rgba(127, 176, 255, 0.2);
 
-  --color-surface-glass: rgba(26, 26, 30, 0.95);
+  --color-success-subtle: rgba(74, 222, 128, 0.13);
+  --color-warning-subtle: rgba(245, 194, 113, 0.14);
+  --color-danger-subtle: rgba(255, 143, 138, 0.13);
+  --color-info-subtle: rgba(127, 176, 255, 0.13);
+  --color-neutral-subtle: rgba(168, 168, 176, 0.14);
+  --color-accent-subtle: rgba(127, 176, 255, 0.11);
 
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
-  --shadow-md: 0 4px 8px rgba(0, 0, 0, 0.3);
-  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.4);
-  /* 深色下黑阴影几乎不可见，抬升靠"更亮的边 + 更深的投影"共同表达。 */
-  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4);
-  --shadow-card-hover: 0 2px 6px rgba(0, 0, 0, 0.45), 0 14px 28px -14px rgba(0, 0, 0, 0.6);
-  --shadow-pop: 0 8px 16px rgba(0, 0, 0, 0.5), 0 28px 56px -18px rgba(0, 0, 0, 0.7);
-  --ring-focus: 0 0 0 3px rgba(99, 102, 241, 0.32);
+  --color-success-strong: #4ADE80;
+  --color-info-strong: #7FB0FF;
+  --color-neutral-strong: #B4B4BE;
+  --color-danger-strong: #FF8F8A;
+  --color-warning-strong: #F5C271;
+
+  --color-overlay: rgba(0, 0, 0, 0.6);
+  --color-overlay-soft: rgba(0, 0, 0, 0.55);
+  --color-overlay-light: rgba(0, 0, 0, 0.42);
+  --color-overlay-thin: rgba(0, 0, 0, 0.24);
+  --color-surface-glass: rgba(31, 31, 34, 0.92);
+
+  --color-warning-faint: rgba(245, 194, 113, 0.06);
+  --color-danger-faint: rgba(255, 143, 138, 0.05);
+  --color-success-faint: rgba(74, 222, 128, 0.05);
+  --color-warning-tag: rgba(245, 194, 113, 0.14);
+
+  /* 深色下代码面要与内容面区分，但别比画布还暗（那会变成洞） */
+  --color-code-bg: #101012;
+  --color-code-bg-alt: #1B1B1E;
+  --color-code-border: #2E2E34;
+
+  --chart-cpu: #FF8F8A;
+  --chart-memory: #4ADE80;
+  --chart-gpu: #F5C271;
+  --chart-grid: rgba(255, 255, 255, 0.07);
+  --chart-axis: rgba(255, 255, 255, 0.16);
+
+  /* 深色下黑阴影几乎不可见，抬升靠"更亮的边 + 更深的投影"共同表达 */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 10px 32px rgba(0, 0, 0, 0.55);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.32);
+  --shadow-card-hover: 0 2px 8px rgba(0, 0, 0, 0.42), 0 16px 30px -16px rgba(0, 0, 0, 0.6);
+  --shadow-pop: 0 8px 20px rgba(0, 0, 0, 0.6), 0 28px 56px -20px rgba(0, 0, 0, 0.75);
+  --ring-focus: 0 0 0 3px rgba(127, 176, 255, 0.34);
 }
 
 body.theme-light {
@@ -316,7 +440,6 @@ body.theme-light {
     --duration-base: 0.01ms;
     --duration-slow: 0.01ms;
     --transition: 0.01ms;
-    /* 减少动态效果时取消 tooltip 延迟，立即显示 */
     --tooltip-delay: 0s;
   }
 }

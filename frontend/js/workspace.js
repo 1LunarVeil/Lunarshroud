@@ -86,14 +86,31 @@ export function onHide() {
   tab?.module.onHide?.();
 }
 
-export function hasPanel() {
-  return Boolean(TABS.find((tab) => tab.id === activeId)?.module.renderPanel);
+export function hasSidebarList() {
+  return Boolean(TABS.find((tab) => tab.id === activeId)?.module.renderSidebarList);
 }
 
-export function renderPanel(el) {
+/**
+ * 侧栏列表标题跟着**当前 tab**走，而不是一级入口名。
+ * 切到"运行环境"时标题该是"运行环境"，不是"模型工作区"。
+ */
+export function sidebarListTitle() {
   const tab = TABS.find((item) => item.id === activeId);
-  if (tab?.module.renderPanel) {
-    tab.module.renderPanel(el, ctx);
+  return tab ? t(tab.labelKey) : '';
+}
+
+/** 主行动也代理给当前 tab（各子模块自己声明）。 */
+export function sidebarListAction() {
+  const tab = TABS.find((item) => item.id === activeId);
+  const action =
+    tab && typeof tab.module.sidebarListAction === 'function' ? tab.module.sidebarListAction() : null;
+  return action;
+}
+
+export function renderSidebarList(el) {
+  const tab = TABS.find((item) => item.id === activeId);
+  if (tab?.module.renderSidebarList) {
+    tab.module.renderSidebarList(el, ctx);
     return;
   }
   el.innerHTML = `<div class="panel-empty">${ctx.escapeHtml(t('workspace.noPanel'))}</div>`;
@@ -112,7 +129,8 @@ export function selectTab(tabId) {
   }
   const next = TABS.find((tab) => tab.id === tabId);
   next?.module.onShow?.();
-  ctx.refreshPanel();
+  // 列表区与标题都要跟着 tab 变（标题由 sidebarListTitle 现算）
+  ctx.refreshList?.();
 }
 
 function showTab(tabId) {

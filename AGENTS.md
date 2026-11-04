@@ -537,12 +537,32 @@ UTF-8 / UTF-16LE / UTF-16BE / latin-1 以及 gzip/zlib 容器——所以"把路
 **刻意不发布**（在 `CURATED_EXCLUDES` 里有规则，不是靠记忆）：
 内部审计文档、AI 编码工具的配置与忽略文件、`data/`、`tmp/`、一切构建产物。
 
+### 3.1 不要在 `github/` 里跑测试或 lint
+
+验证"镜像能否独立构建"时，**不要 `cd github && pytest`**：一次运行就会留下
+`__pycache__/`、`.pytest_cache/`、`.ruff_cache/`，而 AI 编码工具的钩子还会写
+`.mimosa/hook-state/*.json`——后者含用户目录下的绝对路径。
+下一次门禁会报 121 条"禁用路径" + 115 条隐私命中（2026-11-03 实测），
+看起来像镜像被污染了，其实只是刚才那次验证的副产物。
+
+正确做法：`pytest --cache-clear -p no:cacheprovider` 并设
+`PYTHONDONTWRITEBYTECODE=1`，或在**副本**里跑；跑完无论如何都要复查门禁。
+`__pycache__` 与缓存目录不在镜像清单里，所以它们不会让"缺失/漂移"变红，
+只会从"禁用路径/隐私面"侧面炸出来——这两种红字的原因完全不同，别混淆。
+
 ## 4. 产品边界（不要重新提议）
 
 - **不打包、不自动下载 `llama-server`。** 每人环境不同，llama.cpp 自己按环境
   发布了预构建版本；默认路径留空 + README 指引获取方式，是刻意的。
-- **双通道是硬要求**：既能 clone 源码自己编译，也能下载装好即用的安装包。
-  只在一条通道上工作的改动算缺陷。
+- **双通道是硬要求**：既能 clone 源码自己编译，也能拿到装好即用的**免安装**
+  便携包（`release/*-portable-x64.zip`）。只在一条通道上工作的改动算缺陷。
+- **安装包（NSIS）不是每次发版的必交物**（2026-10-28 决定，取代早先"安装包必交"
+  的口径）。理由：未签名的 per-user 安装包带来独立的 SmartScreen 拦截、卸载钩子、
+  沙箱/受限令牌下的目录权限问题，而它面向的人群与便携包完全相同；维护两条
+  分发链路却没有第二条的验收能力（安装/卸载往返需要干净机器），收益低于风险。
+  `src-tauri/nsis/`、`tauri.conf.json` 的 bundle 配置与 `docs/RELEASE.md` 清单
+  **保留**——`cargo tauri build` 随时能重建安装包；要恢复"必交"，需同时解决
+  代码签名（1.0 门槛）并补安装/卸载往返验收。
 - 参数界面**跟随本机那份构建的能力**（`server_probe` + `capabilities`），
   不要把 llama.cpp 的 flag 列表当常量抄进代码。
 
@@ -550,8 +570,13 @@ UTF-8 / UTF-16LE / UTF-16BE / latin-1 以及 gzip/zlib 容器——所以"把路
 
 - 新页面的空态一律用 `panel_views.emptyStateHtml`（它区分"目录未配置"与
   "无匹配"两种引导）。
-- 页面若在异步数据到达后才具备面板内容，**必须**在数据就绪后调用
-  `appCtx.refreshPanel()`，否则面板停在"加载中"。
+- **页面列表长在侧栏里，不是独立的一列。** 页面模块导出
+  `renderSidebarList(el, ctx)` 提供列表；异步数据到达后必须调用
+  `appCtx.refreshList()`（旧名 `refreshPanel` 仍作为别名存在，但新代码用新名），
+  否则列表会停在"加载中"。逐字符输入的场景用 `appCtx.refreshListKeepFocus()`，
+  它会保住搜索框焦点与光标。
+- 列表项用 `.panel-list-item` + `data-list-key`，**不能**用 `.sidebar-item`：
+  后者是页面入口的选择器（`navigateTo` 绑定、导航计数、`aria-current` 都按它查）。
 - 后端错误消息一律经 `i18n.localizeBackendError` 呈现；新增后端错误文案时
   **必须**同时补 `ERROR_PATTERNS` 与中英两份字典（有 key 奇偶性测试兜底）。
 - 令牌只经 Tauri IPC 获取（`get_backend_session`），不得出现在前端源码或 URL 里。
@@ -563,18 +588,51 @@ UTF-8 / UTF-16LE / UTF-16BE / latin-1 以及 gzip/zlib 容器——所以"把路
    只"写完就绿"的测试可能什么都没测（本项目出现过两次）。
 3. UI 改动要真开浏览器看渲染，console 里的报错算失败；纯接口测试测不到
    同源/跨源差异、测不到 WebSocket 握手、测不到 PowerShell 版本差异。
-4. 测试不得写真实 `data/`。`backend/conftest.py` 在任何测试模块导入 `config`
+4. **"全绿"不等于"能用"。测试替身证明不了产品可用性。**
+   2026-11-03 事故：报告了"903 测试全绿、打包后端可启动"，用户实测却发现
+   **换模型发不出消息、新建会话必失败、右栏压住正文、应用关不掉**。四个缺陷
+   全都在真实路径上，而当时没有任何一条测试跑过"真实 llama-server + 真实
+   WebView + 真实操作序列"：
+
+   - `TestClient` 不经过浏览器 CORS 层，所以"跨源 500 缺 CORS 头 →
+     `Failed to fetch`"这条链永远测不到（`test_auth_coverage.py` 全部同源）；
+   - `FakePopen` 不会返回 500，所以"数据库只读 → 所有保存都失败"测不到；
+   - 断言 `.chat-inspector` 存在，测不到它右边界跑到 1052px 而容器只有 900px。
+
+   因此：**凡是"用户会看到"的行为，验证必须用真实后端 + 真实浏览器/窗口跑一遍
+   那条路径**，并读**存储状态与几何数值**（`getBoundingClientRect`、DB 行数），
+   不是读界面文本、也不是读"元素是否存在"。替身与 TestClient 只用于单元层回归。
+   现有接缝：`tools/dev_backend.py`（隔离数据目录）、
+   `frontend/tests/browser/layout.test.mjs`（真实几何）、
+   `LUNARSHROUD_TEST_SERVER`（可选真实 llama-server 路径，没给就整条 skip）。
+
+5. **错误绝不能因为落库失败而被伪装成网络故障。** 2026-11-03 实测：三个
+   SQLite 库同时只读（日志里 `readonly database` 出现 **116 次**），启动期
+   `init_db()` 的失败被 `except Exception` 吞掉，后端照常起来、界面完全正常，
+   而每次保存都 500；前端因为跨域 500 缺 CORS 头只看到 `Failed to fetch`。
+   三层掩盖叠加，用户拿到的信息量是零。所以：存储层错误必须翻译成带
+   `code` 的 503，**所有错误响应都要带 CORS 头**（`main.py`
+   `_storage_error_response` + `unhandled_error_handler`），并且启动时用
+   真实写事务探测（`sqlite_recovery.probe_writable`）把"不可写"记成 ERROR。
+
+6. **错误文案映射不得吃掉真实字段名。** 同一天的第二层掩盖：`seed: null`
+   触发 `seed must be a number`，而 `i18n.mjs` 的宽泛正则
+   `/must be a number|must be a string|.../` 把它翻译成"知识库设置无效" ——
+   用户根本没有知识库。通用类型错误现在走 `err.invalidValue` 并**保留后端
+   原文**，知识库专属正则只匹配真正与知识库有关的措辞。
+
+7. 测试不得写真实 `data/`。`backend/conftest.py` 在任何测试模块导入 `config`
    之前把 `DATA_DIR` / `HISTORY_DB` / `PRESETS_DIR` 重定向到会话级临时目录；
    进入 lifespan 的测试会建库、清洗密钥并收口历史状态，一旦漏掉就会改写用户
    数据（2026-10-17 实测发生过）。`test_regressions.py::test_test_suite_never_uses_the_repository_data_directory`
    钉住这一性质。
-5. **测试必须自密闭，不得依赖继承的 `%TEMP%` 可写。** 受限令牌/沙箱下测试
+8. **测试必须自密闭，不得依赖继承的 `%TEMP%` 可写。** 受限令牌/沙箱下测试
    二进制写 `%TEMP%` 会被拒绝（2026-10-18 核验：同一份代码在作者机器 20/20、
    在核验环境 16/20）。测试目录应放在测试二进制旁边（Cargo 刚写过、必然可写）
    或由夹具注入；清理失败要记录，不能用 `let _ =` 静默吞掉。
    证据：把 `TEMP`/`TMP` 指向不存在的路径后直接运行 Rust 测试二进制，
    `22/22` 通过。
-6. **本机验收套件不得并行跑，也不得写死机器路径。**
+9. **本机验收套件不得并行跑，也不得写死机器路径。**
    `frontend/tests/browser/deep-paths.test.mjs` 与 `adversarial.test.mjs` 会对着
    **同一个后端的共享状态**建库/索引/删库，两个文件同时跑会互相看到对方的中间态
    （实测：并行跑时一个守卫误报“库消失了”，其实是另一个套件的时序）。用
@@ -582,7 +640,7 @@ UTF-8 / UTF-16LE / UTF-16BE / latin-1 以及 gzip/zlib 容器——所以"把路
    （`LUNARSHROUD_TEST_EMBEDDING` / `LUNARSHROUD_TEST_KB`），没给就整条跳过 ——
    把绝对路径写进测试文件会把私人目录结构发布进 `github/` 镜像，而且让测试
    “只在一台机器上成立”。
-7. **UI 验收必须读存储状态，不能只读界面文本。** 面板按自己的节奏轮询，一次
+10. **UI 验收必须读存储状态，不能只读界面文本。** 面板按自己的节奏轮询，一次
    小索引可能在下一个请求之前就完成；只看“界面变成空闲”既会在旧文本上立刻为真
    （假绿），也会在永远等不到闪现的中间态时超时（假红）。断言要读
    `GET /api/knowledge/{id}` 的 `status` + `updated_at`，再给界面一点追上来的

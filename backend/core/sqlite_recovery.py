@@ -37,6 +37,69 @@ def is_database_corruption(exc: BaseException) -> bool:
     return any(marker in message for marker in _CORRUPTION_MARKERS)
 
 
+# SQLite 对"库现在写不进去"的两类措辞。它们都是**可恢复**的（锁会释放、
+# 权限会被修好），所以不能隔离重建；但也绝不能静默吞掉 —— 2026-11-03 实测：
+# 三个库同时只读，``init_db()`` 的失败被 ``except Exception`` 吞掉，后端照常
+# 启动、界面完全正常，而**每一次保存都在 500**。日志里 ``readonly`` 出现 116 次，
+# 用户看到的是"发送失败：Failed to fetch"。
+_READONLY_MARKERS = ("readonly database", "read-only database", "readonlydatabase")
+_LOCKED_MARKERS = ("database is locked", "database table is locked", "database schema is locked")
+
+
+def is_database_readonly(exc: BaseException) -> bool:
+    """库当前不可写（权限 / 只读挂载 / WAL 无法扩展）。可恢复，但必须让用户看见。"""
+    message = str(exc).lower()
+    return any(marker in message for marker in _READONLY_MARKERS)
+
+
+def is_database_locked(exc: BaseException) -> bool:
+    """库被别的连接锁住（通常是残留进程或并发写）。可恢复，重试即可。"""
+    message = str(exc).lower()
+    return any(marker in message for marker in _LOCKED_MARKERS)
+
+
+def probe_writable(path: Path, label: str) -> str:
+    """真实写一次来判定这个库能不能写；返回空串表示可写，否则返回原因。
+
+    **不能用 ``os.access``**：Windows 上它检查的是只读属性位，不看 ACL，
+    沙箱/受限令牌下会返回"可写"而实际 SQLite 打不开 —— 这正是要避免的误判。
+    也不能只做 ``SELECT``：只读的库读得出来。
+
+    做法是开一个 ``BEGIN IMMEDIATE`` 事务（立刻拿写锁，不等第一次真正写入），
+    写一张临时表再回滚。任何一步失败都归为不可写，并带上原始措辞供排查。
+
+    ``BEGIN IMMEDIATE`` 会持有写锁到回滚为止，所以探测本身很短、且必然回滚；
+    它不会留下任何数据改动。
+    """
+    try:
+        conn = sqlite3.connect(str(path), timeout=5.0)
+    except sqlite3.Error as exc:
+        return f"{label}: cannot open {path}: {exc}"
+    try:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error as exc:
+            # 拿不到写锁不等于永久不可写：库被占用时同样会走到这里。
+            if is_database_locked(exc):
+                return f"{label}: database is busy ({exc})"
+            return f"{label}: cannot start a write transaction: {exc}"
+        try:
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS __lunarshroud_write_probe(x)")
+        except sqlite3.Error as exc:
+            return f"{label}: write probe failed: {exc}"
+        finally:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+        return ""
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+
 def quarantine_corrupt_files(path: Path, label: str) -> None:
     """把损坏的主库和它的 ``-wal`` / ``-shm`` 一起改名保留，让新库能立刻重建。
 

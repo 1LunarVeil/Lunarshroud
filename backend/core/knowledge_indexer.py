@@ -181,12 +181,28 @@ class KnowledgeIndexer:
                 raise ValueError(f"file could not be inspected: {path}: {error}") from error
             plan.append((path, stat, existing.get(os.path.normcase(str(path)))))
         new_items = [item for item in plan if item[2] is None]
-        new_bytes = sum(stat.st_size for _, stat, _ in new_items)
         total_docs = len(existing) + len(new_items)
         if total_docs > MAX_FILES_PER_KB:
             raise ValueError(f"too many documents (limit {MAX_FILES_PER_KB})")
-        existing_bytes = sum(int(doc["size_bytes"]) for doc in existing.values())
-        if existing_bytes + new_bytes > MAX_SOURCE_BYTES_PER_KB:
+        # 额度必须按**本次实际将要入库的字节**判定，而不是"数据库里记的旧大小
+        # + 新增文件的当前大小"。
+        #
+        # 2026-11-03 实测缺陷：一个已入库 100 MiB 的文件被原地换成 900 MiB
+        # （更高 DPI 重扫、日志追加），`new_bytes` 只统计**新文件**（这份不算），
+        # `existing_bytes` 用的是库里记录的 100 MiB —— 于是 900 MiB 的文件在
+        # 200 MiB 的额度下被接受，`_stage_document` 随后把真实大小写回去。
+        # 结果是 §2.24 的"写入前拒绝"只对新文件成立。
+        #
+        # 修法：已在库的条目用 plan 里的**当前** stat 大小，只有不在本次
+        # plan 里的历史文档才用库里的记录值。
+        planned_paths = {os.path.normcase(str(path)) for path, _, _ in plan}
+        untouched_bytes = sum(
+            int(doc["size_bytes"])
+            for key, doc in existing.items()
+            if key not in planned_paths
+        )
+        planned_bytes = sum(stat.st_size for _, stat, _ in plan)
+        if untouched_bytes + planned_bytes > MAX_SOURCE_BYTES_PER_KB:
             raise ValueError(
                 "knowledge sources exceed the per-base size budget "
                 f"({MAX_SOURCE_BYTES_PER_KB // (1024 * 1024)} MiB)"
@@ -254,7 +270,25 @@ class KnowledgeIndexer:
                 )
             handle = handles.get("ocr")
             if handle is None:
-                handle = knowledge_services.acquire("ocr", model, mmproj)
+                # **必须走 lease()，不能用裸 acquire()。**
+                #
+                # 裸 acquire() 不会把 `_ACTIVE` 加一，而 acquire() 自己会启动
+                # 空闲回收线程。`release_idle` 只按 `last_used` 与 `_ACTIVE`
+                # 判定，于是一次超过 `IDLE_UNLOAD_SECONDS`（600 s）的 OCR 作业
+                # 会在中途被自己的回收线程停掉，`ocr_image` 收到连接失败，
+                # 文档被标成 error 并把原因算在 OCR 模型头上。扫描版 PDF 单页
+                # 允许 300 s，三页就跨过 600 s —— 这不是理论边界。
+                #
+                # 租约由 `handles["_phase_stack"]` 持有，在提取阶段结束时统一
+                # 退出（见 `_index_base` 的 finally），所以 OCR 服务在整个提取
+                # 期间都保持活跃，同时仍然受 §2.30 的"索引结束必须回收"约束。
+                stack = handles.get("_phase_stack")
+                if stack is None:
+                    handle = knowledge_services.acquire("ocr", model, mmproj)
+                else:
+                    handle = stack.enter_context(
+                        knowledge_services.lease("ocr", model, mmproj)
+                    )
                 handles["ocr"] = handle
             text = llama_services.ocr_image(
                 handle.base_url, png, str(base.get("ocr_prompt") or "Text Recognition:")
@@ -286,6 +320,10 @@ class KnowledgeIndexer:
         started = time.monotonic()
         staged: dict[str, dict[str, Any]] = {}
         handles: dict[str, Any] = {}
+        # 提取阶段（含 OCR）的租约栈：OCR 服务经 lease() 取用，整个提取阶段
+        # 保持活跃，结束时由 ExitStack 统一释放。见 `_ocr_callback`。
+        extraction_stack = contextlib.ExitStack()
+        handles["_phase_stack"] = extraction_stack
         knowledge_store.set_base_status(
             base_id, "indexing", progress=0, message=f"extract 0/{total}"
         )
@@ -297,7 +335,9 @@ class KnowledgeIndexer:
                 try:
                     staged[doc["id"]] = self._stage_document(base, doc, handles, force=force)
                 except IndexCancelled:
-                    self._finish_cancelled(base_id, staged)
+                    self._finish_cancelled(
+                        base_id, staged, in_flight_id=str(doc.get("id") or "") or None
+                    )
                     return
                 except Exception as error:  # noqa: BLE001 - one bad file must not stop the batch
                     errors += 1
@@ -312,6 +352,12 @@ class KnowledgeIndexer:
                     message=f"extract {index}/{total}",
                 )
         finally:
+            # 先退出 OCR 租约（把服务交还给回收器），再按类别兜底停掉：
+            # `release_kind` 只负责"阶段切换时立刻卸载"，租约负责"别在
+            # 作业中途被回收"。两者顺序不能倒 —— 先 release_kind 会让仍在
+            # 租约里的句柄指向一个已停止的实例。
+            extraction_stack.close()
+            handles.pop("_phase_stack", None)
             knowledge_services.release_kind("ocr")
 
         if not staged:
@@ -421,6 +467,7 @@ class KnowledgeIndexer:
         staged: dict[str, Any],
         *,
         processed_ids: list[str] | None = None,
+        in_flight_id: str | None = None,
     ) -> None:
         processed = set(processed_ids or [])
         remaining = {
@@ -429,6 +476,20 @@ class KnowledgeIndexer:
             if document_id not in processed
         }
         self._mark_staged(base_id, remaining)
+        # 取消发生在**单条文档内部**时，那条文档不在 `staged` 里 ——
+        # `_stage_document` 已经把它 upsert 成 `status="indexing"`，然后在
+        # 提取后（或提取中）抛 `IndexCancelled`。只遍历 `staged` 会把它留在
+        # "indexing"，而库状态是 "cancelled"：界面显示一条永远在索引、
+        # chunk_count=0 的文档；重启后 `mark_interrupted()` 会把它改写成
+        # "interrupted by a previous app session"，把原因也说错。
+        # 这里把它退回 `pending`，下次调度会重新处理。
+        if in_flight_id:
+            try:
+                knowledge_store.set_document_status(base_id, in_flight_id, "pending")
+            except Exception:  # noqa: BLE001
+                LOGGER.debug(
+                    "could not release cancelled document %s", in_flight_id, exc_info=True
+                )
         knowledge_store.set_base_status(
             base_id, "idle", progress=0, message="indexing cancelled"
         )

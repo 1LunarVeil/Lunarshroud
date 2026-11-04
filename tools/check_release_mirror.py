@@ -159,12 +159,83 @@ CURATED_EXCLUDES = {
     "docs/EVOLUTION.md":
         "内部演进总档：逐条列出各轮审计的缺陷编号、P1/P2 结论与整改轮次"
         "（AGENTS §3 的『内部审计文档刻意不发布』）；公开树无任何文档引用它",
+    "docs/HANDOVER-NEXT.md":
+        "下一个对话的交接说明：含本机工作区绝对路径与内部工具约束"
+        "（维护者本地材料，不对外）；面向公众的接手说明是 docs/HANDOVER.md",
     "LunarShroud-演进规划.md":
         "含本机绝对路径（内部演进记录，不对外）",
     "docs/archive/":
         "历史交接/测试材料，含本机绝对路径；docs/ 是 0.9.0-beta.1 权威文档，不改不搬",
     "CLAUDE.md":
         "AI 编码工具（Claude Code）的项目指令，非面向用户的项目文档；公开约定见 AGENTS.md",
+    # --- 2026-11-03：维护者工作材料与面向用户的文档分离 -------------------
+    #
+    # 公开仓库是给"下载来用"和"clone 来改"的人的。上面几轮把这些文件也
+    # 镜像了出去，结果是：2208 行的逐轮实测记录、542 行的事件时间线、
+    # 一份已完成的执行计划、一份内部工程计划——它们记录的是**我们怎么做的**，
+    # 不是**用户该知道什么**，而 1.0.0 这个版本已经把该说的都写进 CHANGELOG。
+    #
+    # 这些文件仍然属于工作树（证据要保留），只是不进公开树。
+    "docs/STATUS.md":
+        "逐轮实测证据与部署指纹：含 tmp/ 归档路径、本机构建哈希、受限令牌"
+        "环境的观测细节。对外结论见 CHANGELOG.md 与 RISK_ASSESSMENT 摘要",
+    "docs/HISTORY.md":
+        "按日期的事件时间线，正文明确记录 tmp/ 归档路径与内部轮次编号；"
+        "用户可见的变更已按版本收口在 CHANGELOG.md",
+    "docs/ROADMAP.md":
+        "内部工程计划：逐条写明验收标准、风险与回退方案，含规划期的过时基线；"
+        "已完成项已进入 CHANGELOG.md",
+    "docs/CHAT-PARITY-PLAN.md":
+        "某一次迭代（2026-10-30）的执行计划，已全部完成；开头的起点基线"
+        "（773 tests 等）早已过时，留着只会误导读者",
+    "docs/RISK_ASSESSMENT.md":
+        "风险登记表：含内部审计编号、受限令牌环境探测过程与未公开轮的证据"
+        "引用。对外的版本限制已写进 README 的『已知限制』",
+    "docs/HANDOVER.md":
+        "维护者接手与部署/恢复步骤：面向本仓库的作者，不是使用者；"
+        "用户向的安装与构建说明在 GETTING_STARTED.md / BUILDING.md",
+    # --- 2026-11-03：作者本机的 GUI/CDP 调试脚本 ---------------------------
+    #
+    # 这些脚本靠 pyautogui、Windows 窗口标题、WebView2 远程调试端口和
+    # 本机安装的浏览器工作。在别人的机器上它们既跑不起来也没有意义，
+    # 而照着它们去理解"项目怎么验收"只会得到错误印象——真正的自动化门禁
+    # 是 backend/tests 与 frontend/tests/browser。
+    #
+    # 判据：**clone 下来能不能直接用**。留着的都是有明确输入输出、无外部
+    # 前提的工具（打包、校验、备份、镜像门禁、开发后端）。
+    "tools/app_tester.py":
+        "靠 pyautogui + Windows 窗口标题驱动 GUI 的本机调试脚本，"
+        "在他人机器上不可运行；自动化验收在 frontend/tests/browser",
+    "tools/capture_window.py": "截取本机窗口客户区的一次性脚本（依赖窗口可见且在前台）",
+    "tools/cdp_screenshot.py": "本机 WebView2 远程调试端口的截图脚本",
+    "tools/cdp_tester.py": "本机 CDP 交互式驱动脚本（截图/点击/eval），无断言",
+    "tools/chat_helper.py": "操作本机 chat 页 iframe 的调试辅助脚本",
+    "tools/click_iframe.py": "本机 iframe 点击调试脚本",
+    "tools/css_cascade_probe.js":
+        "配合 tools/ui_preview.py 的本机级联探针；ui_preview 已排除，"
+        "前端样式回归改由 backend/tests/test_design_tokens.py 与浏览器套件覆盖",
+    "tools/focus_and_click.py": "按本机窗口客户区坐标点击的一次性脚本",
+    "tools/inspect_iframe.py": "本机 iframe 检查脚本",
+    "tools/inspect_listeners.py": "本机 CDP 事件监听器检查脚本",
+    "tools/lifecycle_test.py":
+        "手工生命周期诊断：要求本机已有后端与真实 llama-server 在 17520 运行；"
+        "等价断言在 backend/tests/test_e2e_smoke.py",
+    "tools/screenshot_window.py": "按窗口标题截图的本机脚本",
+    "tools/select_file_dialog.py": "靠 pyautogui 操作本机文件对话框的脚本",
+    "tools/smoke_test.py":
+        "手工 API 冒烟脚本（针对 17520 固定端口）；同一覆盖面由 "
+        "backend/tests/test_api_integration.py 与 test_auth_coverage.py 承担",
+    "tools/test_file_dialog.py": "本机文件对话框弹出测试脚本",
+    "tools/test_tauri_dialog.py": "本机 Tauri 对话框 + CDP 联合调试脚本",
+    "tools/ui_preview.py":
+        "本机无头浏览器预览器：需要本机 Chrome/Edge 与 CDP 端口，"
+        "产物是给人看的截图而非断言",
+    "tools/_local_model.py":
+        "为上面这些本机脚本解析模型路径的私有辅助模块；无公开调用方",
+    "tools/verify_packaged_chat.sh":
+        "打包态 CDP 验收脚本：需先构建打包对并在本机开 WebView2 调试端口",
+    "tools/verify_packaged_chat.mjs":
+        "同上，verify_packaged_chat.sh 的伴生实现",
 }
 
 # 2026-09-18 起：原本还有 3 个 tools/*.py 因硬编码本机模型库绝对路径被排除。
@@ -178,6 +249,20 @@ CURATED_EXCLUDES = {
 # 这与 STATUS.md "do not publish data\presets\" 的口径一致。机制保留，
 # 以备将来镜像确需自带文件时使用（须写明理由）。
 MIRROR_ONLY_ALLOWED = ()
+
+# 规则 2c：允许**两边内容不同**的文件（两边都该有，但本来就该不一样）。
+#
+# `.gitignore` 是唯一一条。它服务于两个不同的树：
+#   - 工作树版是维护者的：写明本机用了哪些 AI 编码工具、哪几个目录装着它们
+#     的会话状态与绝对路径。它从不公开。
+#   - 镜像版是给 clone 者的：同样的保护能力，但**不能点名工具链** ——
+#     这个文件本身会随仓库公开，点名等于把私有工作流写进用户文档。
+#
+# 之前两者共用一个文件，结果是公开仓库里的 .gitignore 注释逐条写出
+# "Claude Code"、"LM Studio 学习资料"、"Mimosa 安全插件"，以及内部审计文档的
+# 文件名。漂移检查对这份文件没有意义：差异是**刻意的**，不是同步遗漏。
+# 其余所有文件仍按哈希严格比对。
+INTENTIONALLY_DIFFERENT = {".gitignore"}
 
 # --------------------------------------------------------------------------
 # 规则 3：镜像里**绝不能出现**的路径（同样覆盖 CURATED_EXCLUDES 的反向保护）
@@ -435,7 +520,9 @@ def inspect(root: Path = ROOT, mirror: Path = MIRROR) -> dict:
     missing = sorted(rel for rel in expected if rel not in actual)
     drift = sorted(
         rel for rel in expected
-        if rel in actual and sha256(expected[rel]) != sha256(actual[rel])
+        if rel in actual
+        and rel not in INTENTIONALLY_DIFFERENT
+        and sha256(expected[rel]) != sha256(actual[rel])
     )
     extra = sorted(
         rel for rel in actual
@@ -539,6 +626,12 @@ def apply(root: Path = ROOT, mirror: Path = MIRROR, stream=sys.stdout) -> int:
 
     added, changed, removed = [], [], []
     for rel, full in sorted(expected.items()):
+        # 刻意不同的文件绝不覆盖：`.gitignore` 的镜像版是**干净版**，
+        # 而工作树版写明本机工具链。一次 `--apply` 就会把 17 处工具名
+        # （Claude/LM Studio/Mimosa/内部审计文档名）复制回公开树 ——
+        # 实测发生过一次。已经存在时保持原样；不存在才写入（首次同步）。
+        if rel in INTENTIONALLY_DIFFERENT and rel in actual:
+            continue
         target = mirror / rel
         if rel not in actual:
             target.parent.mkdir(parents=True, exist_ok=True)

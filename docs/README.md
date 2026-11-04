@@ -1,24 +1,63 @@
 # Documentation map
 
-This directory separates documents by role so a maintainer does not have to
-guess which file is authoritative.
+This directory separates documents by role so a reader does not have to guess
+which file is authoritative.
 
-| Need | Canonical document | Scope |
-| --- | --- | --- |
-| First install, first launch, common mistakes | [GETTING_STARTED.md](GETTING_STARTED.md) | End-user onboarding and troubleshooting |
-| Current release health, test evidence, blockers | [STATUS.md](STATUS.md) | Current, time-bound facts |
-| Remaining risk register and release judgement | [RISK_ASSESSMENT.md](RISK_ASSESSMENT.md) | Probability/impact/evidence/residual risk |
-| Take over development, run, test, or recover deployment | [HANDOVER.md](HANDOVER.md) | Operational handover |
-| Design and component boundaries | [ARCHITECTURE.md](ARCHITECTURE.md) | System map |
-| Model manifests and runtime profiles | [MANIFEST_AND_RUNTIME_MODEL.md](MANIFEST_AND_RUNTIME_MODEL.md) | Optional model.yaml/manifest.json and lunarshroud-runtime.json; runtime selection, defaults precedence/source tags, API and security budgets |
-| Offline contract | [OFFLINE.md](OFFLINE.md) | No remote runtime assets or telemetry; Tauri CSP and loopback-only policy; automated guard |
-| Build a Windows package | [BUILDING.md](BUILDING.md) | Build procedure |
-| Decide whether a release can publish | [RELEASE.md](RELEASE.md) | Release gate |
-| Trust boundaries and residual risk | [SECURITY_MODEL.md](SECURITY_MODEL.md) | Security design |
-| Wire up retrieval-augmented generation | [RAG.md](RAG.md) | RAG building blocks, recipes, pitfalls |
-| Material changes and incidents | [HISTORY.md](HISTORY.md) | Project history |
+The project README exists in two languages and both are maintained:
+[`README.md`](../README.md) (简体中文) and [`README.en.md`](../README.en.md)
+(English). Documents below stay in whichever language they were written in;
+there is no requirement that every technical document be bilingual.
 
-Historical material from earlier phases is kept by the maintainer outside the
-published tree. It is retained evidence, not current instructions, and must not
-override the documents above. No document or command in this directory depends
-on it, so a clone of this repository is self-contained.
+## Using LunarShroud
+
+| Need | Document |
+| --- | --- |
+| Install, first launch, common mistakes, failure triage | [GETTING_STARTED.md](GETTING_STARTED.md) |
+| What changed in each version | [../CHANGELOG.md](../CHANGELOG.md) |
+| Build a Windows package from source | [BUILDING.md](BUILDING.md) |
+| Publish a release (gate and checklist) | [RELEASE.md](RELEASE.md) |
+
+## Understanding the design
+
+| Need | Document |
+| --- | --- |
+| Component boundaries and data flow | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| 1.0 shell: tokens, layout, surface hierarchy | [DESIGN_1.0.md](DESIGN_1.0.md) |
+| Model manifests and runtime profiles | [MANIFEST_AND_RUNTIME_MODEL.md](MANIFEST_AND_RUNTIME_MODEL.md) |
+| Trust boundaries | [SECURITY_MODEL.md](SECURITY_MODEL.md) |
+| Offline / no-telemetry contract and its automated guard | [OFFLINE.md](OFFLINE.md) |
+
+## Knowledge base and RAG
+
+| Need | Document |
+| --- | --- |
+| RAG building blocks, recipes, pitfalls | [RAG.md](RAG.md) |
+| Indexing, quotas, citations, measured retrieval quality | [KNOWLEDGE_BASE.md](KNOWLEDGE_BASE.md) |
+
+## Contributing
+
+| Need | Document |
+| --- | --- |
+| Engineering rules and invariants before touching the code | [../AGENTS.md](../AGENTS.md) |
+| Contribution process | [../CONTRIBUTING.md](../CONTRIBUTING.md) |
+| Code of conduct | [../CODE_OF_CONDUCT.md](../CODE_OF_CONDUCT.md) |
+| Dependency baseline | [../DEPENDENCY_AUDIT.md](../DEPENDENCY_AUDIT.md) |
+
+Maintainer working material — per-round test evidence, the risk register, the
+internal roadmap, the event timeline and the handover/recovery steps — is kept
+in the maintainer's tree and is deliberately **not** published here. It records
+how the work was done rather than what a user or contributor needs, and the
+user-visible outcome of it is consolidated in
+[../CHANGELOG.md](../CHANGELOG.md).
+
+## Documented provenance
+
+Two sources are recorded in the project READMEs under "致谢与来源" /
+"Acknowledgements and provenance":
+
+- AI-assisted development by **DeepSeek-V4.1-Flash**
+  (`deepseek-v4.1-flash-10-17`).
+- Frontend design rules from the **frontend-aesthetics** plugin,
+  <https://github.com/1LunarVeil/frontend-aesthetics.git> — a method and token
+  specification, not a runtime dependency, and not part of the shipped
+  artifacts.

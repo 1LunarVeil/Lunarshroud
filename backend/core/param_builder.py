@@ -171,7 +171,55 @@ def redact_argv(argv: list[str]) -> list[str]:
         flag, separator, _ = value.partition("=")
         if separator and flag in SENSITIVE_CLI_FLAGS:
             redacted[index] = f"{flag}={REDACTED_VALUE}"
+    # MCP 服务器定义里几乎必然带凭据（`{"env":{"API_KEY":"sk-…"}}`、
+    # `{"url":"https://…?token=…"}`）。这些 JSON 在 argv 里是**独立元素**，
+    # 上面按 flag 相邻判断的规则完全不适用 —— 实测 `--mcp-servers-json` 的内容
+    # 会原样穿过 redact_argv。Chat 页要展示实例的 MCP 配置，这一处不修就等于
+    # 把密钥直接印在界面上（并随导出外发）。
+    for index, value in enumerate(redacted):
+        lowered = value.lower()
+        if "--mcp-servers" not in lowered:
+            continue
+        if "=" in value:
+            # `--mcp-servers-json={...}`
+            redacted[index] = _redact_mcp_payload(value)
+        elif index + 1 < len(redacted):
+            # `--mcp-servers-json {...}`：JSON 是下一个 argv 元素。只对
+            # `--mcp-servers-json` 这么做；`--mcp-servers-config` 的值是**路径**，
+            # 里面不会有凭据，套正则只会白改一个文件名。
+            if "json" in lowered:
+                redacted[index + 1] = _MCP_SECRET_KEY_RE.sub(
+                    r'\1"' + REDACTED_VALUE + '"', redacted[index + 1]
+                )
     return redacted
+
+
+# MCP 定义里可能装凭据的键名（大小写无关，覆盖 env 块与常见顶层写法）。
+_MCP_SECRET_KEY_RE = re.compile(
+    r'(?i)(["\']?(?:api[_-]?key|token|secret|password|passwd|authorization|'
+    r'access[_-]?token|bearer|credentials?)["\']?\s*:\s*)("(?:[^"\\]|\\.)*"|[^,}\]]+)'
+)
+
+
+def _redact_mcp_payload(value: str) -> str:
+    """把一个 `--mcp-servers-json <json>` 元素里的凭据替换成占位符。
+
+    刻意用正则而不是 `json.loads` + 递归：这个值可能已经被截断或本身就不是
+    合法 JSON（用户手填），解析失败时正则仍能盖住明显的 `"apiKey": "…"`。
+    脱敏宁可多盖，也不能因为"解析不了"就原样放行。
+    """
+    flag, separator, payload = value.partition("=")
+    # 注意必须是原始字符串：`"\1"` 在普通字符串里不是组引用，替换会静默失效
+    # （实测踩过 —— 正则匹配到了、替换却没发生，密钥照原样输出）。
+    replacement = r'\1"' + REDACTED_VALUE + '"'
+    # 两种写法：`--mcp-servers-json={...}` 与 `--mcp-servers-json {...}`
+    if separator:
+        return f"{flag}={_MCP_SECRET_KEY_RE.sub(replacement, payload)}"
+    space_index = value.find(" ")
+    if space_index == -1:
+        return value  # 只有 flag、没有值
+    head, body = value[: space_index + 1], value[space_index + 1 :]
+    return head + _MCP_SECRET_KEY_RE.sub(replacement, body)
 
 
 def redact_command_text(command: str) -> str:

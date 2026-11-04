@@ -343,3 +343,68 @@ def test_apply_aborts_before_copying_private_content(tmp_path):
     assert code == 2
     assert not (mirror / "backend" / "main.py").exists(), "私有内容在检查前被复制进镜像"
     assert (mirror / "keep.txt").exists()
+
+
+def test_apply_never_overwrites_the_intentionally_different_gitignore(tmp_path):
+    """`--apply` 不得把工作树的 `.gitignore` 覆盖到镜像上。
+
+    `.gitignore` 是唯一一个**就该两边不同**的文件：工作树版写明本机装了哪些
+    AI 编码工具、哪几个目录放着它们的会话状态；镜像版会随仓库公开，只能保留
+    保护能力、不能点名工具链。
+
+    2026-11-03 实测：一次 `--apply` 就把工作树那份复制进公开树，17 处工具名
+    （具体产品名与内部审计文档的文件名）全部落进镜像。检查层已经放行这个
+    差异，但写入层没有 —— 于是"检查通过"反而让人以为同步是对的。
+
+    红-绿：删掉 `apply()` 里的 `INTENTIONALLY_DIFFERENT` 跳过分支，本测试必红。
+    """
+    root = tmp_path / "root"
+    mirror = tmp_path / "mirror"
+    (root / "backend").mkdir(parents=True)
+    mirror.mkdir()
+
+    (root / "backend" / "main.py").write_text("x = 1", encoding="utf-8")
+    # 工作树版：含本机工具链细节，绝不能出现在公开树。
+    (root / ".gitignore").write_text(
+        "# 本机使用某 AI 工具，其会话状态在 .agent-state/\n.agent-state/\n",
+        encoding="utf-8",
+    )
+    # 镜像版：同样的保护，措辞中性。
+    clean = "# Local tool state\n.*-session/\n"
+    (mirror / ".gitignore").write_text(clean, encoding="utf-8")
+
+    code = gate.apply(root, mirror, stream=io.StringIO())
+
+    assert code == 0
+    assert (mirror / ".gitignore").read_text(encoding="utf-8") == clean, (
+        "--apply 覆盖了刻意不同的 .gitignore，把本机工具链写进了公开树"
+    )
+    # 其余文件照常同步，跳过规则只作用于这一份。
+    assert (mirror / "backend" / "main.py").exists()
+
+
+def test_the_mirrored_gitignore_names_no_local_toolchain():
+    """镜像里的 `.gitignore` 不得点名具体工具或内部文档。
+
+    与上一条互补：上一条防 `--apply` 覆盖，这一条防有人手工把工作树版粘进去。
+    名单盯的是**产品名**与**内部文件名**这两类，不是某个固定字符串。
+    """
+    text = (gate.MIRROR / ".gitignore").read_text(encoding="utf-8")
+    lowered = text.lower()
+    for marker in (
+        "lm studio",
+        "lmstudio",
+        "mimosa",
+        "zcode",
+        "claude",
+        "codex",
+        "cursor",
+        "copilot",
+        "全面审计",
+        "独立代码审计",
+        "本机",
+    ):
+        assert marker not in lowered, (
+            f"镜像的 .gitignore 出现了 {marker!r}；"
+            "公开文件里不该出现本机工具链或内部材料的名字"
+        )

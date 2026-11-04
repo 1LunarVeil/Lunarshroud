@@ -231,6 +231,8 @@ struct TrayState {
     close_to_tray: AtomicBool,
     tray_ready: AtomicBool,
     quitting: AtomicBool,
+    /// 首次隐藏到托盘时提示一次"怎么真正退出"；之后不再重复。
+    tray_hint_shown: AtomicBool,
 }
 
 impl TrayState {
@@ -239,6 +241,7 @@ impl TrayState {
             close_to_tray: AtomicBool::new(close_to_tray),
             tray_ready: AtomicBool::new(false),
             quitting: AtomicBool::new(false),
+            tray_hint_shown: AtomicBool::new(false),
         }
     }
 }
@@ -570,6 +573,15 @@ pub fn run() {
                     .decorations(true)
                     .center()
                     .visible(true)
+                    // 关闭 WebView2 的原生拖放接管。
+                    //
+                    // Tauri 2 默认 `drag_drop_handler_enabled = true`：wry 会注册
+                    // IDropTarget，把整个 webview 变成原生拖放目标，于是 HTML5 的
+                    // dragenter/dragover/drop **根本不会派发给页面**。表现就是
+                    // "把文件拖进聊天窗口毫无反应"—— 而源码运行通道（浏览器直接
+                    // 打开 127.0.0.1）一切正常，所以这类缺陷只有打包态才暴露。
+                    // 页面自己用 File API 读文件，不需要原生通道。
+                    .disable_drag_drop_handler()
                     // 仅 debug 构建启用 DevTools；release 构建不暴露远程调试端口
                     .devtools(cfg!(debug_assertions))
                     // WebView2 默认**拒绝** window.open / target="_blank"（wry 在
@@ -700,7 +712,29 @@ pub fn run() {
                 if hide_to_tray {
                     api.prevent_close();
                     let _ = window.hide();
-                    append_launcher_log("main window hidden to tray");
+                    // 第一次隐藏时把"怎么真正退出"写进 boot log，并让托盘 tooltip
+                    // 直接说出来。不引入通知插件（那是一个新的权限面），
+                    // 但也不能什么都不做 —— 2026-11-03 实测：点 X 后窗口消失、
+                    // 进程还在，界面上没有任何退出入口（唯一入口是 Ctrl+K），
+                    // 用户能得出的唯一结论就是"关不掉"。
+                    let first_hide = state
+                        .as_ref()
+                        .map(|s| !s.tray_hint_shown.swap(true, Ordering::Relaxed))
+                        .unwrap_or(true);
+                    if first_hide {
+                        append_launcher_log(
+                            "main window hidden to tray (first time); use Settings -> Backups \
+                             -> Application lifecycle -> Quit, or right-click the tray icon",
+                        );
+                        if let Some(tray) = window.app_handle().tray_by_id("lunarshroud-tray") {
+                            let _ = tray.set_tooltip(Some(
+                                "LunarShroud — running in the tray. \
+                                 Right-click to quit, or use Settings → Application lifecycle.",
+                            ));
+                        }
+                    } else {
+                        append_launcher_log("main window hidden to tray");
+                    }
                     return;
                 }
                 if let Some(supervisor) = window.app_handle().try_state::<Arc<BackendSupervisor>>()
@@ -1359,6 +1393,9 @@ fn start_backend(
         cmd.current_dir(&backend_dir)
             .env("LUNARSHROUD_SESSION_ID", session_id)
             .env("LUNARSHROUD_SESSION_TOKEN", session_token)
+            // 版本号的单一来源是 tauri.conf.json（编译期由 CARGO_PKG_VERSION
+            // 带进来）。后端不自己猜版本，只转发给设置页的「开发者」分类。
+            .env("LUNARSHROUD_APP_VERSION", env!("CARGO_PKG_VERSION"))
             // 子进程的 TMP/TEMP 固定到可写目录（PyInstaller onefile 时代用于
             // 解压；onedir 不再需要，但第三方探测/临时文件仍可能使用）。
             .env("TMP", &runtime_temp)
@@ -1413,6 +1450,7 @@ fn start_backend(
             .current_dir(&backend_dir)
             .env("LUNARSHROUD_SESSION_ID", session_id)
             .env("LUNARSHROUD_SESSION_TOKEN", session_token)
+            .env("LUNARSHROUD_APP_VERSION", env!("CARGO_PKG_VERSION"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());

@@ -18,7 +18,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -241,10 +241,19 @@ def server_reported_listening(instance: Instance) -> bool:
 
     这是判断"探测为什么失败"的分水岭：说过 listening 却探测不通，方向是
     端口/地址不一致或进程随后卡死；没说过，才是模型真的还没加载完。
+
+    **必须快照**（``list(...)``）。``logs`` 是 ``deque``，``_read_stdout``
+    线程在另一端持续 ``append``；直接迭代会在"监控线程正走到超时分支、子进程
+    仍在打印加载进度"时抛 ``RuntimeError: deque mutated during iteration``。
+    这个异常从 ``describe_probe_failure`` 冒出去会跳过监控线程里的
+    ``_terminate_process_tree`` / ``_release_port`` / ``_finalize_process_resources``
+    —— 结果是活的 llama-server 没人回收、FAILED 记录因持有活句柄免于裁剪、
+    端口预留永不释放（实测复现）。本文件其它读点是 ``reversed(list(...))`` 与
+    ``list(self.logs)``，这里是唯一的例外。
     """
     return any(
         "listening on" in entry.line
-        for entry in instance.logs
+        for entry in list(instance.logs)
         if entry.source != "system"
     )
 
@@ -325,6 +334,58 @@ def explain_startup_crash(
 
 # ========== 状态枚举 ==========
 
+def supports_vision(params: Mapping[str, Any] | None) -> bool:
+    """这台实例能不能接收图片输入。
+
+    判据只有一条：**启动参数里给了 mmproj**。不能看同目录有没有 mmproj 文件
+    —— 文件存在但没传给 llama-server 时它照样只接受文本；也不能看主模型
+    名字里有 "vl"/"vision" —— 那只是命名习惯，不是能力承诺。
+
+    实测依据（llama-server b11698）：不带 `--mmproj` 时 `/props` 返回
+    `modalities: {vision: false, ...}`，即使同目录有 mmproj 文件。
+
+    `no_mmproj=True` 显式禁用时返回 False，与"没给"同一个结论 ——
+    两者都不产生视觉能力。
+    """
+    if not isinstance(params, Mapping):
+        return False
+    if params.get("no_mmproj"):
+        return False
+    value = params.get("mmproj")
+    return isinstance(value, str) and bool(value.strip())
+
+
+# 前端唯一允许执行的三类工具（与 frontend/js/chat_tools.mjs 的
+# READ_ONLY_TOOLS、backend/core/chat_tools.py 的 READ_ONLY_TOOLS 三处一致）。
+# 写文件 / 执行命令不在其中，所以即使实例用 `--tools all` 启动，这里也只回
+# 这三个名字 —— 界面上不会有"能点但不敢点"的按钮。
+READ_ONLY_TOOL_NAMES = frozenset({"read_file", "file_glob_search", "grep_search"})
+
+
+def declared_read_only_tools(argv: list[str] | None) -> list[str]:
+    """实例启动参数里声明了哪些**只读**工具。
+
+    解析 ``--tools a,b`` 与 ``--tools=a,b``，``all`` 展开成全部只读工具。
+    只回只读的那几个：``llama-server`` 的 ``--tools`` 里如果还有写类工具，
+    本产品不执行它们，也就不该告诉前端"这台实例有这个能力"。
+    """
+    if not argv:
+        return []
+    value = ""
+    for index, token in enumerate(argv):
+        text = str(token)
+        if text == "--tools" and index + 1 < len(argv):
+            value = str(argv[index + 1])
+            break
+        if text.startswith("--tools="):
+            value = text[len("--tools="):]
+            break
+    names = {item.strip() for item in value.split(",") if item.strip()}
+    if "all" in names:
+        return sorted(READ_ONLY_TOOL_NAMES)
+    return sorted(names & READ_ONLY_TOOL_NAMES)
+
+
 class InstanceStatus(str, Enum):
     IDLE = "idle"              # 待启动（保留用于未来）
     STARTING = "starting"      # 启动中（已 Popen，等待就绪）
@@ -392,6 +453,12 @@ class Instance:
     logs: deque[LogEntry] = field(default_factory=lambda: deque(maxlen=5000))
     _log_buffer_max_lines: int = 5000
     _log_buffer_bytes: int = 0
+    # `_append_log` 的"追加 + 计数 + 裁剪"必须原子完成：stdout 读线程、监控
+    # 线程与 stop_instance（asyncio.to_thread）会并发追加同一个实例。无锁时
+    # 字节计数会漂移（实测差一个数量级），§2.21 的字节预算失效。
+    _log_buffer_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False
+    )
     _log_subscribers: list[Callable[[LogEntry], None]] = field(default_factory=list)
     _status_subscribers: list[Callable[[Instance], None]] = field(default_factory=list)
     _monitor_thread: threading.Thread | None = None
@@ -416,6 +483,42 @@ class Instance:
     # 失败归因的缓存（见 to_dict）。只在 FAILED 时计算一次，避免 WS 每次推送
     # 都重跑一遍日志正则。
     _diagnosis: list[dict[str, str]] | None = field(default=None, repr=False)
+
+    @property
+    def model_path(self) -> str:
+        """模型的绝对路径（来自启动参数的 `model` 键）。
+
+        为什么要有这个属性：`to_dict()` 一直用 `self.params.get("model", "")`
+        派生 `model_path`，但**对象本身没有这个属性**。网关
+        （`api/gateway.py`、`api_server_admin.py`）直接用
+        `getattr(inst, "model_path", "")`，于是永远拿到空串 ——
+        `/v1/models` 返回空 id、按模型名路由一律 404。
+
+        2026-11-02 实测缺陷。测试没抓到是因为当时的 FakeInstance 手动设了
+        `self.model_path`，替身形状与真实对象不一致（假绿）。
+        """
+        try:
+            return str(self.params.get("model") or "")
+        except AttributeError:  # params 被外部改坏时的兜底
+            return ""
+
+    @property
+    def is_serving_model(self) -> bool:
+        """这台实例能否接受 `/v1/chat/completions`。
+
+        embedding / rerank 实例虽然也是 llama-server，但不提供对话补全；
+        网关与 Chat 的实例下拉都必须排除它们，否则用户选中后会收到 400。
+
+        判据是启动参数里的 `embeddings` / `rerank`（与 param_schema 的 G6
+        分组一致），外加知识库托管服务约定的 `[KB] ` 名字前缀。
+        """
+        try:
+            params = self.params or {}
+        except AttributeError:
+            return True
+        if params.get("embeddings") or params.get("rerank"):
+            return False
+        return not str(self.name or "").startswith("[KB] ")
 
     def to_dict(self, include_logs: bool = False, log_limit: int = 200) -> dict[str, Any]:
         """转为字典（用于 API 响应）"""
@@ -447,8 +550,27 @@ class Instance:
             "error_message": self.error_message,
             "warnings": list(self.warnings),
             "model_path": self.params.get("model", ""),
+            # 能否接受对话补全。前端（Chat 的实例下拉、网关的 /v1/models）
+            # 靠它排除 embedding / rerank 实例 —— 那些也是 llama-server，
+            # 但选中后发消息只会收到 400。
+            #
+            # 只回布尔，不回 `params` 整包：params 里含 api_key。
+            "serves_chat": self.is_serving_model,
             "context_size": context_size,
             "command": self.command_string,
+            # 图片附件只在这台实例真的带视觉编码器时才可用。判据是**启动参数
+            # 里是否传了 mmproj**：llama-server 只有带 `--mmproj` 时才会把
+            # `modalities.vision` 置 true（实测 b11698：文本模型返回 false，
+            # 即使同目录躺着 mmproj 文件）。前端据此显示或置灰图片按钮 ——
+            # 让用户传了图却收到 400，比按钮一开始就不可用糟得多。
+            "supports_vision": supports_vision(self.params),
+            # 实例声明了哪些**只读**内置工具。前端据此决定要不要在请求里附
+            # tools 声明：模型看不到清单就不会发起调用；而把声明发给一个没启用
+            # 工具的实例，只会让它请求一个不会被执行的能力。
+            #
+            # 只回工具名而不是整个 argv：argv 里还有路径、端口与凭据形态，前端
+            # 需要的只是"有没有这个能力"。
+            "declared_tools": declared_read_only_tools(self.argv),
         }
         if self.status == InstanceStatus.FAILED:
             if self._diagnosis is None:
@@ -1592,20 +1714,44 @@ class ProcessManager:
     # ========== 日志和订阅 ==========
 
     def _append_log(self, instance: Instance, source: str, line: str) -> None:
-        """追加日志并通知订阅者，同时守住行数与字节预算。"""
+        """追加日志并通知订阅者，同时守住行数与字节预算。
+
+        **整段"追加 + 计数 + 裁剪"必须在 ``_log_buffer_lock`` 内完成。**
+        至少三个线程会往同一个实例追加日志：stdout 读线程、监控线程，以及
+        经 ``asyncio.to_thread`` 执行的 ``stop_instance``。此前这段是无锁的
+        读-改-写（``deque.append`` → ``+=`` → 裁剪循环），于是：
+
+        - 计数漂移：实测 8 线程 × 500 行后 ``_log_buffer_bytes`` 与
+          ``sum(len(e.line))`` 相差一个数量级（甚至归零）—— 少计一侧让缓冲
+          能装到 ``max_lines × 16 KiB``，§2.21 的字节预算形同虚设；多计一侧
+          则每追加一行就把缓冲清空，日志页看不到宣称要保留的内容；
+        - 裁剪循环里的两个线程可能都看到非空 ``logs``，其中一个 ``popleft()``
+          撞上空 deque，``IndexError`` 从 ``_read_stdout`` / ``stop_instance``
+          冒出去（读线程是 daemon，异常直接带走日志收集）。
+
+        锁是每实例独立的，不与 ``_log_file_lock`` 合并：后者护的是落盘流，
+        两者没有嵌套关系，合并只会让写入路径上的争用面积变大。
+        订阅者回调放在锁**外**调用，避免把用户回调里的阻塞带进日志路径。
+        """
         entry = LogEntry(timestamp=time.time(), source=source, line=line)
-        instance.logs.append(entry)
-        instance._log_buffer_bytes += len(line.encode("utf-8", "replace"))
         max_lines = getattr(instance, "_log_buffer_max_lines", 5000) or 5000
-        while instance.logs and (
-            len(instance.logs) > max_lines
-            or instance._log_buffer_bytes > MAX_LOG_BUFFER_BYTES
-        ):
-            dropped = instance.logs.popleft()
-            instance._log_buffer_bytes -= len(
-                dropped.line.encode("utf-8", "replace")
-            )
-        instance._log_buffer_bytes = max(0, instance._log_buffer_bytes)
+        with instance._log_buffer_lock:
+            instance.logs.append(entry)
+            instance._log_buffer_bytes += len(line.encode("utf-8", "replace"))
+            while instance.logs and (
+                len(instance.logs) > max_lines
+                or instance._log_buffer_bytes > MAX_LOG_BUFFER_BYTES
+            ):
+                dropped = instance.logs.popleft()
+                instance._log_buffer_bytes -= len(
+                    dropped.line.encode("utf-8", "replace")
+                )
+            # 计数以缓冲里的真实内容为准：任何一处漏算/重算都会被下一次追加
+            # 纠正，而不是把误差永久累积下去。
+            if not instance.logs:
+                instance._log_buffer_bytes = 0
+            elif instance._log_buffer_bytes < 0:
+                instance._log_buffer_bytes = 0
         self._persist_log_line(instance, entry)
         for sub in list(instance._log_subscribers):
             try:

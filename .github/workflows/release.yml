@@ -80,25 +80,84 @@ jobs:
         working-directory: src-tauri
         shell: pwsh
         run: |
-          # Registry crate paths (which contain the build machine's user name)
-          # end up in panic location strings inside the binary. Remap them to a
-          # neutral prefix so the public artifact carries no builder identity.
-          $env:RUSTFLAGS = "--remap-path-prefix=$env:USERPROFILE\.cargo\registry\src=cargo-registry"
+          # Two things in RUSTFLAGS, both required:
+          #  1. Registry crate paths (which contain the build machine's user name)
+          #     end up in panic location strings; remap to a neutral prefix.
+          #  2. /Brepro makes the MSVC linker derive the PE timestamp from content
+          #     instead of writing the current time. Without it the launcher hash
+          #     changes on every build even with SOURCE_DATE_EPOCH set (measured:
+          #     TimeDateStamp tracked the wall clock). Two /Brepro builds on
+          #     unchanged sources reproduce byte-for-byte.
+          $env:RUSTFLAGS = "--remap-path-prefix=$env:USERPROFILE\.cargo\registry\src=cargo-registry -C link-arg=/Brepro"
           cargo +1.97.1 tauri build --ci -- --locked
+      - name: Stage the portable runtime
+        shell: pwsh
+        run: |
+          # 便携包是**主发布通道**（免安装、解压即用），安装包不是必交物。
+          # 这条步骤以前完全缺失：release.yml 只产 NSIS，而 README/ROADMAP 承诺的
+          # `release/*-portable-x64.zip` 从来不由 CI 产出 —— 两条分发链路只有一条
+          # 有自动化，另一条全靠手工，且手工步骤没有任何校验。
+          #
+          # 部署脚本会把 launcher 与 onedir backend（backend.exe + _internal/）
+          # 作为**一个整体**复制到仓库根，并逐文件比 SHA-256；缺 _internal/ 直接失败。
+          # -Destination 是必填参数（默认值刻意不写，见脚本里 5.1/$PSScriptRoot 的说明），
+          # 传仓库根：package_portable.py 从那里取 LunarShroud.exe 与 backend/。
+          # 传 -SkipSigning：发布签名由后续步骤统一处理，这里只求"文件已就位且完整"。
+          .\tools\Publish-PortableRuntime.ps1 -Destination . -SkipSigning -SkipDesktopShortcut
+          if ($LASTEXITCODE -ne 0) { throw 'portable runtime deployment failed' }
+      - name: Build portable zip
+        shell: pwsh
+        run: |
+          # 版本号由 package_portable.py 从 tauri.conf.json 读取，并与 Cargo.toml
+          # 交叉校验 —— 不一致时脚本以非 0 退出，产不出一个"名字与内容矛盾"的包。
+          python tools/package_portable.py
+          if ($LASTEXITCODE -ne 0) { throw 'portable packaging failed' }
+      - name: Verify the portable zip is self-contained
+        shell: pwsh
+        run: |
+          # 便携包最常见的坏法是"只装了 exe、没有 _internal/"，用户解压后一启动
+          # 就报后端启动失败。在发布之前把这条钉死。
+          $zips = @(Get-ChildItem release -File -Filter '*-portable-x64.zip')
+          if ($zips.Count -ne 1) { throw "Expected exactly one portable zip, found $($zips.Count)." }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zips[0].FullName)
+          try {
+            $names = $archive.Entries | ForEach-Object { $_.FullName }
+          } finally {
+            $archive.Dispose()
+          }
+          $required = @('LunarShroud.exe', 'backend/backend.exe', '使用说明.txt')
+          foreach ($needle in $required) {
+            if (-not ($names | Where-Object { $_.EndsWith($needle) })) {
+              throw "portable zip is missing $needle"
+            }
+          }
+          $internal = @($names | Where-Object { $_ -like '*/backend/_internal/*' })
+          if ($internal.Count -lt 50) {
+            throw "portable zip has only $($internal.Count) _internal entries; the onedir runtime was not copied"
+          }
+          Write-Host "portable zip verified: $($names.Count) entries, $($internal.Count) runtime files"
       - name: Create checksums
         shell: pwsh
         run: |
-          # 只对本次构建的安装包计算校验和：目录里可能残留上一次的
-          # SHA256SUMS.txt 或调试文件，把"目录里的一切"算进去会把它们带上发布。
-          $artifacts = @(Get-ChildItem src-tauri/target/release/bundle/nsis -File -Filter '*.exe')
-          if ($artifacts.Count -ne 1) {
-            throw "Expected exactly one NSIS installer, found $($artifacts.Count)."
+          # 对**本次**构建的两个分发物一起算校验和：安装包与便携包。目录里可能
+          # 残留上一次的 SHA256SUMS.txt 或调试文件，只取本次构建的产物。
+          $installers = @(Get-ChildItem src-tauri/target/release/bundle/nsis -File -Filter '*.exe')
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one NSIS installer, found $($installers.Count)."
           }
+          $zips = @(Get-ChildItem release -File -Filter '*-portable-x64.zip')
+          if ($zips.Count -ne 1) {
+            throw "Expected exactly one portable zip, found $($zips.Count)."
+          }
+          $artifacts = @($installers) + @($zips)
           $lines = foreach ($artifact in $artifacts) {
             $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifact.FullName).Hash.ToLowerInvariant()
             "$hash  $($artifact.Name)"
           }
           $lines | Set-Content src-tauri/target/release/bundle/nsis/SHA256SUMS.txt -Encoding ascii
+          # 便携包附件与校验和放进同一目录，upload-artifact 只需一个路径。
+          Copy-Item -LiteralPath $zips[0].FullName -Destination src-tauri/target/release/bundle/nsis -Force
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: lunarshroud-windows-${{ github.ref_name }}

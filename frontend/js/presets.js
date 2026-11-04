@@ -74,7 +74,7 @@ async function refresh() {
       selectedId = presets[0].id;
     }
     // 先落定 selectedId 再画面板，否则首次进入时高亮会闪一下
-    ctx.refreshPanel();
+    ctx.refreshList?.();
     renderDetail();
   } catch (e) {
     ctx.showToast(`${t('presets.loadFailed')}: ${localizeBackendError(e.message)}`, 'error');
@@ -82,9 +82,19 @@ async function refresh() {
 }
 
 // 二级面板：预设列表。
-// 列表项不放操作按钮 —— 面板只有 252px，四个按钮挤一行既看不清也点不准；
+// 列表项不放操作按钮 —— 侧栏虽比旧面板宽，但一行塞四个按钮仍会读成表单；
 // 操作统一收到正文详情页（只对"当前选中的那一个"生效，语义也更清楚）。
-export function renderPanel(el) {
+/** 侧栏列表的标题与主行动。 */
+export function sidebarListTitle() {
+  return t('nav.presets');
+}
+
+export function sidebarListAction() {
+  // 新建预设走的是与页头 #btn-new 同一个入口，避免"新建"有两套代码。
+  return { label: '+', title: t('presets.new'), onClick: () => openEditModal(null) };
+}
+
+export function renderSidebarList(el) {
   renderList(el, ctx, {
     items: presets.map((p) => ({
       key: String(p.id),
@@ -94,7 +104,7 @@ export function renderPanel(el) {
     activeKey: selectedId,
     onSelect: (key) => {
       selectedId = key;
-      ctx.refreshPanel();
+      ctx.refreshList?.();
       renderDetail();
     },
     emptyText: t('presets.empty'),

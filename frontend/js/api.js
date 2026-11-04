@@ -320,6 +320,8 @@ const Api = {
 
   // 系统资源快照
   getSystemOverview: () => _get('/api/system/overview'),
+  // 运行期路径与版本（设置页「开发者」分类）
+  getSystemPaths: () => _get('/api/system/paths'),
 
   // 参数 Schema（runtimeId 可选：所选构建决定 supported/upstream_options）
   getParamSchema: (runtimeId) => _get(`/api/params/schema${_qs({ runtime_id: runtimeId })}`),
@@ -431,12 +433,16 @@ const Api = {
   branchChat: (id, body = {}) =>
     _post(`/api/chats/${encodeURIComponent(id)}/branch`, body),
   clearChats: () => _post('/api/chats/clear'),
+  purgeChats: (body) => _post('/api/chats/purge', body),
+  exportChat: (id) => _get(`/api/chats/${encodeURIComponent(id)}/export`),
+  importChat: (payload) => _post('/api/chats/import', payload),
   listPrompts: () => _get('/api/prompts'),
   createPrompt: (body) => _post('/api/prompts', body),
   updatePrompt: (id, body) => _patch(`/api/prompts/${encodeURIComponent(id)}`, body),
   deletePrompt: (id) => _del(`/api/prompts/${encodeURIComponent(id)}`),
   streamChatCompletion: (instanceId, body, options) =>
     _streamChatCompletion(instanceId, body, options),
+  executeChatTool: (body) => _post('/api/chat/tools/execute', body),
 
   // ========== 本地知识库 / RAG ==========
   listKnowledge: () => _get('/api/knowledge'),
@@ -468,6 +474,8 @@ const Api = {
       300000
     ),
   unloadKnowledgeServices: () => _post('/api/knowledge/services/unload'),
+  // 当前常驻的 embedding / rerank / OCR 服务（Chat 右栏的 Integrations 视图用）
+  getKnowledgeServicesStatus: () => _get('/api/knowledge/services/status'),
 
   // ========== 用户数据备份 ==========
   listBackups: () => _get('/api/backups'),
@@ -484,6 +492,15 @@ const Api = {
   deleteHistory: (id) => _del(`/api/history/${encodeURIComponent(id)}`),
   clearHistory: () => _post('/api/history/clear'),
   relaunchHistory: (id) => _post(`/api/history/${encodeURIComponent(id)}/relaunch`),
+
+  // ========== 本地 API 服务（OpenAI 兼容网关） ==========
+  // 这些是**管理面**接口（挂在启动器上，走会话令牌）。数据面 /v1/* 在网关
+  // 自己的端口上，外部客户端用 Bearer key 访问，页面不直连它。
+  getApiServerStatus: () => _get('/api/api-server/status'),
+  getApiServerLogs: (limit = 100) => _get(`/api/api-server/logs${_qs({ limit })}`),
+  clearApiServerLogs: () => _del('/api/api-server/logs'),
+  restartApiServer: () => _post('/api/api-server/restart', {}),
+  getApiServerRecipes: () => _get('/api/api-server/recipes'),
 
   // ========== WebSocket 监听器（自动重连） ==========
 

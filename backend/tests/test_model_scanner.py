@@ -81,7 +81,13 @@ def _make_junction(link, target) -> bool:
     result = subprocess.run(
         ["cmd", "/c", "mklink", "/J", str(link), str(target)],
         capture_output=True,
+        # `cmd` 的输出走 OEM 代码页（中文 Windows = cp936）。不指定
+        # `encoding/errors` 时 subprocess 的读线程会抛 UnicodeDecodeError，
+        # 表现为 `PytestUnhandledThreadExceptionWarning` —— 看起来像产品缺陷的
+        # 噪声，实际是测试自身的解码问题。
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     return result.returncode == 0
 

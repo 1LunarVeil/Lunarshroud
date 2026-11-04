@@ -1,7 +1,7 @@
 [package]
 name = "lunarshroud"
-version = "0.9.0-beta.2"
-description = "LunarShroud - llama.cpp 桌面端启动器"
+version = "1.0.0"
+description = "LunarShroud - 本地 llama.cpp 聊天与运行时管理"
 authors = ["LunarShroud contributors"]
 license = "MIT"
 edition = "2021"

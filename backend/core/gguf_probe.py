@@ -300,20 +300,50 @@ def _read_metadata(
 
 
 def _scan_tensor_names(reader: _Reader, tensor_count: int, max_tensors: int) -> dict[str, int]:
-    """扫张量名找 MTP/NextN 头。
+    """扫张量名找 MTP/NextN 头，并数出**真正带 KV cache 的层**。
 
     比元数据键更硬的信号：有些模型带 nextn 权重却不写 ``nextn_predict_layers``。
     只看名字，不回读数据，所以很便宜。
+
+    ``attn_layers`` 是给显存估算用的：混合架构（Qwen3.5 的 SSM 层、Mamba 等）
+    只有**部分**层是 dense attention，其余层用循环状态（llama.cpp 在日志里报
+    ``llama_memory_recurrent``），不占 KV cache。实测 Qwen3.5-4B：32 层里
+    只有 **8** 层进 KV。按全部层估 KV 会高出 4 倍，用户看到"13 GiB 超过 8 GiB
+    显卡"的告警，真实占用只有 4 GiB —— 那条假告警会把人吓得反复乱调参数。
+
+    判据是张量名里的 ``attn_k``：只有真正的 attention 层才持有 K/V 投影张量，
+    SSM 层有的是 ``ssm_*``。按层号去重后就是 KV 层数。
     """
-    stats = {"scanned": 0, "nextn": 0}
+    stats = {"scanned": 0, "nextn": 0, "attn_layers": 0}
+    attn_layer_ids: set[str] = set()
     for _ in range(min(tensor_count, max_tensors)):
         name = reader.string()
         stats["scanned"] += 1
-        if "nextn" in name or ".mtp" in name:
+        lowered = name.lower()
+        if "nextn" in lowered or ".mtp" in lowered:
             stats["nextn"] += 1
+        if "attn_k" in lowered or "attn_v" in lowered:
+            layer = _layer_index(name)
+            if layer is not None:
+                attn_layer_ids.add(layer)
         n_dims = reader.u32()
         reader.skip(n_dims * 8 + 4 + 8)  # dims + type + offset
+    stats["attn_layers"] = len(attn_layer_ids)
     return stats
+
+
+def _layer_index(tensor_name: str) -> str | None:
+    """从张量名里取出层号（``blk.7.attn_k.weight`` → ``"7"``）。
+
+    取不到就返回 None（例如全局张量 ``output.weight``），调用方跳过。
+    """
+    parts = tensor_name.split(".")
+    for index, part in enumerate(parts[:-1]):
+        if part == "blk" and index + 1 < len(parts):
+            candidate = parts[index + 1]
+            if candidate.isdigit():
+                return candidate
+    return None
 
 
 def probe_gguf(
@@ -375,7 +405,7 @@ def probe_gguf(
                 return None
             truncated = True
 
-        tensor_stats = {"scanned": 0, "nextn": 0}
+        tensor_stats = {"scanned": 0, "nextn": 0, "attn_layers": 0}
         if scan_tensors and not truncated and not stopped_early:
             try:
                 tensor_stats = _scan_tensor_names(reader, tensor_count, max_tensors)
@@ -494,6 +524,10 @@ def _normalize(
         "has_nextn_weights": has_nextn_weights,
         "is_assistant_model": is_assistant_model,
         "provides_builtin_mtp": provides_builtin_mtp,
+        # 真正持有 KV cache 的层数（混合架构里小于 block_count）。
+        # 0 = 没扫张量（快速路径）或数不出来，调用方应回落到 block_count
+        # 并在界面上说明这是保守估计。
+        "attn_layer_count": tensor_stats.get("attn_layers", 0),
         # 多模态编码器（mmproj 文件自身会声明这些）
         "has_vision_encoder": bool(meta.get("clip.has_vision_encoder")),
         "has_audio_encoder": bool(meta.get("clip.has_audio_encoder")),

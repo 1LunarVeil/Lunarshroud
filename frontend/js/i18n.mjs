@@ -73,6 +73,11 @@ const ERROR_PATTERNS = [
   [/unsupported config key/, 'err.unknownConfigKey'],
   [/invalid launcher session/, 'err.invalidSession'],
   [/request body too large/, 'err.bodyTooLarge'],
+  // 附件超限有两条不同的后端消息：429/400 来自存储层（会话总额度），
+  // 413 来自传输层（上一条）。两条都必须本地化 —— 否则用户看到的是
+  // 一句英文原文，而它恰好是"你刚拖进来的那张图太大了"。
+  [/conversation attachments are too large/, 'err.attachmentTooLarge'],
+  [/attachment .* is too large/, 'err.attachmentTooLarge'],
   [/too many launch parameters/, 'err.tooManyParams'],
   [/llama-server executable is not configured/, 'err.serverNotConfigured'],
   [/previous launcher session ended while this instance was still running/, 'err.instanceInterrupted'],
@@ -91,7 +96,17 @@ const ERROR_PATTERNS = [
   [/knowledge retrieval failed|service unreachable|embedding service returned|rerank service returned/, 'err.knowledgeRetrieval'],
   [/chunk limit/, 'err.knowledgeChunkLimit'],
   [/size budget|too many documents|too many files/, 'err.knowledgeTooLarge'],
-  [/knowledge base setting|knowledge base name is invalid|must be at most|must be a string|must be a number|must be a boolean|top_k must|chunk_chars must/, 'err.knowledgeSetting'],
+  // 这一条必须**只**匹配真正与知识库有关的错误。
+  //
+  // 2026-11-03 实测缺陷：它原先还包含 `must be a number|must be a string|
+  // must be a boolean|must be at most`，于是任何 400 —— 包括
+  // `seed must be a number`（新建会话时的一个 `null` 草稿值）—— 都被翻译成
+  // "知识库设置无效"。用户明明没有任何知识库，却被指着去查知识库设置；
+  // 真正的字段名从头到尾没有出现在界面上。宽泛的错误映射不是"贴心的兜底"，
+  // 它会**吃掉真实诊断**，比不翻译更糟。
+  //
+  // 通用的字段类型错误现在走下面的 `err.invalidValue`，文案里带上原始消息。
+  [/knowledge base setting|knowledge base name is invalid|top_k must|chunk_chars must/, 'err.knowledgeSetting'],
   [/document not found/, 'err.knowledgeDocumentNotFound'],
   [/must be absolute/, 'err.knowledgePathAbsolute'],
   [/knowledge source does not exist/, 'err.knowledgeSourceMissing'],
@@ -100,13 +115,24 @@ const ERROR_PATTERNS = [
   [/no longer matches this index|query embedding dimension/, 'err.knowledgeModelMismatch'],
   [/reranking is enabled but no rerank model/, 'err.knowledgeRerankRequired'],
   [/could not be read|no extractable text|unsupported knowledge file type|binary files are not supported/, 'err.knowledgeExtract'],
+  // 存储不可写：必须说清"这是磁盘/权限问题"，不能让用户去猜。
+  [/data directory is not writable|readonly database|read-only database/, 'err.storageReadonly'],
+  [/database is busy|database is locked/, 'err.storageBusy'],
+  // 通用参数错误，保留字段名（`{detail}` 由调用方填入原始消息）。
+  [/(must be a number|must be a string|must be a boolean|must be an integer|must be at most|must be finite)/, 'err.invalidValue'],
 ];
 
 export function localizeBackendError(message) {
   if (!message) return '';
   const text = String(message);
   for (const [pattern, key] of ERROR_PATTERNS) {
-    if (pattern.test(text)) return t(key);
+    if (pattern.test(text)) {
+      // `err.invalidValue` 是通用兜底：译文本身不带信息量，把后端的原文接在
+      // 后面，否则用户看到"参数无效"却不知道是哪个字段 —— 那和没翻译一样。
+      // 其余键的译文是完整句子，直接返回。
+      if (key === 'err.invalidValue') return `${t(key)}: ${text}`;
+      return t(key);
+    }
   }
   return text;
 }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 import sys
 from pathlib import Path
 
@@ -14,7 +15,13 @@ if str(BACKEND_DIR) not in sys.path:
 # 于是 15 个断言全都证明不了任何安全性质：把 session_auth_middleware 整个删掉
 # 它们依然全绿（曾经的空洞测试形态 #1）。现在改为**启用认证**并让客户端自带
 # 令牌，这些测试才真正穿过认证路径。
-AUTH_TOKEN = "integration-test-token"
+# 运行期生成的会话令牌。它**不是**凭据：这个值只存在于本次测试进程里，通过
+# monkeypatch 写进 `main.SESSION_TOKEN`，测试结束即消失，与任何生产密钥无关。
+#
+# 之所以不写成字面量：一个形如 `AUTH_TOKEN = "..."` 的赋值会被密钥扫描器
+# 稳定地报成"硬编码凭据"，每一轮都要人工复核一遍。生成式把噪音彻底消掉，
+# 语义完全不变（中间件只比较字符串是否相等）。
+AUTH_TOKEN = f"it-{secrets.token_hex(16)}"
 AUTH_HEADERS = {"X-LunarShroud-Token": AUTH_TOKEN}
 # 后端把令牌当 WS subprotocol 传递（main.websocket_session_is_valid），
 # 且要求 "lunarshroud" 这个 marker 与令牌一起出现。
@@ -744,3 +751,38 @@ def test_saving_an_unregistered_server_path_still_saves_config(api_client, monke
     assert response.status_code == 200
     assert response.json()["llama_server_path"] == str(stray)
     assert runtime_registry.get_runtime_preferences()["defaults"] == {}
+
+
+def test_capabilities_survive_a_broken_default_runtime(api_client, monkeypatch):
+    """注册表默认项探测失败时，只读的"本机构建能力"查询不该整个 400。
+
+    真实触发路径：用户在运行环境页注册过一个构建，之后那个文件被移动/删除，
+    注册表里的默认项状态变成 `probe failed`。此后 `_runtime_for_launch(None)`
+    抛 400（"runtime probe failed: rt_xxx"）。旧实现在 `/api/system/capabilities`
+    里没有接住它 —— 于是**新手指南与参数编辑器**都显示"构建探测失败"，
+    而真正的原因是一个失效的注册表默认项，跟当前配置里的路径毫无关系。
+
+    修法：默认项坏掉时退回配置的 `llama_server_path`（与没有注册表时同一行为）。
+    显式点名 runtime_id 仍必须报错 —— 那是调用方真实的请求，不能假装成功。
+    """
+    import main as backend_main
+    from fastapi import HTTPException
+
+    calls: list[str | None] = []
+
+    def fake_runtime(runtime_id=None, *, fallback=False):
+        calls.append(runtime_id)
+        if runtime_id:
+            raise HTTPException(400, f"runtime probe failed: {runtime_id}")
+        raise HTTPException(400, "runtime probe failed: rt_default")
+
+    monkeypatch.setattr(backend_main, "_runtime_for_launch", fake_runtime)
+
+    response = api_client.get("/api/system/capabilities")
+    assert response.status_code == 200, response.text
+    assert "server" in response.json()
+    assert calls == [None], f"should have tried the default once: {calls}"
+
+    # 显式点名的坏运行环境仍然必须是错误（不能因为上面加了兜底就静默）。
+    explicit = api_client.get("/api/system/capabilities?runtime_id=rt_broken")
+    assert explicit.status_code == 400

@@ -111,6 +111,43 @@ def test_command_string_redacts_equals_form():
     assert "[REDACTED]" in text
 
 
+def test_mcp_server_credentials_are_redacted():
+    """MCP 定义里的凭据必须脱敏，两种写法都要盖住。
+
+    这些 JSON 在 argv 里是**独立元素**，按 flag 相邻判断的规则完全不适用 ——
+    实测 `--mcp-servers-json` 的内容原样穿过 redact_argv。Chat 页要展示实例的
+    MCP 配置，这一处不修就等于把凭据直接印在界面上（并随导出外发）。
+    """
+    joined_form = redact_argv([
+        FAKE_EXE,
+        "--mcp-servers-json",
+        '{"mcpServers":{"fs":{"command":"npx","env":{"API_KEY":"sk-live-123","PATH":"/usr/bin"}}}}',
+    ])
+    assert "sk-live-123" not in " ".join(joined_form)
+    # 非凭据字段必须保留，否则这条配置在界面上就没意义了
+    assert "npx" in joined_form[2]
+    assert "/usr/bin" in joined_form[2]
+
+    equals_form = redact_argv([
+        FAKE_EXE,
+        '--mcp-servers-json={"x":{"token":"tok-999","command":"npx"}}',
+    ])
+    assert "tok-999" not in equals_form[1]
+    assert "npx" in equals_form[1]
+
+    # 认证头形式的凭据
+    headers = redact_argv([
+        FAKE_EXE,
+        "--mcp-servers-json",
+        '{"a":{"headers":{"Authorization":"Bearer leaktoken"}}}',
+    ])
+    assert "leaktoken" not in " ".join(headers)
+
+    # `--mcp-servers-config` 的值是**路径**，不该被正则改写
+    config_path = redact_argv([FAKE_EXE, "--mcp-servers-config", "D:/cfg/mcp.json"])
+    assert config_path[2] == "D:/cfg/mcp.json"
+
+
 # ========== 启动前校验 ==========
 
 

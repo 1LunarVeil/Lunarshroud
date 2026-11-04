@@ -52,6 +52,23 @@ def context_size_of(instance: Any) -> int:
     return value if value > 0 else 0
 
 
+def _coerce_token_count(value: Any) -> int:
+    """把客户端给的 token 数变成 int；非法值一律当"没设"（0）。
+
+    ``int(float('inf'))`` 抛 ``OverflowError``，而裁剪路径只捕获
+    ``(TypeError, ValueError)`` —— 一个 ``max_tokens: 1e999`` 的请求（JSON 里
+    完全合法，``json.loads`` 解析成 ``inf``）会冒出去变成 500，而它本该是
+    400 或"按默认值处理"。布尔值也按"没设"处理：``True`` 在 Python 里等于 1，
+    会被读成"只回复 1 个 token"这种看不出来的错。
+    """
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def reply_reserve(payload: dict[str, Any], context_size: int) -> int:
     """本次生成要预留多少 token 给回复。
 
@@ -62,10 +79,7 @@ def reply_reserve(payload: dict[str, Any], context_size: int) -> int:
     if requested is None:
         requested = payload.get("max_completion_tokens")
     ceiling = max(1, int(context_size * 0.8))
-    try:
-        value = int(requested) if requested is not None else 0
-    except (TypeError, ValueError):
-        value = 0
+    value = _coerce_token_count(requested)
     if value > 0:
         return min(value, ceiling)
     return max(_MIN_REPLY_RESERVE_TOKENS, min(1024, context_size // 4))
@@ -81,7 +95,73 @@ def token_budget(context_size: int, payload: dict[str, Any]) -> int:
 
 
 def _message_text(message: dict[str, Any]) -> str:
-    return str(message.get("content") or "")
+    """抽出消息里**可分词**的文本部分。
+
+    多模态消息的 content 是内容块数组（``[{"type":"text",...},
+    {"type":"image_url",...}]``）。直接 ``str(content)`` 会把整段 base64 当成
+    文本喂给 ``/tokenize`` —— 既慢又毫无意义（一张 4 MB 图 base64 后 5.3M
+    字符，一次分词就能把裁剪循环拖死），算出来的 token 数也和模型实际开销
+    无关。所以这里只取 text 块，图片按固定估算单独计（见
+    ``_message_image_tokens``）。
+    """
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+    return ""
+
+
+# 一张图片的 token 开销估算。
+#
+# 真实值由视觉编码器与切片策略决定（Qwen3-VL 这类模型一张 1080p 图可达上千
+# token），而 ``/tokenize`` 只认文本、给不出这个数。用**偏高**的固定值而不是
+# 精确值，是因为这个数只用于"要不要裁历史"：高估的代价是多裁一轮，低估的
+# 代价是请求超窗被 llama-server 拒绝 —— 后者对用户是硬失败。
+_IMAGE_TOKENS_ESTIMATE = 1200
+
+
+def _message_image_count(message: dict[str, Any]) -> int:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return 0
+    return sum(
+        1
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "image_url"
+    )
+
+
+def _measure_rows(rows: Sequence[dict[str, Any]], counted: int) -> int:
+    """文本 token（来自 /tokenize）+ 图片估算。
+
+    图片必须计入，否则带图的对话在裁剪眼里"零成本"：一张 1080p 图能吃掉
+    上千 token，5 张就会把 4K 窗口塞满，而 ``fit_messages_to_context``
+    会认为窗口几乎是空的、一轮都不裁，随后 llama-server 直接拒绝请求。
+    """
+    return counted + sum(
+        _IMAGE_TOKENS_ESTIMATE * _message_image_count(row) for row in rows
+    )
+
+
+async def measure_messages(
+    messages: Sequence[dict[str, Any]],
+    count_tokens: Callable[[str], Awaitable[int]],
+) -> int:
+    """一次说清"这组消息占多少 token"，供调用方做准入判断。
+
+    这是**唯一**的整体计量入口。把它抽出来是因为曾经有两套规则：裁剪循环用
+    ``_message_text``（只取 text 块 + 图片估算），而转发前的初始计量用
+    ``str(content)`` —— 后者会把整段 base64 图片当文本发给 ``/tokenize``。
+    实测一张 4 MB 图的初始计量变成 5.6 MB 请求 / 2.65 秒 / 约 280 万 token，
+    每轮都白付，4 张图时逼近超时。计量只有一份实现，就不会再漂移。
+    """
+    counted = await count_tokens("\n".join(_message_text(m) for m in messages))
+    return _measure_rows(messages, counted)
 
 
 async def fit_messages_to_context(
@@ -110,7 +190,8 @@ async def fit_messages_to_context(
     dropped = 0
     total = 0
     for _ in range(_MAX_TRIM_PASSES):
-        total = await count_tokens("\n".join(_message_text(m) for m in kept))
+        counted = await count_tokens("\n".join(_message_text(m) for m in kept))
+        total = _measure_rows(kept, counted)
         if total <= budget_tokens:
             return kept, dropped, total
         # 可裁的：除最后一条以外的非 system 轮次
@@ -127,5 +208,5 @@ async def fit_messages_to_context(
         for index in sorted(droppable[:share], reverse=True):
             kept.pop(index)
             dropped += 1
-    total = await count_tokens("\n".join(_message_text(m) for m in kept))
-    return kept, dropped, total
+    counted = await count_tokens("\n".join(_message_text(m) for m in kept))
+    return kept, dropped, _measure_rows(kept, counted)

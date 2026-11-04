@@ -191,3 +191,157 @@ def test_tiny_or_non_positive_window_yields_no_trim_budget(bad):
     调用方拿到 0 就跳过裁剪，让上游去报"上下文不够"，而不是我们替它悄悄丢历史。
     """
     assert chat_context.token_budget(bad, {}) == 0
+
+
+def test_multimodal_content_is_measured_by_its_text_parts_only():
+    """多模态消息只把 text 块送去分词，不能把 base64 当文本。
+
+    实测：一张 4 MB 图 base64 后约 5.3M 字符。直接 ``str(content)`` 会把这
+    5.3M 字符喂给 ``/tokenize``，既慢（拖死裁剪循环）又毫无意义（那个数与视觉
+    编码器的实际开销无关）。
+    """
+    image_message = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "描述这张图"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 50_000}},
+        ],
+    }
+    assert chat_context._message_text(image_message) == "描述这张图"
+    assert chat_context._message_text({"role": "user", "content": "hello"}) == "hello"
+    # 只有图没有文字 → 空串，而不是 repr
+    assert (
+        chat_context._message_text(
+            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}
+        )
+        == ""
+    )
+
+
+def test_images_consume_the_token_budget_so_history_is_actually_trimmed():
+    """图片必须计入预算，否则带图对话在裁剪眼里是"零成本"。
+
+    真实失败形态：调用方算出"窗口还很空、一轮都不用裁"，把带图的请求发出去，
+    llama-server 因超窗直接拒绝 —— 用户看到的是硬失败，而不是"丢了几轮历史"。
+    """
+    messages = []
+    # 每轮 ~400 字符（≈100 token），12 轮 ≈ 1200 token 文本，与图片估算同量级，
+    # 才构成真正的"裁掉历史就能装下"的空间。
+    for index in range(6):
+        messages.append({"role": "user", "content": f"old question {index} " + "x" * 400})
+        messages.append({"role": "assistant", "content": f"old answer {index} " + "y" * 400})
+    messages.append(
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ],
+        }
+    )
+
+    async def count(text):
+        return max(1, len(text) // 4) if text else 0
+
+    # 先量出两个边界，而不是猜一个预算数字：
+    #   full    = 全量（文本 + 图片估算）
+    #   minimal = 只留最后那条带图消息时的总量（图片本身的开销，裁不掉）
+    # 预算取两者之间，就能同时断言"确实裁了"和"裁完确实装得下"。
+    texts = [chat_context._message_text(m) for m in messages]
+    full = run(count("\n".join(texts)))
+    minimal = run(count(texts[-1])) + chat_context._IMAGE_TOKENS_ESTIMATE
+    assert minimal < full, "测试数据没有构造出可裁剪的空间"
+
+    budget = (minimal + full) // 2
+    kept, dropped, total = run(chat_context.fit_messages_to_context(messages, budget, count))
+    assert dropped > 0, "图片没有被计入预算，历史一点没裁"
+    assert total <= budget, f"裁完仍然超额：total={total} budget={budget}"
+    assert any(isinstance(m.get("content"), list) for m in kept)
+
+
+def test_a_single_image_larger_than_the_budget_is_not_silently_accepted():
+    """图片本身超过预算时，裁历史救不了它 —— 必须如实返回超额的 token 数。
+
+    真实边界：``ctx_size`` 很小时（或被别的请求占满时），一张图的估算开销就
+    可能大于预算。此时把历史全裁光也没用。函数必须返回**真实的** total，让
+    调用方看到"还是超了"，而不是返回一个 ≤ 预算的假数字、让请求到上游才炸。
+    """
+    messages = [
+        {"role": "user", "content": "older question"},
+        {"role": "assistant", "content": "older answer"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ],
+        },
+    ]
+
+    async def count(text):
+        return max(1, len(text) // 4) if text else 0
+
+    kept, dropped, total = run(chat_context.fit_messages_to_context(messages, 300, count))
+    assert len(kept) == 1
+    assert dropped == 2
+    assert total > 300, "超额必须如实报告，不能假装装下了"
+
+
+def test_image_estimate_is_not_applied_to_text_only_conversations():
+    """纯文本对话的裁剪结果不能被图片估算改变。
+
+    无差别加上 1200 token 会让每个纯文本对话都平白少掉一段历史 —— 那是没有
+    依据的静默降级。
+    """
+    messages = [
+        {"role": "user", "content": "a" * 400},
+        {"role": "assistant", "content": "b" * 400},
+        {"role": "user", "content": "c" * 40},
+    ]
+
+    async def count(text):
+        return max(1, len(text) // 4) if text else 0
+
+    kept, dropped, total = run(chat_context.fit_messages_to_context(messages, 300, count))
+    assert dropped == 0
+    assert len(kept) == 3
+
+
+def test_measure_messages_never_sends_base64_image_data_to_the_tokenizer():
+    """**入口级**计量不许把图片 base64 当文本量。
+
+    `_message_text` 本身是对的（上面那条钉住了），但转发前的初始计量曾经绕开
+    它、直接用 `str(content)`：多模态 content 是内容块数组，`str()` 会得到含
+    完整 data URL 的 Python repr。实测一张 4 MB 图 → `/tokenize` 收到 5.6 MB
+    文本、耗时 2.65 秒、返回约 280 万 token；每一轮都白付，4 张图时逼近 15 秒
+    超时。
+
+    "纯函数对、调用点错"是这类缺陷的典型形态，所以必须有一条**穿过调用点**的
+    断言。退回 `str(content)` 时 seen 里会出现 base64 头，必红。
+    """
+    fake_b64 = "iVBORw0KGgo" + "A" * 6000
+    messages = [
+        {"role": "user", "content": "先看这张图"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "这张图里有什么？"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{fake_b64}"},
+                },
+            ],
+        },
+    ]
+    seen: list[str] = []
+
+    async def count(text):
+        seen.append(text)
+        return max(1, len(text) // 4) if text else 0
+
+    total = run(chat_context.measure_messages(messages, count))
+    joined = "\n".join(seen)
+    assert "iVBORw0KGgo" not in joined, "base64 image data reached the tokenizer"
+    assert "这张图里有什么" in joined, "text parts must still be measured"
+    # 图片本身仍要计入（固定估算），否则带图对话在裁剪眼里是"零成本"。
+    assert total >= chat_context._IMAGE_TOKENS_ESTIMATE

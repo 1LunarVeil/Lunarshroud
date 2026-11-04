@@ -47,22 +47,27 @@ _CACHE_TYPE_BYTES = {
     "iq4_nl": 18 / 32,
 }
 
-# CUDA 上下文 + 计算图/临时缓冲的开销（GiB）。原先是一个固定 0.5，问题是
-# 这块缓冲要等计算图真正建立才分配，也就是**首次推理**那一刻，而它的尺寸随
-# 上下文长度**和层数**增长 —— 固定值等于在大模型/长上下文下系统性低估，而
-# 低估的方向恰好是崩得最难看的那个方向（加载通过、就绪通过、一说话就死）。
+# CUDA 上下文 + 计算图/临时缓冲的开销（GiB）。
 #
-# 实测标定（RTX 5060 Laptop 8151 MiB = 7.96 GiB，-ngl 99 -fa on --kv-unified
-# -ctk/-ctv q8_0，挂 mmproj）：
-#   MiMo-9B-Q4_K_M  32 层  权重 5.44  -c 8192  KV 0.53 → 7.33  实测正常
-#   MiMo-9B-Q4_K_M  32 层  权重 5.44  -c 16384 KV 1.06 → 7.96  实测可跑（零余量）
-#   MiMo-9B-Q4_K_M  32 层  权重 5.44  -c 32768 KV 2.13 → 9.23  实测首次推理即 CUDA 崩
-#   Bonsai-27B-PTQ  64 层  权重 5.54  -c 8192  KV 1.06 → 8.06  实测就绪探测超时
-# 线性近似只到"数量级正确"，不是精确建模；界面上必须继续标注"估算"。
-_COMPUTE_BASE_GIB = 0.30           # CUDA 上下文 + 与规模无关的固定 scratch
-_COMPUTE_PER_4K_CTX_GIB = 0.05     # 每 4096 token 上下文的增量
-_COMPUTE_PER_16_LAYERS_GIB = 0.05  # 每 16 层的增量（每层都有激活/归约缓冲）
-_COMPUTE_MAX_GIB = 2.0
+# 这块最难估，历史上有过两次系统性错误，值得写清楚：
+#
+# 1) 最初是一个固定 0.5。问题是计算缓冲要等计算图建立才分配（首次推理那一刻），
+#    尺寸随**层数**增长 —— 固定值在大模型下系统性低估，而低估的方向恰好是
+#    崩得最难看的那个方向。
+# 2) 后来改成"随 ctx **线性**增长"。实测（Qwen3.5-4B，131072 上下文，-fa on）：
+#    llama.cpp 报 compute buffer = 207.02 + 148.02 MiB ≈ 0.35 GiB，而线性公式
+#    给出 2.0 GiB（还撞了上限）—— 又变成高估 6 倍。
+#
+# 根因：compute buffer 主要由**单次前向的 batch/ubatch** 决定（默认 2048/512），
+# 而不是由 ctx 决定。128K 上下文并不需要 128K 个 token 同时进计算图。ctx 只
+# 影响 attention 的临时空间，那部分相对很小。
+#
+# 所以现在：以层数为主（每层都有激活/归约缓冲），ctx 的贡献用一个**很缓**的
+# 系数并设小上限。宁可略高，也不能再出现"6 倍"这种量级的偏差。
+_COMPUTE_BASE_GIB = 0.20           # CUDA/Vulkan 上下文 + 与规模无关的固定 scratch
+_COMPUTE_PER_16_LAYERS_GIB = 0.06  # 每 16 层的激活/归约缓冲
+_COMPUTE_PER_32K_CTX_GIB = 0.05    # 每 32768 token 的 attention 临时空间（缓增长）
+_COMPUTE_MAX_GIB = 1.5
 
 
 def fit_verdict(gpu_gib: float, devices: list[dict[str, Any]]) -> dict[str, Any]:
@@ -102,11 +107,11 @@ def fit_verdict(gpu_gib: float, devices: list[dict[str, Any]]) -> dict[str, Any]
 
 
 def compute_overhead_gib(ctx_size: int | None, block_count: int | None = None) -> float:
-    """计算缓冲 + CUDA 上下文的估算（GiB），随上下文长度**和层数**增长。
+    """计算缓冲 + CUDA 上下文的估算（GiB）。
 
-    层数那一维不是可有可无：Bonsai-2-27B 有 64 层，是同一台机器上 MiMo-9B（32 层）
-    的两倍。只按 ctx 缩放时它被算成 7.94 GiB、显卡 7.96 GiB —— 判"刚好装得下"，
-    而 llama.cpp 自己明说装不下；补上层数项后是 8.06 GiB，判 over，与真机一致。
+    层数是主项：每层都有激活/归约缓冲，层数翻倍这部分也翻倍。ctx 只贡献一小块
+    attention 临时空间（32768 token 一个台阶），**不是**线性主导项 —— 详见上方
+    常数的注释（线性版本实测高估 6 倍）。
     """
     def _as_number(value: Any) -> float:
         try:
@@ -120,8 +125,8 @@ def compute_overhead_gib(ctx_size: int | None, block_count: int | None = None) -
 
     scaled = (
         _COMPUTE_BASE_GIB
-        + (_as_number(ctx_size) / 4096.0) * _COMPUTE_PER_4K_CTX_GIB
         + (_as_number(block_count) / 16.0) * _COMPUTE_PER_16_LAYERS_GIB
+        + (_as_number(ctx_size) / 32768.0) * _COMPUTE_PER_32K_CTX_GIB
     )
     return min(scaled, _COMPUTE_MAX_GIB)
 
@@ -168,8 +173,22 @@ def estimate_vram(
     embedding_length: int | None = None,
     kv_offload: bool = True,
     extra_weights_bytes: int = 0,
+    attn_layer_count: int | None = None,
 ) -> dict[str, Any]:
-    """返回显存估算（单位 GiB）。所有输入都来自 GGUF 元数据与当前参数值。"""
+    """返回显存估算（单位 GiB）。所有输入都来自 GGUF 元数据与当前参数值。
+
+    ``attn_layer_count`` 是**真正持有 KV cache 的层数**，来自张量名扫描
+    （见 ``gguf_probe._scan_tensor_names``）。混合架构（Qwen3.5 / Mamba）
+    只有部分层是 dense attention，其余层用循环状态、不占 KV。
+
+    这个参数不是可选优化，是正确性前提：实测 Qwen3.5-4B 有 32 个 block，
+    但只有 8 层进 KV。按 32 层算出的 KV 是 16 GiB（超过 8 GiB 显卡 2 倍），
+    而 llama.cpp 实际只分配 4 GiB —— 那条"必然爆显存"的告警纯属误报，
+    用户会为了一个不存在的问题去砍上下文、降层数、换量化。
+
+    ``None`` / 0 表示数不出来（没扫张量），此时回落到 ``block_count``
+    **并标注** ``kv_layers_source = "block-count"``，让界面能说明这是保守上界。
+    """
     ratio = resolve_gpu_ratio(n_gpu_layers, block_count)
     slots = max(1, int(parallel or 1))
 
@@ -188,12 +207,24 @@ def estimate_vram(
     else:
         k_dim = v_dim = None
 
+    # KV 层数：优先用真实 attention 层数，否则回落 block_count（保守）。
+    # 两者都拿不到时 kv_layers 保持 None、来由标成 unavailable —— 不能留一个
+    # 未赋值的局部变量让整个估算接口 500。
+    kv_layers = None
+    kv_layers_source = "unavailable"
+    if isinstance(attn_layer_count, int) and attn_layer_count > 0:
+        kv_layers = attn_layer_count
+        kv_layers_source = "attention-tensors"
+    elif block_count:
+        kv_layers = block_count
+        kv_layers_source = "block-count"
+
     # KV 估算的三种可信度：声明的元数据 / 回退推算 / 完全算不出。
     # 混成一个 partial 会把"偏保守"和"只有权重"说成同一件事。
     kv_gib = 0.0
-    if block_count and ctx_size and kv_heads and k_dim:
-        k_bytes = block_count * ctx_size * kv_heads * k_dim * _bytes_per_element(cache_type_k)
-        v_bytes = block_count * ctx_size * kv_heads * v_dim * _bytes_per_element(cache_type_v)
+    if kv_layers and ctx_size and kv_heads and k_dim:
+        k_bytes = kv_layers * ctx_size * kv_heads * k_dim * _bytes_per_element(cache_type_k)
+        v_bytes = kv_layers * ctx_size * kv_heads * v_dim * _bytes_per_element(cache_type_v)
         kv_gib = (k_bytes + v_bytes) * slots / GIB
         kv_source = "declared" if (head_count_kv and key_length and value_length) else "derived"
     else:
@@ -218,6 +249,9 @@ def estimate_vram(
         "slots": slots,
         "kv_heads": kv_heads or None,
         "head_dim": round(k_dim, 1) if k_dim else None,
+        # KV 层数及其来源：界面据此说明"这是实测层数"还是"按总层数的保守上界"
+        "kv_layers": kv_layers,
+        "kv_layers_source": kv_layers_source,
         # 界面据此决定提示哪一档（见前端 params.vramPartial*）
         "kv_source": kv_source,
         "partial": kv_source != "declared",
@@ -239,7 +273,11 @@ def estimate_for_model(
     mmproj 也算进权重 —— 它确实要占显存，漏掉它会让"带视觉的模型"估得偏小。
     """
     path = Path(model_path)
-    info = probe_gguf_cached(path, scan_tensors=False, stop_at_tokenizer=True)
+    # scan_tensors=True 是为了拿到 attn_layer_count（KV 层数）。代价是几十毫秒，
+    # 换来的是混合架构模型不再被高估 4 倍 —— 这个交换非常划算。
+    info = probe_gguf_cached(
+        path, scan_tensors=True, stop_at_tokenizer=True
+    )
     if info is None:
         return {"probed": False, "error": "不是一个可解析的 GGUF 文件"}
 
@@ -270,6 +308,7 @@ def estimate_for_model(
         value_length=info["value_length"],
         embedding_length=info["embedding_length"],
         extra_weights_bytes=extra_bytes,
+        attn_layer_count=info.get("attn_layer_count"),
     )
     estimate.update({
         "probed": True,

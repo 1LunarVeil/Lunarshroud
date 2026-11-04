@@ -22,6 +22,7 @@
 """
 from __future__ import annotations
 
+import secrets
 import sys
 from pathlib import Path
 
@@ -31,7 +32,11 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-AUTH_TOKEN = "auth-coverage-token"
+# 运行期生成的会话令牌，**不是凭据**：只在本次测试进程内存在，通过 monkeypatch
+# 写进 `main.SESSION_TOKEN`，用来验证"无令牌 401 / 有令牌非 401"两侧。
+# 写成字面量会被密钥扫描器稳定报成"硬编码凭据"，每轮都要人工复核一遍才能
+# 排除；生成式让噪音消失，而断言的语义完全不变（中间件只比字符串）。
+AUTH_TOKEN = f"ac-{secrets.token_hex(16)}"
 SESSION_ID = "auth-coverage-session"
 
 # 刻意不需要令牌的端点。**这个集合不该增长** —— 要加豁免必须显式改这里并写明理由。
@@ -50,11 +55,22 @@ WS_PATHS = frozenset({
 
 # 路径参数的样例值。**必须穷举**：漏掉一个，生成的 URL 会含 "{xxx}"，
 # 而认证中间件仍会返回 401 —— 那会让本测试假绿（见模块文档的"两侧都要验"）。
+#
+# 2026-10-28 实测：未填参数的 URL 在**两侧**都"通过"——无令牌 401（中间件不看
+# 路径），有令牌 404（字面量 `{base_id}` 匹配不上任何路由）。当时缺 7 个参数，
+# 等价于"一条根本不存在的路由也能过全绿"。
 _SAMPLES = {
     "instance_id": "00000000-0000-0000-0000-000000000000",
     "preset_id": "sample-preset",
     "record_id": "1",
     "path": "index.html",
+    "base_id": "sample-base",
+    "conversation_id": "1",
+    "document_id": "1",
+    "message_id": "1",
+    "name": "sample-backup",
+    "prompt_id": "sample-prompt",
+    "runtime_id": "sample-runtime",
 }
 
 
@@ -66,17 +82,37 @@ def _fill(route_path: str) -> str:
 
 
 def _http_routes(app) -> list[tuple[str, str]]:
-    """枚举 HTTP 路由（方法，路径），跳过 Mount 与 WebSocket 路由。"""
+    """枚举 HTTP 路由（方法，路径），跳过 Mount 与 WebSocket 路由。
+
+    **必须递归**：``app.include_router(x)`` 在 FastAPI 0.141 / Starlette 1.3 下
+    不把子路由摊平进 ``app.routes``，而是插入一个惰性的 ``_IncludedRouter``
+    节点，其 ``path`` 是 ``None``。只读 ``route.path`` 的枚举看不见被包含的
+    路由 —— 实测 25 条（presets 9 / models 11 / history 5）就这样从这道门禁里
+    消失，而运行时它们其实受保护：于是"安全门禁全绿"与"门禁根本没看它们"
+    同时成立。这正是 AGENTS §2.2 警告的假绿形状。
+
+    ``include_context.prefix`` 会被拼回去，保证看到的就是实际 URL。
+    """
     found: set[tuple[str, str]] = set()
-    for route in app.routes:
-        path = getattr(route, "path", None)
-        methods = getattr(route, "methods", None)
-        if path is None or not methods:
-            continue
-        for method in methods:
-            if method in ("HEAD", "OPTIONS", "TRACE"):
+
+    def walk(routes, prefix: str) -> None:
+        for route in routes:
+            included = getattr(route, "original_router", None)
+            if included is not None:
+                context = getattr(route, "include_context", None)
+                inner = getattr(context, "prefix", "") or ""
+                walk(getattr(included, "routes", []), prefix + inner)
                 continue
-            found.add((method, path))
+            path = getattr(route, "path", None)
+            methods = getattr(route, "methods", None)
+            if path is None or not methods:
+                continue
+            for method in methods:
+                if method in ("HEAD", "OPTIONS", "TRACE"):
+                    continue
+                found.add((method, prefix + path))
+
+    walk(app.routes, "")
     return sorted(found)
 
 
@@ -121,8 +157,62 @@ def test_route_enumeration_is_actually_finding_routes(app):
         ("GET", "/api/system/config"),
         ("POST", "/api/instances"),
         ("GET", "/api/system/ready"),
+        # 这三条来自 `app.include_router(...)`（惰性 _IncludedRouter 节点）。
+        # 它们曾经不在枚举里 —— 那条恒真断言正好覆盖了"看起来正常"的部分。
+        ("GET", "/api/presets"),
+        ("GET", "/api/models/scan"),
+        ("GET", "/api/history"),
     ):
         assert expected in routes, f"{expected} 未被枚举到；routes={routes}"
+
+
+def test_included_routers_are_not_skipped(app):
+    """`include_router` 挂进来的路由必须仍被穷举看见。
+
+    2026-10-28 实测：FastAPI 0.141 / Starlette 1.3 的 ``include_router`` 不摊平
+    子路由，而是插入 ``_IncludedRouter``（``path=None``）。旧的枚举只读
+    ``route.path``，于是 25 条已挂载路由从门禁里静默消失 —— 而运行时它们确实
+    返回 401，所以"测试全绿"与"测试没看它们"同时为真。
+
+    本测试从**另一个角度**独立数一遍：直接数每个 router 自己的 routes。
+    两个数字不一致就说明枚举又漏了东西。
+    """
+    flat = {path for _method, path in _http_routes(app)}
+
+    mounted = []
+    for node in app.routes:
+        original = getattr(node, "original_router", None)
+        if original is None:
+            continue
+        prefix = getattr(getattr(node, "include_context", None), "prefix", "") or ""
+        for route in getattr(original, "routes", []):
+            path = getattr(route, "path", None)
+            # 只比对 HTTP 路由：WS 路由没有 .methods，_http_routes 本就不枚举，
+            # 它们由 test_websocket_routes_reject_missing_token 单独覆盖。
+            if path and getattr(route, "methods", None):
+                mounted.append(prefix + path)
+
+    assert mounted, "没有任何 include_router 挂载 —— 本测试将失去意义"
+    missing = sorted({p for p in mounted if p not in flat})
+    assert not missing, f"以下 include_router 路由未被穷举看见：{missing}"
+
+
+def test_every_path_parameter_has_a_sample(app):
+    """路径参数缺样例 = 该 URL 永远匹配不上 = 两侧都假绿。
+
+    未填的 `{base_id}` 会让请求打到字面量路径：认证中间件不看路径，返回 401
+    （"已保护"）；带令牌时返回 404（"可达"）。一条**完全不存在**的路由能同时
+    通过这两侧 —— 所以样例表必须穷举，缺一个就报错。
+    """
+    import re
+
+    needed: set[str] = set()
+    for _method, path in _http_routes(app):
+        needed.update(re.findall(r"\{(\w+)\}", path))
+    missing = sorted(needed - set(_SAMPLES))
+    assert not missing, (
+        f"这些路径参数没有样例值，相关路由的断言是空的：{missing}"
+    )
 
 
 def test_every_http_route_is_behind_token_auth(app, monkeypatch):

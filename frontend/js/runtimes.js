@@ -60,6 +60,9 @@ async function refresh() {
     loadError = localizeBackendError(error.message || String(error));
   }
   render();
+  // 数据变了，侧栏列表也要跟上。refreshList 由 app.js 注入；在 workspace
+  // 子页面里它重绘的是 workspace 当前的列表区。
+  ctx.refreshList?.();
 }
 
 function render() {
@@ -85,29 +88,66 @@ function render() {
     })}</div>`;
     return;
   }
-  body.innerHTML = `
-    <div class="card">
-      <div class="card-header">
-        <span class="card-title">${ctx.escapeHtml(t('runtimes.registered'))} · ${profiles.length}</span>
-        <div class="card-actions"><span class="text-sm text-muted">${ctx.escapeHtml(t('runtimes.defaultHint'))}</span></div>
-      </div>
-      <div class="table-wrap">
-        <table class="table">
-          <thead><tr>
-            <th>${ctx.escapeHtml(t('runtimes.name'))}</th>
-            <th>${ctx.escapeHtml(t('runtimes.version'))}</th>
-            <th>${ctx.escapeHtml(t('runtimes.backend'))}</th>
-            <th>${ctx.escapeHtml(t('runtimes.status'))}</th>
-            <th>${ctx.escapeHtml(t('runtimes.actions'))}</th>
-          </tr></thead>
-          <tbody>
-            ${profiles.map((profile) => rowHtml(profile)).join('')}
-          </tbody>
-        </table>
-      </div>
-    </div>
-    <div id="runtime-detail">${detailHtml()}</div>
-  `;
+  // 列表在侧栏，正文只留选中项的详情。两处各列一份同一批构建正是
+  // "功能东一块西一块"的典型 —— 用户要点两次才知道哪份是可操作的。
+  body.innerHTML = `<div id="runtime-detail">${detailHtml()}</div>`;
+}
+
+// ========== 侧栏列表：运行环境 ==========
+
+/**
+ * 侧栏里的构建列表。
+ *
+ * 与正文的分工：列表负责"选哪个"（名称 / 版本 / 后端 / 状态），详情负责
+ * "对这个做什么"（探测 / 设为默认 / 移除）。这样切一次就能换目标，
+ * 而不是在卡片里先找到卡片再找卡片里的按钮。
+ */
+/** 侧栏列表的标题与主行动。 */
+export function sidebarListTitle() {
+  return t('nav.runtimes');
+}
+
+export function sidebarListAction() {
+  return { label: '+', title: t('runtimes.add'), onClick: () => addRuntime() };
+}
+
+export function renderSidebarList(el) {
+  if (loadError) {
+    el.innerHTML = `<div class="panel-empty">${ctx.escapeHtml(t('runtimes.loadFailed'))}</div>`;
+    return;
+  }
+  if (!profiles.length) {
+    el.innerHTML = `<div class="panel-empty">${ctx.escapeHtml(t('runtimes.empty'))}</div>`;
+    return;
+  }
+  el.innerHTML = `<div class="panel-list">${profiles
+    .map((profile) => {
+      const isDefault = preferences.gguf === profile.id;
+      const selected = profile.id === selectedId;
+      return `
+      <button type="button" class="panel-list-item ${selected ? 'active' : ''}"
+        data-list-key="${ctx.escapeHtml(profile.id)}" data-runtime-id="${ctx.escapeHtml(profile.id)}"
+        ${selected ? 'aria-current="true"' : ''}>
+        <span class="panel-list-row">
+          <span class="panel-list-label">${ctx.escapeHtml(profile.display_name || profile.id)}</span>
+          ${isDefault ? `<span class="tag">${ctx.escapeHtml(t('runtimes.default'))}</span>` : ''}
+        </span>
+        <span class="panel-list-meta">
+          ${statusHtml(profile)}
+          <span class="panel-list-meta-text text-mono">${ctx.escapeHtml(
+            `${versionText(profile)} · ${backendLabel(profile.backend)}`
+          )}</span>
+        </span>
+      </button>`;
+    })
+    .join('')}</div>`;
+  el.querySelectorAll('[data-runtime-id]').forEach((node) => {
+    node.addEventListener('click', () => {
+      selectedId = node.dataset.runtimeId;
+      render();
+      ctx.refreshList?.();
+    });
+  });
 }
 
 function versionText(profile) {
@@ -122,28 +162,6 @@ function statusHtml(profile) {
     return `<span class="badge badge-running">${ctx.escapeHtml(t('runtimes.ok'))}</span>`;
   }
   return `<span class="badge badge-failed">${ctx.escapeHtml(t('runtimes.probeFailed'))}</span>`;
-}
-
-function rowHtml(profile) {
-  const isDefault = preferences.gguf === profile.id;
-  const selected = profile.id === selectedId;
-  return `
-    <tr${selected ? ' class="runtime-row-selected"' : ''}>
-      <td>
-        <div class="flex items-center gap-2">
-          <button type="button" class="btn btn-sm btn-ghost" data-action="select" data-id="${ctx.escapeHtml(profile.id)}">${ctx.escapeHtml(profile.display_name || profile.id)}</button>
-          ${isDefault ? `<span class="tag">${ctx.escapeHtml(t('runtimes.default'))}</span>` : ''}
-        </div>
-      </td>
-      <td class="text-mono text-sm">${ctx.escapeHtml(versionText(profile))}</td>
-      <td>${ctx.escapeHtml(backendLabel(profile.backend))}</td>
-      <td>${statusHtml(profile)}</td>
-      <td>
-        <button class="btn btn-sm btn-secondary" data-action="probe" data-id="${ctx.escapeHtml(profile.id)}"${busy ? ' disabled' : ''}>${ctx.escapeHtml(t('runtimes.probe'))}</button>
-        <button class="btn btn-sm btn-secondary" data-action="default" data-id="${ctx.escapeHtml(profile.id)}"${isDefault || profile.status !== 'ok' ? ' disabled' : ''} title="${ctx.escapeHtml(profile.status === 'ok' ? t('runtimes.setDefault') : t('runtimes.defaultUnavailable'))}">${ctx.escapeHtml(t('runtimes.setDefault'))}</button>
-        <button class="btn btn-sm btn-ghost" data-action="remove" data-id="${ctx.escapeHtml(profile.id)}">${ctx.escapeHtml(t('runtimes.remove'))}</button>
-      </td>
-    </tr>`;
 }
 
 function backendLabel(backend) {
@@ -220,14 +238,14 @@ function detailHtml() {
       </div>
       ${localized ? `<div class="text-sm text-muted mb-2">${ctx.escapeHtml(localized)}</div>` : ''}
       <div class="text-mono text-sm mb-2 break-all text-tertiary">${ctx.escapeHtml(profile.executable_path || '')}</div>
-      <div class="flex gap-3 mt-2" flex-wrap>
-        <span><span class="text-muted">${ctx.escapeHtml(t('runtimes.version'))}:</span> <span class="text-mono">${ctx.escapeHtml(versionText(profile))}</span></span>
-        <span><span class="text-muted">${ctx.escapeHtml(t('runtimes.backend'))}:</span> ${ctx.escapeHtml(backendLabel(profile.backend))}</span>
-        <span><span class="text-muted">${ctx.escapeHtml(t('runtimes.domains'))}:</span> ${ctx.escapeHtml((profile.domains || []).join(', ') || '-')}</span>
-        <span><span class="text-muted">${ctx.escapeHtml(t('runtimes.formats'))}:</span> ${ctx.escapeHtml((profile.supported_model_formats || []).join(', ') || '-')}</span>
-        <span><span class="text-muted">${ctx.escapeHtml(t('runtimes.options'))}:</span> ${ctx.escapeHtml(String(probe.option_count ?? '-'))}</span>
-        <span><span class="text-muted">${ctx.escapeHtml(t('runtimes.probedAt'))}:</span> ${ctx.escapeHtml(probe.probed_at ? ctx.formatTime(new Date(probe.probed_at * 1000).toISOString()) : '-')}</span>
-      </div>
+      <dl class="runtime-detail-meta">
+        <div><dt>${ctx.escapeHtml(t('runtimes.version'))}</dt><dd class="text-mono">${ctx.escapeHtml(versionText(profile))}</dd></div>
+        <div><dt>${ctx.escapeHtml(t('runtimes.backend'))}</dt><dd>${ctx.escapeHtml(backendLabel(profile.backend))}</dd></div>
+        <div><dt>${ctx.escapeHtml(t('runtimes.domains'))}</dt><dd>${ctx.escapeHtml((profile.domains || []).join(', ') || '-')}</dd></div>
+        <div><dt>${ctx.escapeHtml(t('runtimes.formats'))}</dt><dd>${ctx.escapeHtml((profile.supported_model_formats || []).join(', ') || '-')}</dd></div>
+        <div><dt>${ctx.escapeHtml(t('runtimes.options'))}</dt><dd>${ctx.escapeHtml(String(probe.option_count ?? '-'))}</dd></div>
+        <div><dt>${ctx.escapeHtml(t('runtimes.probedAt'))}</dt><dd>${ctx.escapeHtml(probe.probed_at ? ctx.formatTime(new Date(probe.probed_at * 1000).toISOString()) : '-')}</dd></div>
+      </dl>
       <div class="mt-3">
         <div class="card-title">${ctx.escapeHtml(t('runtimes.devices'))}</div>
         ${devicesHtml(profile)}

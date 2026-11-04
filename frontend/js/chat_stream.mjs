@@ -61,7 +61,10 @@ export function createSseParser() {
  * Normalize one OpenAI-compatible chunk.
  *
  * llama.cpp may put reasoning text in `reasoning_content`; usage/timings can
- * arrive on the final chunk. All fields are optional.
+ * arrive on the final chunk. Tool calls stream **incrementally** — the same
+ * `index` appears in many chunks, each carrying a fragment of `arguments`
+ * (measured against b11698: `{"` → `\"pattern\":\"` → `*` → `gg` → `uf` …).
+ * All fields are optional.
  */
 export function extractChunk(payload) {
   if (!payload || typeof payload !== 'object') return null;
@@ -76,11 +79,68 @@ export function extractChunk(payload) {
         : typeof delta.reasoning === 'string'
           ? delta.reasoning
           : '',
+    // 原样透出，由 accumulateToolCalls 负责按 index 合并增量
+    toolCalls: Array.isArray(delta.tool_calls) ? delta.tool_calls : [],
     finishReason: choice && choice.finish_reason ? String(choice.finish_reason) : null,
     usage: payload.usage && typeof payload.usage === 'object' ? payload.usage : null,
     timings: payload.timings && typeof payload.timings === 'object' ? payload.timings : null,
     error: error ? String(error.message || error) : null,
   };
+}
+
+/**
+ * 把增量的 `tool_calls` 累加成完整调用列表。
+ *
+ * 为什么需要专门写：服务端每次只发**一段**参数字符串，靠 `index` 标识属于
+ * 哪一个调用。直接覆盖会让参数只剩最后一个字符；直接 push 会得到十几个
+ * 同名残缺调用。实测 b11698 的 `arguments` 就是这么逐字符/逐词到的。
+ *
+ * `id` 与 `name` 只在第一段出现，后续段没有 —— 所以不能"以新值覆盖旧值"，
+ * 只能"有值才写"。
+ *
+ * @param {Array} existing 已累加的结果（会被修改）
+ * @param {Array} deltas   本帧的 delta.tool_calls
+ * @returns {Array} 同一个数组引用，便于调用方保持
+ */
+export function accumulateToolCalls(existing, deltas) {
+  const list = Array.isArray(existing) ? existing : [];
+  for (const delta of Array.isArray(deltas) ? deltas : []) {
+    if (!delta || typeof delta !== 'object') continue;
+    const index = Number.isInteger(delta.index) ? delta.index : 0;
+    while (list.length <= index) {
+      list.push({ id: '', type: 'function', function: { name: '', arguments: '' } });
+    }
+    const target = list[index];
+    if (!target.function) target.function = { name: '', arguments: '' };
+    if (typeof delta.id === 'string' && delta.id) target.id = delta.id;
+    if (typeof delta.type === 'string' && delta.type) target.type = delta.type;
+    const fn = delta.function;
+    if (fn && typeof fn === 'object') {
+      if (typeof fn.name === 'string' && fn.name) target.function.name = fn.name;
+      if (typeof fn.arguments === 'string' && fn.arguments) {
+        target.function.arguments += fn.arguments;
+      }
+    }
+  }
+  return list;
+}
+
+/**
+ * 把累加好的参数串解析成对象。
+ *
+ * 流式中途解析必然失败（JSON 还没写全），所以这里**返回 null 而不是抛**：
+ * UI 要在流式期间就把"正在准备调用 X"显示出来，那时参数一定是不完整的。
+ * 调用方只在完成后再取解析结果。
+ */
+export function parseToolArguments(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -188,4 +248,40 @@ export function reasoningPanelOpen({
   if (mode === 'expand') return true;
   if (mode === 'collapse') return false;
   return Boolean(streaming);
+}
+
+/**
+ * 流式渲染时该怎么更新思考面板。
+ *
+ * 这存在的理由是一个真实的回归：`updateStreamingBubble()` 只刷新正文节点，
+ * 从不碰思考面板，于是模型整个思考期间界面上只有一个空壳（一句固定的
+ * "思考过程…"），用户看不到进展、还以为卡死。面板内容必须在每个增量上刷新。
+ *
+ * 返回值刻意区分两种动作，因为它们的 DOM 语义不同：
+ * - `create`：面板节点还不存在（首帧时 reasoning 为空，模板没渲染它）。
+ *   必须**用 `open` 属性**建，不能用 `element.open = true` —— 后者会异步触发
+ *   `toggle`，而 toggle 委托监听器会把它记成"用户手动操作过"，从而冻结开合
+ *   状态，之后"思考时展开、结束后收起"永久失效。
+ * - `update`：只改正文。已存在的面板不要碰 `open`，同理。
+ * - `none`：没有思考正文，或长度没变（廉价短路，避免每帧重跑 markdown）。
+ *
+ * @param {object} state
+ * @param {boolean} state.hasPanel   思考面板节点当前是否存在
+ * @param {boolean} state.shouldOpen reasoningPanelOpen(...) 的结果
+ * @param {number} state.textLength  当前思考正文长度
+ * @param {string|null} state.renderedLength 上次渲染时记下的长度
+ * @returns {{action: 'create'|'update'|'none', open: boolean}}
+ */
+export function planReasoningUpdate({
+  hasPanel = false,
+  shouldOpen = false,
+  textLength = 0,
+  renderedLength = null,
+} = {}) {
+  if (!textLength) return { action: 'none', open: false };
+  if (!hasPanel) return { action: 'create', open: Boolean(shouldOpen) };
+  if (renderedLength !== null && renderedLength === String(textLength)) {
+    return { action: 'none', open: Boolean(shouldOpen) };
+  }
+  return { action: 'update', open: Boolean(shouldOpen) };
 }
