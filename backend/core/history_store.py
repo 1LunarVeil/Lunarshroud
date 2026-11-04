@@ -62,12 +62,22 @@ def _create_schema() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_history_started ON launch_history(started_at DESC)"
             )
             # 幂等迁移：旧库没有运行时列。用 PRAGMA 判断，不能假设新库/旧库。
+            #
+            # 下面是四条平铺的 `if`，每条的 SQL 都是完整字面量。刻意不写成
+            # 循环 + 拼接：SQLite 不允许把列名做参数绑定（`ADD COLUMN ?` 是
+            # 语法错误），而"用变量拼标识符"正是注入的经典形状 —— 即使这里的
+            # 变量来自常量元组，四条明确语句的可审计性也远好过一行通用代码。
             columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(launch_history)")
             }
-            for column in ("runtime_id", "runtime_label", "model_key", "variant_key"):
-                if column not in columns:
-                    conn.execute(f"ALTER TABLE launch_history ADD COLUMN {column} TEXT")
+            if "runtime_id" not in columns:
+                conn.execute("ALTER TABLE launch_history ADD COLUMN runtime_id TEXT")
+            if "runtime_label" not in columns:
+                conn.execute("ALTER TABLE launch_history ADD COLUMN runtime_label TEXT")
+            if "model_key" not in columns:
+                conn.execute("ALTER TABLE launch_history ADD COLUMN model_key TEXT")
+            if "variant_key" not in columns:
+                conn.execute("ALTER TABLE launch_history ADD COLUMN variant_key TEXT")
 
 
 def _quarantine_corrupt_db(path: Path) -> None:

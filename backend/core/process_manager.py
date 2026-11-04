@@ -118,6 +118,13 @@ def explain_fatal_line(fatal: str) -> str:
 # 单个备份足够：实例日志是排障材料，不是历史取证材料。
 INSTANCE_LOG_MAX_BYTES = 5 * 1024 * 1024
 
+# 允许作为健康探测目标的地址。
+#
+# 探测问的是"我刚启动的那个子进程起来了吗"，目标永远在本机。`instance.host`
+# 却是用户可编辑的启动参数，所以这里用**白名单**而不是"排除 0.0.0.0"：
+# 后者会放行任何写进来的域名或远程地址，让探测器替调用方对外发请求。
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
 # 单条日志行的字符上限。llama-server/GGUF 元数据可能吐出一行几十 MB 的内容；
 # 环形缓冲只限制行数，不限制单行大小，于是这一行会被原样 JSON 序列化进
 # WebSocket、再塞进一个 DOM 文本节点。截断并显式标注，比让 UI 卡死好。
@@ -1240,9 +1247,14 @@ class ProcessManager:
         "启动超时"的报错，会把"端口被占 / 探测目标写错 / 服务真的没起来"
         三种完全不同的情况压成同一个现象。
         """
-        # 通配监听地址不能作为连接目标，统一探测回环（与 chat 接口的转换一致）
-        host = "127.0.0.1" if instance.host == "0.0.0.0" else instance.host
-        url = f"http://{host}:{instance.port}/health"
+        # 通配监听地址不能作为连接目标，统一探测回环（与 chat 接口的转换一致）。
+        #
+        # 候选集合是**显式白名单**：健康探测问的是"我刚启动的子进程起来了吗"，
+        # 与任何外部服务无关。`instance.host` 来自用户可编辑的启动参数，所以
+        # 不能把任意值直接拼进 URL —— 一个被改成远程地址的 host 会让探测器
+        # 替调用方发起外部请求。不在白名单里的一律按回环处理。
+        host = instance.host if instance.host in LOOPBACK_HOSTS else "127.0.0.1"
+        url = f"http://{host}:{int(instance.port)}/health"
         instance._probe_attempts += 1
         try:
             # trust_env=False 是必须的：httpx 默认读取 HTTP_PROXY/HTTPS_PROXY
