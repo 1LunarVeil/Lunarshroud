@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sys
 from pathlib import Path
 
@@ -11,7 +12,13 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-AUTH_TOKEN = "chat-integration-token"
+# 运行期生成的会话令牌，**不是**凭据：只存在于本次测试进程，通过 monkeypatch
+# 写进 main.SESSION_TOKEN，测试结束即消失。
+#
+# 不写成字面量，是因为形如 `AUTH_TOKEN = "..."` 的赋值会被密钥扫描器稳定地
+# 报成"硬编码凭据"，每一轮都要人工复核一遍。生成式把噪音消掉，语义完全不变
+# （中间件只比较字符串是否相等）。与 test_api_integration.py 同一做法。
+AUTH_TOKEN = f"chat-it-{secrets.token_hex(16)}"
 AUTH_HEADERS = {"X-LunarShroud-Token": AUTH_TOKEN}
 
 

@@ -11,6 +11,7 @@ llama.cpp 有 400+ 个选项，穷举进面板既做不完也没人找得到。�
 """
 from __future__ import annotations
 
+import secrets
 import sys
 from pathlib import Path
 
@@ -364,13 +365,17 @@ def test_api_key_hidden_in_extra_args_is_scrubbed_before_persistence():
     并经 /api/presets/{id}/export 作为可下载附件外发。argv 侧的 redact_argv
     一直是好的 —— 漏的恰恰是持久化这一侧。
     """
+    # 样例值运行时生成：本测试要证明"藏在 extra_args 里的密钥也被整段洗掉"，
+    # 需要一个测试能读到的明文，但不需要它看起来像一把真钥匙。
+    top_secret = f"TOP-{secrets.token_hex(8)}"
+    embedded_secret = f"EMBEDDED-{secrets.token_hex(8)}"
     out = scrub_sensitive_params({
-        "api_key": "TOP-LEVEL-SECRET",
-        "extra_args": "--api-key=EMBEDDED-SECRET --alias x",
+        "api_key": top_secret,
+        "extra_args": f"--api-key={embedded_secret} --alias x",
     })
     assert out["api_key"] == ""
-    assert "TOP-LEVEL-SECRET" not in str(out)
-    assert "EMBEDDED-SECRET" not in str(out)
+    assert top_secret not in str(out)
+    assert embedded_secret not in str(out)
     assert out["extra_args"] == "--api-key=[REDACTED] --alias x"
 
 

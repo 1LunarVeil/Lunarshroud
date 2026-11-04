@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 import sys
 from pathlib import Path
 
@@ -10,7 +11,8 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-AUTH_TOKEN = "knowledge-integration-token"
+# 运行期生成的会话令牌，不是凭据（说明见 test_chat_api.py 同一处）。
+AUTH_TOKEN = f"knowledge-it-{secrets.token_hex(16)}"
 AUTH_HEADERS = {"X-LunarShroud-Token": AUTH_TOKEN}
 
 

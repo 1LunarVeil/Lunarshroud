@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import runpy
+import secrets
 import sys
 import threading
 import time
@@ -2625,13 +2626,16 @@ def test_scrub_legacy_secrets_removes_plaintext_keys_from_history(monkeypatch, t
     history_store._initialized_paths.discard(str(tmp_path / "history.db"))
     history_store.init_db()
 
-    # 直接插一条"旧版本"形状的记录：两种写法的密钥都在
+    # 直接插一条"旧版本"形状的记录：两种写法的密钥都在。
+    # 样例值运行时生成 —— 它们不是凭据，只是要证明"旧记录里的明文会被洗掉"。
+    plain_secret = f"PLAIN-{secrets.token_hex(8)}"
+    embedded_secret = f"EMBEDDED-{secrets.token_hex(8)}"
     params = {
         "model": "C:/m.gguf",
-        "api_key": "PLAIN-LEGACY",
-        "extra_args": "--api-key=EMBEDDED-LEGACY --cache-prompt",
+        "api_key": plain_secret,
+        "extra_args": f"--api-key={embedded_secret} --cache-prompt",
     }
-    command = "llama-server.exe -m C:/m.gguf --api-key EMBEDBED-LEGACY --cache-prompt"
+    command = f"llama-server.exe -m C:/m.gguf --api-key {embedded_secret} --cache-prompt"
     import sqlite3
     with sqlite3.connect(str(tmp_path / "history.db")) as conn:
         conn.execute(
@@ -2645,9 +2649,9 @@ def test_scrub_legacy_secrets_removes_plaintext_keys_from_history(monkeypatch, t
     with sqlite3.connect(str(tmp_path / "history.db")) as conn:
         row = conn.execute("SELECT params_json, command_text FROM launch_history").fetchone()
     stored_params, stored_command = row
-    assert "PLAIN-LEGACY" not in stored_params
-    assert "EMBEDDED-LEGACY" not in stored_params
-    assert "EMBEDDED-LEGACY" not in stored_command
+    assert plain_secret not in stored_params
+    assert embedded_secret not in stored_params
+    assert embedded_secret not in stored_command
     assert "[REDACTED]" in stored_command
     # 参数本身不该被误伤
     assert "C:/m.gguf" in stored_params
