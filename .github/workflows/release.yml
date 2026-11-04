@@ -44,7 +44,7 @@ jobs:
         # 发布路径不能只跑 pytest：lint 与前端/Rust 门禁在 ci.yml 里有，但打 tag
         # 时可能没有对应的 push CI。发布作业必须自己把同一套门禁再跑一遍。
         run: python -m ruff check backend tools
-      - uses: actions/setup-node@0a44ba7841725637a19e28fa30b79a866c81b0a6 # v4.0.4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
       - name: Frontend unit tests
