@@ -388,8 +388,16 @@ def test_the_mirrored_gitignore_names_no_local_toolchain():
 
     与上一条互补：上一条防 `--apply` 覆盖，这一条防有人手工把工作树版粘进去。
     名单盯的是**产品名**与**内部文件名**这两类，不是某个固定字符串。
+
+    **在公开仓库里跑时 `gate.MIRROR` 不存在**：那棵树本身就是镜像（根目录
+    即仓库根），没有 `github/` 子目录可比。此时检查的对象就是根 `.gitignore`
+    —— 换成它继续断言，而不是跳过：公开仓库里的这一份恰恰是最该被盯住的。
     """
-    text = (gate.MIRROR / ".gitignore").read_text(encoding="utf-8")
+    candidate = gate.MIRROR / ".gitignore"
+    if not candidate.exists():
+        # 双树布局不存在 → 这是公开仓库自身，检查仓库根的 .gitignore。
+        candidate = Path(__file__).resolve().parents[2] / ".gitignore"
+    text = candidate.read_text(encoding="utf-8")
     lowered = text.lower()
     for marker in (
         "lm studio",
