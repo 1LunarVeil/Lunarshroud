@@ -23,7 +23,12 @@ httpx==0.28.1
 nvidia-ml-py==13.610.43
 # Knowledge base: PDF text extraction, PDF page rendering for OCR, and the
 # cosine-similarity scan over up to 20k chunks per base.
-pypdf==6.18.1
+#
+# pypdf 6.18.1 carried 21 open advisories (PYSEC-2026-4159/4157 and
+# CVE-2026-113786…119209), all of them in PDF parsing — which is exactly what
+# this project asks it to do with user-supplied files. 6.21.4 is the lowest
+# release with every one of them fixed (pip-audit is clean at that version).
+pypdf==6.21.4
 pypdfium2==5.13.0
 numpy==2.4.6
 # model_manifest._load_yaml 惰性 import 它（所以静态分析看不见），缺包时只打
