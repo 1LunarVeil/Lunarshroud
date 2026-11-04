@@ -1606,6 +1606,12 @@ fn kill_process_tree(pid: u32) {
 
 /// 启动器日志的候选路径。首选 %APPDATA%，失败时退到 exe 同目录的 logs/
 /// 再退到系统临时目录，保证"受限环境里也能留下诊断证据"。
+///
+/// 只在非 test 构建里被 `append_launcher_log` 使用：test 构建走
+/// `test_launcher_log_path()`，绝不写用户目录。没有这条 cfg 时，
+/// test 构建里本函数无人调用，clippy 的 `dead_code` 在 `-D warnings` 下会
+/// 直接报错（CI 红的原因之一）。
+#[cfg(not(test))]
 fn launcher_log_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(appdata) = std::env::var_os("APPDATA") {
@@ -1686,25 +1692,32 @@ fn test_launcher_log_path() -> PathBuf {
     .clone()
 }
 
+/// 写一条启动器日志。
+///
+/// 两个构建形态各有一份**完整实现**，用 `#[cfg]` 在函数级别二选一。
+/// 不写成"一个函数 + 内部 `#[cfg]` 语句块"的原因：test 构建下那块带
+/// `return;`，而它之后的生产代码被 cfg 掉，`return` 就成了函数最后一条语句，
+/// clippy 的 `needless_return` 在 `-D warnings` 下直接报错 —— CI 正是这么红的
+/// （2026-11-04，两次），而本地 `cargo test` 看不出来，因为它不跑 clippy。
+#[cfg(test)]
 fn append_launcher_log(message: &str) {
     let timestamp = now_secs();
-    #[cfg(test)]
-    {
-        // 测试绝不能写真实 %APPDATA%。`request_shutdown()` 会记关闭证据，
-        // 而候选路径的首选就是 ``%APPDATA%\LunarShroud\logs\launcher.log``：
-        // 一是污染用户目录，二是在受限令牌/沙箱下那个位置常常不可写，
-        // 于是 `cargo test` 在不同机器上结果不一致（AGENTS §6.5）。
-        // 生产路径（下面的候选链）不受影响。
-        let path = test_launcher_log_path();
-        if let Err(error) = append_launcher_log_at(&path, timestamp, message) {
-            eprintln!(
-                "warning: test launcher log {} is not writable: {error}",
-                path.display()
-            );
-        }
-        return;
+    // 测试绝不能写真实 %APPDATA%。`request_shutdown()` 会记关闭证据，
+    // 而候选路径的首选就是 `%APPDATA%\LunarShroud\logs\launcher.log`：
+    // 一是污染用户目录，二是在受限令牌/沙箱下那个位置常常不可写，
+    // 于是 `cargo test` 在不同机器上结果不一致（AGENTS §6.5）。
+    let path = test_launcher_log_path();
+    if let Err(error) = append_launcher_log_at(&path, timestamp, message) {
+        eprintln!(
+            "warning: test launcher log {} is not writable: {error}",
+            path.display()
+        );
     }
-    #[cfg(not(test))]
+}
+
+#[cfg(not(test))]
+fn append_launcher_log(message: &str) {
+    let timestamp = now_secs();
     for path in launcher_log_candidates() {
         if append_launcher_log_at(&path, timestamp, message).is_ok() {
             return;
