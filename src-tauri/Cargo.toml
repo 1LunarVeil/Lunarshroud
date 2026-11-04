@@ -20,7 +20,7 @@ tokio = { version = "1", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", features = ["blocking"] }
-getrandom = "0.2"
+getrandom = "0.4"
 # 就绪探测的挑战-应答：后端以 HMAC-SHA256(token, nonce) 证明自己持有令牌，
 # 令牌本身从不出现在探测请求/响应里。ring 已在依赖锁的传递闭包里（rustls），
 # 直接复用它的 HMAC 实现，不自己拼密码学原语。
