@@ -1,11 +1,29 @@
 version: 2
+
+# 依赖升级是**批次动作**，不是持续背景噪音。
+#
+# 2026-11-04：1.0.0 发布后仓库里堆了 14 个自动 PR，其中 5 个是破坏性升级
+# （reqwest 0.12→0.13、getrandom 0.2→0.4、fastapi 0.141→0.162 跨 21 个 minor），
+# 而它们从创建起就没人评估过。无人处理的 PR 不只是噪音：它们会在某次"顺手
+# 合掉"里把未经兼容性验证的升级带进来，而本项目刚经历过"测试全绿但产品不可用"。
+#
+# 因此三条策略：
+#   1. `open-pull-requests-limit: 0` —— 默认不自动开 PR。需要升级时手工触发，
+#      或临时把这个数字改回非 0，升完再改回来。
+#   2. 安全更新**不受影响**：GitHub 的 security updates 是独立开关（仓库
+#      Settings → Code security），不受这里的 limit 约束。
+#   3. 真要升级时按类别分批：GitHub Actions（只影响 CI）→ Python（有哈希锁）
+#      → Rust（破坏性最多，且要重跑打包验证）。
 updates:
   - package-ecosystem: pip
     directory: /backend
-    schedule: {interval: weekly}
+    schedule: {interval: monthly}
+    open-pull-requests-limit: 0
   - package-ecosystem: cargo
     directory: /src-tauri
-    schedule: {interval: weekly}
+    schedule: {interval: monthly}
+    open-pull-requests-limit: 0
   - package-ecosystem: github-actions
     directory: /
-    schedule: {interval: weekly}
+    schedule: {interval: monthly}
+    open-pull-requests-limit: 0
