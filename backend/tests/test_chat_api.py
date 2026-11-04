@@ -344,14 +344,17 @@ def test_chat_proxy_uses_last_api_key_from_argv(chat_client):
     _, main = chat_client
     from types import SimpleNamespace
 
-    inst = SimpleNamespace(params={"api_key": "panel-key"}, argv=["--api-key", "extra-key"])
-    assert main._instance_api_key(inst) == "extra-key"
+    # 样例值运行时生成：本测试只关心"哪个 --api-key 生效"，值本身无意义。
+    argv_key = f"argv-{secrets.token_hex(8)}"
+    panel_key = f"panel-{secrets.token_hex(8)}"
+    inst = SimpleNamespace(params={"api_key": panel_key}, argv=["--api-key", argv_key])
+    assert main._instance_api_key(inst) == argv_key
 
     inst = SimpleNamespace(params={}, argv=["--api-key=equals-key"])
     assert main._instance_api_key(inst) == "equals-key"
 
-    inst = SimpleNamespace(params={"api_key": "panel-key"}, argv=[])
-    assert main._instance_api_key(inst) == "panel-key"
+    inst = SimpleNamespace(params={"api_key": panel_key}, argv=[])
+    assert main._instance_api_key(inst) == panel_key
 
 
 def test_chat_proxy_rejects_missing_or_stopped_instances(chat_client, monkeypatch):

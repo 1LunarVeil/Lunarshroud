@@ -236,6 +236,17 @@ CURATED_EXCLUDES = {
         "打包态 CDP 验收脚本：需先构建打包对并在本机开 WebView2 调试端口",
     "tools/verify_packaged_chat.mjs":
         "同上，verify_packaged_chat.sh 的伴生实现",
+    # --- 2026-11-04：只有作者本人能运行的两个脚本 ---------------------------
+    #
+    # 判据仍是"clone 下来能不能直接用"。这两个连输入都没有：一个要求一份
+    # 真实的 377 片段法规索引 + 真实模型，另一个是已完成的一次性重构脚本。
+    # 它们的参数（索引路径、模型路径）只在本机存在，公开了也无法执行。
+    "tools/eval_knowledge_retrieval.py":
+        "检索质量评测：需要本机一份真实的法规索引与 embedding/rerank 模型，"
+        "clone 者无从运行；评测方法与结论写在 docs/KNOWLEDGE_BASE.md",
+    "tools/migrate_params_to_single_source.py":
+        "已完成的一次性重构脚本（把英文语言包的值内联进 ParamMeta），"
+        "对应的代码状态已经定型，不需要再跑一次",
 }
 
 # 2026-09-18 起：原本还有 3 个 tools/*.py 因硬编码本机模型库绝对路径被排除。
