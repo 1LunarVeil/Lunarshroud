@@ -1,43 +1,46 @@
 # Release Checklist
 
-There are two distribution channels. The **portable zip is required**; the NSIS
-installer is optional per release (decided 2026-10-28, see `AGENTS.md` §4).
-**1.0.0 ships the portable channel only.**
+There is **one** distribution channel: the portable zip. The NSIS installer
+channel was **removed** on 2026-11-05 (see `AGENTS.md` §4) — not parked, not
+"optional per release". Nothing in the repository builds, packages, signs, or
+publishes an installer any more, and the release workflow fails if one appears.
 
-| Channel | Artifact | Audience | Shipped in 1.0.0 |
-|---|---|---|---|
-| Portable | `LunarShroud-<version>-portable-x64.zip` | unzip and run, no install | **Yes** |
-| Installer | `LunarShroud_<version>_x64-setup.exe` | per-user NSIS install | No — buildable, not validated |
+| Channel | Artifact | Audience |
+|---|---|---|
+| Portable | `LunarShroud-<version>-portable-x64.zip` | unzip and run, no install |
 
-When both are produced they come out of `.github/workflows/release.yml` in the
-same job from the same sources, so they can never be built from different
-revisions. The portable zip is the **main** channel: it needs no install
-permission and works under sandboxed or restricted accounts. The 1.0.0 installer
-was built and byte-scanned but has **not** been through an install → start →
-uninstall round trip, which is why it is not published.
+Why the installer went away: it targeted exactly the same audience as the
+portable zip, but carried three extra chains — code signing, uninstall hooks,
+and install-directory permissions under sandboxed/restricted accounts — while
+the only acceptance that matters for it (install → start → uninstall on a clean
+machine) was never doable here. Two distribution paths, one of them
+unverifiable, is a net risk rather than a net feature.
+
+The portable zip needs no install permission and works under sandboxed or
+restricted accounts. It is produced by `.github/workflows/release.yml` from a
+single job, and that job builds the launcher with `--no-bundle`.
 
 1. Verify repository settings, enable private vulnerability reporting, and configure branch protection.
 2. Run CI and dependency-security workflows from a clean checkout.
-3. Run product-code coverage, frontend tests plus non-empty syntax enumeration, Rust format/Clippy/tests, and a real Windows install/start/close/uninstall smoke test.
+3. Run product-code coverage, frontend tests plus non-empty syntax enumeration, Rust format/Clippy/tests, and a real Windows start/close/uninstall smoke test on the portable build.
 4. Perform at least one real llama-server start/chat/stop cycle. For a stable release, add 4–8 hour soak results across representative hardware.
 5. Review `CHANGELOG.md`, licenses, dependency inventory/SBOM, and `SANITIZATION_REPORT.md`.
 6. Build with the release workflow or the pinned commands in `BUILDING.md` (including the `RUSTFLAGS` path remap); never reuse an old `backend.exe`.
-7. Byte-scan the built launcher, backend sidecar, and installer for builder identity — user names, `C:\Users` paths, local directories; all three must scan clean before anything is published.
-8. Compute and publish SHA-256 checksums for **both** artifacts. Code-sign when a certificate is available. Until then, every download must be verified by the user before running:
+7. Byte-scan the built launcher and backend sidecar for builder identity — user names, `C:\Users` paths, local directories; both must scan clean before anything is published.
+8. Compute and publish the SHA-256 checksum for the zip. Code-sign when a certificate is available. Until then, every download must be verified by the user before running:
 
    ```powershell
    Get-FileHash .\LunarShroud-1.0.0-portable-x64.zip -Algorithm SHA256
-   Get-FileHash .\LunarShroud_1.0.0_x64-setup.exe  -Algorithm SHA256
    ```
 
-   Compare the printed values with `SHA256SUMS.txt` (published with the release) or the checksum in the release notes. A mismatch means the file is not the published artifact — do not run it.
+   Compare the printed value with `SHA256SUMS.txt` (published with the release) or the checksum in the release notes. A mismatch means the file is not the published artifact — do not run it.
 
    Do not retype hashes into reports or release notes; read them from the file. The repository ships a verifier that parses `SHA256SUMS.txt` and recomputes every digest (non-zero exit on any missing/corrupt artifact):
 
    ```powershell
    python tools\verify_checksums.py .\release-candidate-directory
    ```
-9. Upload both artifacts, the checksum file, changelog/release notes, and the SBOM/inventory intended for users.
+9. Upload the zip, the checksum file, changelog/release notes, and the SBOM/inventory intended for users.
 
 ## Gates that run automatically
 

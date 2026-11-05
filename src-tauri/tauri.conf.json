@@ -14,24 +14,11 @@
     }
   },
   "bundle": {
-    "active": true,
-    "targets": [
-      "nsis"
-    ],
+    "active": false,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/icon.ico"
-    ],
-    "resources": [
-      "backend/backend.exe",
-      "backend/_internal/**/*"
-    ],
-    "externalBin": [],
-    "windows": {
-      "nsis": {
-        "installerHooks": "nsis/hooks.nsh"
-      }
-    }
+    ]
   }
 }

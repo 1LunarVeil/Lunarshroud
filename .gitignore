@@ -42,10 +42,13 @@ backend/data/
 *.deb
 *.zip
 *.7z
-# Staged by src-tauri/build.rs as a bundle resource.
-src-tauri/backend/
 # PyInstaller onedir runtime, deployed beside backend.exe.
 backend/_internal/
+# Portable release directory. Publish-PortableRuntime.ps1 deploys the launcher
+# and backend into it and package_portable.py writes the zip plus dist/ here.
+# Everything under it is build output; the *.zip rule above only catches the
+# archive, so the unpacked release tree has to be ignored as a directory.
+release/
 
 # Logs
 debug.log

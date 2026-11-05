@@ -238,19 +238,17 @@ lifespan 的 `init_db()` 抛 `DatabaseError`，进程以 exit 3 退出，用户�
 
 
 `backend/dist/backend/` 里的 `backend.exe` 与 `_internal/` 是一个不可拆分的
-运行时。`src-tauri/build.rs`、`tauri.conf.json` 的 bundle resources、
-`Publish-PortableRuntime.ps1` 都必须整棵复制并逐文件校验；只复制 exe 会得到
-一个启动即失败的 sidecar（找不到 Python 运行时），而用户只会看到"后端启动失败"。
-部署脚本还必须**拒绝**缺少 `_internal/` 的构建，并在换入/校验失败时恢复旧的
-launcher/backend/runtime 三段（不能留下"新 exe + 旧运行时"的混合对）。
+运行时。`src-tauri/build.rs` 与 `Publish-PortableRuntime.ps1` 都必须整棵复制并
+逐文件校验；只复制 exe 会得到一个启动即失败的 sidecar（找不到 Python 运行时），
+而用户只会看到"后端启动失败"。部署脚本还必须**拒绝**缺少 `_internal/` 的构建，
+并在换入/校验失败时恢复旧的 launcher/backend/runtime 三段（不能留下"新 exe +
+旧运行时"的混合对）。
 
-安装器的 `NSIS_HOOK_PREUNINSTALL`（`src-tauri/nsis/hooks.nsh`）必须清理应用在
-安装目录创建的 `webview2-data/`、`runtime-temp/`、`logs/`、`launcher-boot.log`、
-`debug.log`、`backend/backend-child.log`；**绝不能**删除 `backend/data`
-（受限运行的回退用户数据）或 `%APPDATA%`/`%LOCALAPPDATA%` 里的用户配置。
-没有这个钩子时，跑过一次应用的安装目录在卸载后会残留整份 WebView2 缓存。
-钉它的证据：2026-10-18 静默安装 → 安装版启动 → 静默卸载，卸载后安装目录被
-移除，真实用户数据哈希前后一致。
+**安装包通道已于 2026-11-05 移除**（见 §4），因此 `src-tauri/nsis/hooks.nsh` 与
+`tauri.conf.json` 的 bundle resources 都不再存在，`build.rs` 也不再往
+`src-tauri/backend/` 做 staging 副本。`bundle.active` 为 `false`，发布工作流
+用 `--no-bundle` 构建设计产物：任何重新引入安装包的改动都必须同时恢复卸载钩子、
+沙箱目录权限与安装/卸载往返验收，否则就是在分销一条没人验收的链路。
 
 *为什么*：onefile 每次启动要解压 ~20 MB 到 `%TEMP%`，在用户的临时目录被
 重定向/只读/安全软件拦截时，PyInstaller 只弹 "Could not create temporary
@@ -258,7 +256,8 @@ directory!" 然后挂住，启动器拿不到可读原因；强杀还会在 Temp
 （实测 167 个、2.2 GB）。onedir 不走临时目录，在 `TEMP` 指向不存在路径时仍能启动。
 *钉它的测试*：`test_portable_runtime.py::test_portable_runtime_deployer_copies_the_onedir_runtime`
 （真实 PowerShell 5.1、含子目录与逐文件哈希）；`build.rs` 在 release 缺目录时
-直接 panic；安装包的 NSIS 脚本包含 `backend\_internal` 文件项。
+直接 panic；`test_packaging_contracts.py::test_build_rs_does_not_stage_a_bundle_resource_copy`
+钉住 staging 副本不会被重新引入。
 
 ### 2.16 数据/日志目录必须"可写才用"
 
@@ -515,6 +514,45 @@ CPU / Vulkan / OpenVINO / ROCm 四个官方 Windows 包 `--version` 完全相同
 DLL 判别）、`test_multibackend_runtimes.py`（四包归属与设备枚举）、
 `test_runtime_path_sync.py`（路径双向同步）。
 
+### 2.34 文档、配置与工作流必须与"产品实际提供的东西"一致
+
+**任何一份会公开的文档里提到的路径/命令/产物，都必须是这个仓库真的有的东西。**
+指一个被刻意排除的文件、跑一个没发布的脚本、要求一个已移除的产物，都是缺陷——
+读者会照做，然后撞墙，而所有测试仍然全绿。
+
+已实际踩过的四类（2026-11-05 一轮审计全部命中）：
+
+1. **文档指向被排除的文件**：`CHANGELOG.md` 让读者看 `docs/RISK_ASSESSMENT.md`、
+   `docs/STATUS.md`；`docs/KNOWLEDGE_BASE.md` 让读者 `python
+   tools/eval_knowledge_retrieval.py`；`FRONTEND_CONTRACT.md` 让贡献者跑
+   `tools/ui_preview.py`。这些文件全在 `CURATED_EXCLUDES` 里，公开树里不存在。
+2. **注释指向被排除的文档**：`backend/api/*.py` 写"见 `docs/ROADMAP.md` §P1"。
+   源码也是公开的，注释同样是给读者看的。
+3. **文档与工作流互相矛盾**：README 说"本版不提供 NSIS 安装包"，而
+   `release.yml` 硬性要求"恰好 1 个安装包"否则 `throw` —— 按文档打 tag 发布会
+   直接失败。反过来也一样危险：配置留着但没人验收。
+4. **`.gitignore` 漏了产物目录**：`.zip` 规则只覆盖归档本身，`release/` 目录
+   （部署器把 launcher + backend 放这里）与 `release/dist/SHA256SUMS.txt` 不被
+   任何规则命中。一次本地打包就会把 40 MB 产物留在工作树里，发布镜像门禁会把它
+   当成"该发布的文件"。**审计 `.gitignore` 的正确方法是问"构建会写出哪些目录"，
+   而不是问"哪些扩展名要忽略"。**
+
+*为什么*：这类错误不会让任何测试变红——它们是"文档说 A、代码做 B"的静默漂移。
+公开仓库的价值全在"clone 下来能直接用/能照文档做"，一份指错路的文档让整条
+通道失效，而维护者看到的是全绿的 CI。
+
+*怎么防*：改动文档/配置/工作流时，逐个把它们提到的路径与产物在当前工作树里
+`ls` 一遍；`.github/workflows/*.yml`、`.gitignore`、`docs/*.md`、根 README 属于
+"必须与实际一致"的清单。移除一个产品能力（通道、脚本、产物）时，必须在**同一次
+改动**里清掉：工作流步骤、bundle/构建配置、测试断言（反转成"不得再出现"）、
+README 的中英两份、`docs/RELEASE.md`/`BUILDING.md`/`GETTING_STARTED.md`、
+以及本节 §4 的产品边界条目。
+
+*钉它的测试*：
+`test_release_mirror_gate.py::test_release_workflow_publishes_the_portable_zip_and_no_installer`
+（双向断言 + 配置层校验）、
+`test_packaging_contracts.py::test_build_rs_does_not_stage_a_bundle_resource_copy`。
+
 ## 3. 发布镜像与门禁
 
 `github/` 是**精选的公开镜像**，不是工作树快照。任何被镜像文件的改动，
@@ -556,13 +594,23 @@ UTF-8 / UTF-16LE / UTF-16BE / latin-1 以及 gzip/zlib 容器——所以"把路
   发布了预构建版本；默认路径留空 + README 指引获取方式，是刻意的。
 - **双通道是硬要求**：既能 clone 源码自己编译，也能拿到装好即用的**免安装**
   便携包（`release/*-portable-x64.zip`）。只在一条通道上工作的改动算缺陷。
-- **安装包（NSIS）不是每次发版的必交物**（2026-10-28 决定，取代早先"安装包必交"
-  的口径）。理由：未签名的 per-user 安装包带来独立的 SmartScreen 拦截、卸载钩子、
-  沙箱/受限令牌下的目录权限问题，而它面向的人群与便携包完全相同；维护两条
-  分发链路却没有第二条的验收能力（安装/卸载往返需要干净机器），收益低于风险。
-  `src-tauri/nsis/`、`tauri.conf.json` 的 bundle 配置与 `docs/RELEASE.md` 清单
-  **保留**——`cargo tauri build` 随时能重建安装包；要恢复"必交"，需同时解决
-  代码签名（1.0 门槛）并补安装/卸载往返验收。
+- **不提供安装包（NSIS 已移除，2026-11-05 决定）。** 这不是"某次发版不必交"，
+  而是**通道整体删除**：`src-tauri/nsis/` 已删，`tauri.conf.json` 的
+  `bundle.active` 为 `false` 且没有 `targets`，发布工作流用
+  `tauri build --no-bundle`，`release.yml` 还会在产物里出现 `.exe` 时**主动失败**。
+  理由：未签名的 per-user 安装包带来独立的 SmartScreen 拦截、卸载钩子、沙箱/
+  受限令牌下的目录权限问题，而它面向的人群与便携包完全相同；维护两条分发链路
+  却没有第二条的验收能力（安装/卸载往返需要干净机器，长期做不到），收益低于风险。
+  早先（2026-10-28）的口径是"非必交、保留配置随时可重建"，实践下来那条口径
+  只会让文档与工作流互相矛盾（README 说"不提供"、`release.yml` 却硬性要求
+  "恰好 1 个安装包"否则发布失败）。**要恢复必须先同时具备**：代码签名
+  （1.0 门槛）+ 干净机器上的安装/卸载往返验收 + 卸载钩子（清理 `webview2-data/`、
+  `runtime-temp/`、`logs/`、`launcher-boot.log`、`debug.log`、
+  `backend/backend-child.log`，且**绝不**删 `backend/data` 与 `%APPDATA%`/`%LOCALAPPDATA%`
+  的用户数据）。三者缺一就不要重新引入。
+  钉它的测试：`test_release_mirror_gate.py::test_release_workflow_publishes_the_portable_zip_and_no_installer`
+  （双向：既钉便携包发布，也钉"不得再产安装包"——包括 `bundle.active` 必须为
+  false、`targets` 不得回来、`nsis/` 不得回来、`--no-bundle` 必须在命令里）。
 - 参数界面**跟随本机那份构建的能力**（`server_probe` + `capabilities`），
   不要把 llama.cpp 的 flag 列表当常量抄进代码。
 

@@ -9,9 +9,9 @@ parameter editing, presets, multi-instance management, live logs, resource
 monitoring, launch history, a native streaming Chat (with a llama-server WebUI
 fallback), a local knowledge base / RAG, local backup and a tray lifecycle.
 
-> Current version: `1.0.0`. The **portable zip is the release channel**
-> (`LunarShroud-1.0.0-portable-x64.zip`, unzip and run); no NSIS installer ships
-> with this version. Artifacts are **not code-signed**; verify the SHA-256 from
+> Current version: `1.0.0`. The **only release channel is the portable zip**
+> (`LunarShroud-1.0.0-portable-x64.zip`, unzip and run); no installer ships, and
+> none is built. Artifacts are **not code-signed**; verify the SHA-256 from
 > the release page before running. See [docs/RELEASE.md](docs/RELEASE.md).
 >
 > Positioning: `1.0.0` means **feature-complete and usable daily**, not an
@@ -170,11 +170,11 @@ Pop-Location
 cargo test --manifest-path src-tauri\Cargo.toml --locked
 ```
 
-Baseline at the 2026-11-05 working tree: **925 Python tests (924 passed, 1
+Baseline at the 2026-11-05 working tree: **929 Python tests (928 passed, 1
 skipped)**, 117 frontend unit tests, all JavaScript syntax checks passing, and
 **84.75%** product-code coverage (gate ≥ 75%). A clean checkout has no
 prebuilt llama.cpp packages under `study/`, so the 6 multi-backend cases that
-need them skip (**918 passed, 7 skipped**); that is expected. The Rust suite is
+need them skip (**922 passed, 7 skipped**); that is expected. The Rust suite is
 **23 passed,
 0 failed**, but `CARGO_TARGET_DIR` must point at a short path outside the
 repository: under the default `src-tauri/target/` the `ring` C compile fails on
@@ -183,7 +183,11 @@ Test counts grow with regressions — the gate is always **0 failures + coverage
 ≥ 75%**, measured by actually running it. Tests do not replace real-model and
 long-duration stress runs.
 
-## Building the package
+## Building the portable package
+
+There is **one** distribution channel: the portable zip. The NSIS installer
+channel was removed on 2026-11-05 (see [docs/RELEASE.md](docs/RELEASE.md) and
+[AGENTS.md](AGENTS.md) §4).
 
 ```powershell
 # Fixed build metadata: otherwise two consecutive PyInstaller builds differ.
@@ -193,14 +197,16 @@ Set-Location backend
 ..\.venv\Scripts\python.exe -m PyInstaller backend.spec --clean -y
 Set-Location ..\src-tauri
 # Remap the local cargo registry path (it contains the build machine's user
-# name) to a neutral prefix so the public installer carries no builder identity.
+# name) to a neutral prefix so the public artifact carries no builder identity.
 # This RUSTFLAGS is required on every release build.
 $env:RUSTFLAGS = "--remap-path-prefix=$env:USERPROFILE\.cargo\registry\src=cargo-registry"
-cargo tauri build --ci -- --locked
+# --no-bundle: produce only the launcher binary, no installer of any kind.
+cargo tauri build --ci --no-bundle -- --locked
 ```
 
-The NSIS installer lands in `src-tauri/target/release/bundle/nsis/`. Release
-procedure and checklist: [docs/RELEASE.md](docs/RELEASE.md).
+The artifact is `src-tauri/target/release/lunarshroud.exe`. Packaging it into a
+zip and producing the checksum file is covered in
+[docs/RELEASE.md](docs/RELEASE.md).
 
 To run inside the build workspace, do not reuse an old root-launcher EXE. After
 building, use the publisher to produce a matching launcher/sidecar pair and
@@ -228,9 +234,9 @@ Documentation map: [docs/README.md](docs/README.md).
 - Windows 10/11 only; macOS and Linux are not supported.
 - The portable package is not code-signed; Windows SmartScreen may warn about an
   unknown publisher.
-- `1.0.0` ships the portable channel only. `cargo tauri build` can still produce
-  an NSIS installer, but this version has not been through an install/uninstall
-  round trip.
+- **No installer is provided.** The NSIS channel was removed on 2026-11-05, so
+  the portable zip is the only distribution form. `cargo tauri build` will not
+  produce one either: `bundle.active` is off.
 - GPU monitoring prefers NVML (`nvidia-ml-py`) and falls back to `nvidia-smi`
   when the library or driver is unavailable.
 - llama.cpp parameters change between versions; re-check the generated command

@@ -37,13 +37,12 @@ Earlier claims that `SOURCE_DATE_EPOCH` alone made the launcher reproducible
 were wrong — the PE timestamp kept tracking the wall clock, which is exactly the
 kind of claim that only a second build disproves.
 The 2026-10-18 onedir backend also reproduced `08C8FAFC…` across two builds.
-The NSIS installer still differs between builds because makensis writes its own
-metadata; verify the installed `lunarshroud.exe`/`backend.exe` hashes and record
-the installer hash for each release instead of assuming installer reproducibility.
+(An NSIS installer was also measured at one point; that channel has since been
+removed — see `AGENTS.md` §4 — so it is no longer built or verified.)
 
-Release builds require the `backend/dist/backend/` directory (`backend.exe` plus its `_internal/` runtime). `src-tauri/build.rs` copies the whole directory into the bundle and aborts a release build when it is absent; never copy a previously built backend across source revisions, and never copy only the exe. The sidecar is **onedir** so startup does not extract to `%TEMP%` — see `backend/backend.spec` for the rationale (a redirectable or read-only temp directory makes a onefile bootloader hang with no usable error).
+Release builds require the `backend/dist/backend/` directory (`backend.exe` plus its `_internal/` runtime). `src-tauri/build.rs` stages the whole directory beside the compiled launcher and aborts a release build when it is absent; never copy a previously built backend across source revisions, and never copy only the exe. The sidecar is **onedir** so startup does not extract to `%TEMP%` — see `backend/backend.spec` for the rationale (a redirectable or read-only temp directory makes a onefile bootloader hang with no usable error).
 
-Before publishing, byte-scan the built launcher, backend sidecar, and installer for builder identity (user names, `C:\Users` paths, local directories). The remap above covers the known source of such strings; the scan is the verification.
+Before publishing, byte-scan the built launcher and backend sidecar for builder identity (user names, `C:\Users` paths, local directories). The remap above covers the known source of such strings; the scan is the verification.
 
 For reproducible review, build from a clean checkout, retain the source commit/tag and `Cargo.lock`, capture tool versions, and publish SHA-256 checksums. Python runtime and dev dependencies are hash-locked (`backend/requirements.lock` / `requirements-dev.lock`) and CI plus `setup.ps1` install with `--require-hashes`; when a pin changes, regenerate both the `.txt` and the corresponding lock (see the lock header for the exact commands).
 

@@ -4,7 +4,7 @@
 
 LunarShroud 是一个面向 Windows 的**本地 AI 聊天应用**：自带 llama.cpp 构建与 GGUF 模型，无账号、不联网、所有数据留在本机。使用 Tauri、FastAPI 与原生 JavaScript 构建，内置参数编辑、预设、多实例、实时日志、资源监控、启动历史、原生流式 Chat（可回退到 llama-server WebUI）、本地知识库/RAG、本地备份与托盘生命周期。
 
-> 当前版本：`1.0.0`。**发布通道是便携包**（`LunarShroud-1.0.0-portable-x64.zip`，解压即用）；本版不提供 NSIS 安装包。产物**未做代码签名**，下载后请按发布页给出的 SHA-256 校验再运行；详见 [docs/RELEASE.md](docs/RELEASE.md)。
+> 当前版本：`1.0.0`。**唯一发布通道是便携包**（`LunarShroud-1.0.0-portable-x64.zip`，解压即用）；本项目不提供安装包（NSIS 通道已移除）。产物**未做代码签名**，下载后请按发布页给出的 SHA-256 校验再运行；详见 [docs/RELEASE.md](docs/RELEASE.md)。
 >
 > 版本定位：`1.0.0` 表示**功能完整、可日常使用**，不是"生产级稳定"的无保留结论。
 > **8 小时长稳与多硬件矩阵尚未完成**（4 小时真实模型 soak 已通过），未签名的便携包
@@ -112,9 +112,12 @@ Pop-Location
 cargo test --manifest-path src-tauri\Cargo.toml --locked
 ```
 
-当前工作树基线（2026-11-05）：**925 个 Python 测试（924 通过 + 1 跳过）**、117 个前端单元测试、全部前端 JavaScript 语法检查通过；产品代码覆盖率 **84.75%**（门禁 ≥75%）。干净检出里没有 `study/` 下那几份预编译 llama.cpp 包，相关的 6 个多后端用例会跳过（**918 通过 + 7 跳过**），这是预期行为。Rust 测试 **23 个全部通过（0 失败）**，但**必须把 `CARGO_TARGET_DIR` 指到仓库之外的短路径**（例如盘符根下的短目录）：默认的 `src-tauri/target/` 下 `ring` 的 C 编译会因路径定位问题失败；与 MSVC 安装、SDK 和源码均无关。测试数量随回归测试增长，门禁始终是 **0 失败 + 覆盖率 ≥75%**，以实际运行为准。测试不替代真实模型和长时间压力测试。
+当前工作树基线（2026-11-05）：**929 个 Python 测试（928 通过 + 1 跳过）**、117 个前端单元测试、全部前端 JavaScript 语法检查通过；产品代码覆盖率 **84.75%**（门禁 ≥75%）。干净检出里没有 `study/` 下那几份预编译 llama.cpp 包，相关的 6 个多后端用例会跳过（**922 通过 + 7 跳过**），这是预期行为。Rust 测试 **23 个全部通过（0 失败）**，但**必须把 `CARGO_TARGET_DIR` 指到仓库之外的短路径**（例如盘符根下的短目录）：默认的 `src-tauri/target/` 下 `ring` 的 C 编译会因路径定位问题失败；与 MSVC 安装、SDK 和源码均无关。测试数量随回归测试增长，门禁始终是 **0 失败 + 覆盖率 ≥75%**，以实际运行为准。测试不替代真实模型和长时间压力测试。
 
-## 构建安装包
+## 构建便携包
+
+本项目**只有便携包一个发布通道**（安装包已在 2026-11-05 移除，理由见
+[docs/RELEASE.md](docs/RELEASE.md) 与 [AGENTS.md](AGENTS.md) §4）。
 
 ```powershell
 # 固定构建元数据：否则连续两次 PyInstaller 构建的哈希会不同
@@ -124,12 +127,14 @@ Set-Location backend
 ..\.venv\Scripts\python.exe -m PyInstaller backend.spec --clean -y
 Set-Location ..\src-tauri
 # 把 cargo registry 的本机路径（含构建机用户名）改写成中性前缀，
-# 避免公开安装包嵌出构建者身份 —— 每次构建都要带上这个 RUSTFLAGS
+# 避免公开产物嵌出构建者身份 —— 每次构建都要带上这个 RUSTFLAGS
 $env:RUSTFLAGS = "--remap-path-prefix=$env:USERPROFILE\.cargo\registry\src=cargo-registry"
-cargo tauri build --ci -- --locked
+# --no-bundle：只产 launcher 可执行文件，不产任何安装包
+cargo tauri build --ci --no-bundle -- --locked
 ```
 
-NSIS 安装包输出到 `src-tauri/target/release/bundle/nsis/`。发布流程和校验清单见 [docs/RELEASE.md](docs/RELEASE.md)。
+产物是 `src-tauri/target/release/lunarshroud.exe`。打包成 zip 与校验清单见
+[docs/RELEASE.md](docs/RELEASE.md)。
 
 如需在构建工作区直接运行，请不要复用旧的根目录 EXE。构建完成后使用发布器生成匹配的启动器和侧车后端，并更新桌面快捷方式：
 
@@ -154,7 +159,7 @@ docs/           架构、构建、发布与安全说明
 
 - 仅支持并验证 Windows 10/11；macOS 和 Linux 尚未支持。
 - 便携包未代码签名，Windows SmartScreen 可能提示未知发布者。
-- 1.0.0 只发布了便携包；NSIS 安装包可用 `cargo tauri build` 自行产出，但本版未做安装/卸载往返验证。
+- 本项目**不提供安装包**（NSIS 通道已于 2026-11-05 移除）：只有便携包一种分发形式。自行 `cargo tauri build` 也不会产出安装包——`bundle.active` 已关闭。
 - GPU 监控优先使用 NVML（`nvidia-ml-py`），库或驱动不可用时回退 `nvidia-smi`。
 - 不同 llama.cpp 版本的参数可能变化，升级后应检查生成命令。
 - llama.cpp 默认 `--cache-ram 8192` 会启用宿主侧提示词缓存。实测 4B 模型运行 10 分钟后 llama-server 内存从 5.2 GB 升至 11.4 GB 并平台化；这不是启动器泄漏。内存较小的机器请把 `--cache-ram` 调低或设为 0（代价是重复提示词不再复用）。

@@ -7,8 +7,11 @@ Starlette (pinned deliberately, see `backend/requirements.txt`), Uvicorn,
 Pydantic, psutil, HTTPX, `nvidia-ml-py`, Tokio, Reqwest, serde/serde_json,
 getrandom, ring (HMAC-SHA256 for the readiness challenge) and windows-sys.
 Build and test tooling includes PyInstaller, pytest, Pillow (icons only),
-Node.js, Rust, and NSIS. See `backend/requirements*.txt`, `src-tauri/Cargo.toml`,
+Node.js and Rust. See `backend/requirements*.txt`, `src-tauri/Cargo.toml`,
 and `src-tauri/Cargo.lock` for the authoritative dependency set.
+
+NSIS is **not** a dependency: the installer channel was removed on 2026-11-05
+(see `AGENTS.md` §4), so nothing here builds or ships an NSIS package.
 
 `llama-server.exe`, GGUF model files, WebView2, GPU drivers, and Python/Rust/Node toolchains are not distributed in this source tree. Users are responsible for their licenses and model terms.
 

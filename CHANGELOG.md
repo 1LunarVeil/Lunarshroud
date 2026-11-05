@@ -8,6 +8,63 @@ entry and sorted after it. Nothing was ever collapsed into a released version,
 so the file read as an endless stream of iterations rather than as a history of
 releases. `1.0.0` is the first version to own the whole body of work.
 
+## [Unreleased]
+
+### Removed
+
+- **The NSIS installer channel is gone, not merely optional.** Until now
+  `docs/RELEASE.md` described the installer as "optional per release" while
+  `release.yml` demanded *exactly one* installer and threw otherwise — so
+  following the documentation and tagging a release failed the build. Rather
+  than keep a second channel nobody could verify, it is removed outright:
+  `src-tauri/nsis/` is deleted, `bundle.active` is `false` with no `targets`,
+  the release workflow builds with `tauri build --no-bundle`, and it now fails
+  if any `.exe` shows up in the artifact set. The portable zip is the only
+  distribution channel. `build.rs` also stopped staging a second copy of the
+  backend runtime into `src-tauri/backend/`; that copy existed only to feed
+  bundle resources.
+
+### Fixed
+
+- Chat forwarding, the knowledge-base services, and the health probe all broke
+  on an IPv6 loopback listener. `host="::1"` is accepted as loopback, but every
+  URL builder concatenated it bare (`http://::1:8080`), which `urlsplit` reads
+  as `hostname=None` with the port string `":1:8080"`. The probe guard then
+  refused the URL and startup timed out repeatedly with no usable diagnostic.
+  IPv6 literals are now bracketed, and the probe maps the host through a
+  constant table so user input never reaches the request target; it also
+  rejects ports outside 1-65535 and no longer follows redirects.
+- `release.yml` published with `--no-bundle` but had no guard against a stray
+  installer reappearing; it does now.
+- The backend test suite failed on every CI runner and passed locally, because
+  three GPU tests stubbed `subprocess.run` but not the `nvidia-smi` resolver.
+  On a host without an NVIDIA driver the resolver returns `None` and the
+  monitor disables GPU metrics by design, so the "a subprocess must have run"
+  assertions could only pass on a machine with nvidia-smi installed. The tool
+  path is now injected.
+- `requirements-dev.lock` still pinned pypdf 6.18.1 with its old digest even
+  though 6.21.4 was declared, so the hash-locked install that CI and `setup.ps1`
+  use kept pulling the vulnerable release. The pin now matches.
+
+### Documentation
+
+- Published documents no longer point at things this repository does not ship.
+  `CHANGELOG.md` referenced `docs/RISK_ASSESSMENT.md` and `docs/STATUS.md`,
+  `docs/KNOWLEDGE_BASE.md` told readers to run an unpublished evaluation
+  script, `FRONTEND_CONTRACT.md` pointed contributors at local-only preview
+  tools, and `backend/api/*.py` docstrings referenced `docs/ROADMAP.md`. Each
+  now states its conclusion inline or points at a file that exists.
+- Documented counts were stale: the sanitization report claimed 244 mirrored
+  files against an actual 246, and the README baseline still read 903 tests /
+  84.92% coverage.
+- `.gitignore` never ignored `release/`. The `*.zip` rule covered the archive
+  but not the deployed launcher/backend tree or `release/dist/SHA256SUMS.txt`,
+  so one local packaging run left ~40 MB of build output in the working tree
+  for the mirror gate to treat as publishable source.
+- A new `test_public_docs_consistency.py` reads every published document and
+  source comment for `docs/*.md` and `tools/*` references and fails when one
+  does not exist, so this class of drift cannot come back silently.
+
 ## [1.0.0] - 2026-11-03
 
 First stable release. The product moved from "launcher for `llama-server`" to a

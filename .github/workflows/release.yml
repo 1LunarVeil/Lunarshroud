@@ -9,13 +9,14 @@ permissions:
   contents: read
 
 jobs:
-  windows-installer:
+  windows-portable:
     runs-on: windows-latest
     timeout-minutes: 90
     env:
       # Fixed metadata: consecutive PyInstaller builds otherwise embed
-      # different timestamps/hash iteration order. The NSIS installer itself
-      # is still not byte-reproducible; its inner binaries are.
+      # different timestamps/hash iteration order, which would make the
+      # portable zip differ run to run. The launcher binary itself is made
+      # byte-reproducible by the /Brepro linker flag below.
       SOURCE_DATE_EPOCH: '1790000000'
       PYTHONHASHSEED: '0'
     steps:
@@ -76,10 +77,15 @@ jobs:
           cargo +1.97.1 fmt --manifest-path src-tauri/Cargo.toml -- --check
           cargo +1.97.1 clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings -A linker-messages
           cargo +1.97.1 test --manifest-path src-tauri/Cargo.toml --locked
-      - name: Build NSIS installer
+      - name: Build the desktop launcher
         working-directory: src-tauri
         shell: pwsh
         run: |
+          # --no-bundle：本仓库**只有便携包一个发布通道**（AGENTS §4）。
+          # tauri.conf.json 的 bundle.active 已是 false，这里再显式声明一次，
+          # 让"不产安装包"成为命令的一部分而不只依赖配置 —— 配置被误改回来时
+          # 这一步仍然不会产出任何 bundle。
+          #
           # Two things in RUSTFLAGS, both required:
           #  1. Registry crate paths (which contain the build machine's user name)
           #     end up in panic location strings; remap to a neutral prefix.
@@ -89,14 +95,15 @@ jobs:
           #     TimeDateStamp tracked the wall clock). Two /Brepro builds on
           #     unchanged sources reproduce byte-for-byte.
           $env:RUSTFLAGS = "--remap-path-prefix=$env:USERPROFILE\.cargo\registry\src=cargo-registry -C link-arg=/Brepro"
-          cargo +1.97.1 tauri build --ci -- --locked
+          cargo +1.97.1 tauri build --ci --no-bundle -- --locked
+          if ($LASTEXITCODE -ne 0) { throw 'launcher build failed' }
       - name: Stage the portable runtime
         shell: pwsh
         run: |
-          # 便携包是**主发布通道**（免安装、解压即用），安装包不是必交物。
-          # 这条步骤以前完全缺失：release.yml 只产 NSIS，而 README/ROADMAP 承诺的
-          # `release/*-portable-x64.zip` 从来不由 CI 产出 —— 两条分发链路只有一条
-          # 有自动化，另一条全靠手工，且手工步骤没有任何校验。
+          # 便携包是**唯一的发布通道**（免安装、解压即用）。安装包通道已在
+          # 2026-11-05 移除：它面向的人群与便携包完全相同，却要额外维护
+          # 签名、卸载钩子、沙箱目录权限三条链路，而安装/卸载往返验收需要
+          # 干净机器、长期做不到，收益低于风险。
           #
           # 部署脚本会把 launcher 与 onedir backend（backend.exe + _internal/）
           # 作为**一个整体**复制到仓库根，并逐文件比 SHA-256；缺 _internal/ 直接失败。
@@ -140,34 +147,36 @@ jobs:
       - name: Create checksums
         shell: pwsh
         run: |
-          # 对**本次**构建的两个分发物一起算校验和：安装包与便携包。目录里可能
-          # 残留上一次的 SHA256SUMS.txt 或调试文件，只取本次构建的产物。
-          $installers = @(Get-ChildItem src-tauri/target/release/bundle/nsis -File -Filter '*.exe')
-          if ($installers.Count -ne 1) {
-            throw "Expected exactly one NSIS installer, found $($installers.Count)."
-          }
+          # 只有便携包一个分发物（安装包通道已移除，见 AGENTS §4）。
+          # 目录里可能残留上一次的 SHA256SUMS.txt 或调试文件，只取本次构建的产物。
           $zips = @(Get-ChildItem release -File -Filter '*-portable-x64.zip')
           if ($zips.Count -ne 1) {
             throw "Expected exactly one portable zip, found $($zips.Count)."
           }
-          $artifacts = @($installers) + @($zips)
-          $lines = foreach ($artifact in $artifacts) {
-            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifact.FullName).Hash.ToLowerInvariant()
-            "$hash  $($artifact.Name)"
+          # 万一 targets 配置被改回去而真的产出了安装包，这里必须停下：
+          # 发布物清单是"只有一个 zip"，多出来的安装包不该被静默忽略。
+          $strayInstallers = @()
+          if (Test-Path 'src-tauri/target/release/bundle') {
+            $strayInstallers = @(Get-ChildItem 'src-tauri/target/release/bundle' -Recurse -File -Filter '*.exe')
           }
-          $lines | Set-Content src-tauri/target/release/bundle/nsis/SHA256SUMS.txt -Encoding ascii
-          # 便携包附件与校验和放进同一目录，upload-artifact 只需一个路径。
-          Copy-Item -LiteralPath $zips[0].FullName -Destination src-tauri/target/release/bundle/nsis -Force
+          if ($strayInstallers.Count -ne 0) {
+            throw "Installer channel is removed but $($strayInstallers.Count) bundle artifact(s) were produced."
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zips[0].FullName).Hash.ToLowerInvariant()
+          $lines = @("$hash  $($zips[0].Name)")
+          New-Item -ItemType Directory -Path release/dist -Force | Out-Null
+          $lines | Set-Content release/dist/SHA256SUMS.txt -Encoding ascii
+          Copy-Item -LiteralPath $zips[0].FullName -Destination release/dist -Force
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: lunarshroud-windows-${{ github.ref_name }}
-          path: src-tauri/target/release/bundle/nsis/*
+          path: release/dist/*
           if-no-files-found: error
 
-  # ── 把安装包真正发布出去 ──────────────────────────────────────────────
+  # ── 把便携包真正发布出去 ──────────────────────────────────────────────
   # 只 upload-artifact 等于没有发布：workflow artifact 90 天过期、必须登录
-  # GitHub 点进具体某次运行才能下载、仓库首页完全没有入口。要满足"给不懂
-  # 命令行的用户一个能直接装的文件"，必须落到 GitHub Release 上。
+  # GitHub 点进具体某次运行才能下载、仓库首页完全没有入口。必须落到
+  # GitHub Release 上，用户才有可匿名下载的入口。
   #
   # 单独成 job 有两个理由：
   #   1) 构建 job 的 permissions 保持 contents: read（最小权限不被稀释），
@@ -178,7 +187,7 @@ jobs:
   # 所有 action 固定到完整 commit SHA 且只用官方 actions/*，为一步发布破例
   # 不划算。
   publish-release:
-    needs: windows-installer
+    needs: windows-portable
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     # 写权限只给这一个 job（构建 job 保持 read）；actions: read 是为了 gh run download
@@ -195,13 +204,20 @@ jobs:
         run: |
           gh run download "$GITHUB_RUN_ID" -n "lunarshroud-windows-$GITHUB_REF_NAME" -D dist/
           ls -l dist/
-      - name: Refuse to publish an incomplete bundle
+      - name: Refuse to publish an incomplete release
         shell: bash
         run: |
           shopt -s nullglob
+          # 唯一的分发物就是便携包。安装包通道已移除，因此**出现 .exe 反而是
+          # 错误**（说明 bundle 又被打开了），必须停下而不是顺手发出去。
+          zips=(dist/*-portable-x64.zip)
+          if [ "${#zips[@]}" -ne 1 ]; then
+            echo "期望恰好 1 个便携包，实际 ${#zips[@]}: ${zips[*]}" >&2
+            exit 1
+          fi
           installers=(dist/*.exe)
-          if [ "${#installers[@]}" -ne 1 ]; then
-            echo "期望恰好 1 个安装包，实际 ${#installers[@]}: ${installers[*]}" >&2
+          if [ "${#installers[@]}" -ne 0 ]; then
+            echo "安装包通道已移除，但产物里出现了 ${#installers[@]} 个 .exe: ${installers[*]}" >&2
             exit 1
           fi
           if [ ! -s dist/SHA256SUMS.txt ]; then
@@ -222,13 +238,15 @@ jobs:
             echo "下载后请先核对哈希（PowerShell）："
             echo ""
             echo '```powershell'
-            for f in dist/*.exe; do
+            for f in dist/*.zip; do
               b=$(basename "$f")
               echo "(Get-FileHash -Algorithm SHA256 '$b').Hash.ToLower()   # 应为: $(awk -v n="$b" '$2==n{print $1}' dist/SHA256SUMS.txt)"
             done
             echo '```'
             echo ""
             echo "⚠️ 本构建未做代码签名，Windows SmartScreen 可能提示未知发布者。"
+            echo ""
+            echo "本版本只提供便携包：解压后用 LunarShroud.exe 启动，无需安装。"
           } > notes.md
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber

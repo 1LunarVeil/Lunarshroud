@@ -17,8 +17,9 @@
   **一个固定位置**，然后运行里面的 `LunarShroud.exe`。**不要只复制一个 exe**：
   `backend\backend.exe` 与 `backend\_internal\` 必须与启动器在同一个目录里
   配套使用 —— 解压整个文件夹，而不是把 exe 拖出来。
-- 安装包：本版**未提供**。`cargo tauri build` 随时可以重新产出 NSIS 安装包
-  （见 [BUILDING.md](BUILDING.md)），但 1.0.0 只发布了便携通道。
+- 安装包：本版**不提供，也不会再提供**。NSIS 通道已于 2026-11-05 移除，
+  `bundle.active` 已关闭，自行 `cargo tauri build` 也只产便携运行时
+  （见 [BUILDING.md](BUILDING.md) 与 [RELEASE.md](RELEASE.md)）。
 
 ### 2. 获取 llama-server
 

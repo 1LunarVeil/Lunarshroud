@@ -8,6 +8,7 @@ data/history.db-wal 既能被 --apply 复制进公开镜像、又不会被内容
 from __future__ import annotations
 
 import io
+import json
 import sys
 from pathlib import Path
 
@@ -191,16 +192,19 @@ def test_every_workflow_action_is_pinned_to_a_full_commit_sha():
     assert not bad, ("以下 action 没有固定到完整 40 位 SHA：" + chr(10) + chr(10).join(bad))
 
 
-def test_workflows_publish_an_installer_users_can_actually_download():
-    """release.yml 必须真正把安装包发到一个可匿名下载的 URL。
+def test_release_workflow_publishes_the_portable_zip_and_no_installer():
+    """release.yml 必须把便携包发到可匿名下载的 URL，且**不得**再产安装包。
 
     只 upload-artifact 不等于发布：workflow artifact 会过期、必须登录 GitHub 并
-    点进具体某次运行才能下载、仓库首页没有入口。项目的既定要求是"既能让用户
-    克隆源码自构建，也要给不懂命令行的用户一个能直接装的安装包"，缺这一步
-    第二条通道就是 0% 完成。
+    点进具体某次运行才能下载、仓库首页没有入口，所以必须落到 GitHub Release。
+
+    安装包通道已于 2026-11-05 移除（AGENTS §4）：它面向的人群与便携包完全相同，
+    却要额外维护签名、卸载钩子和沙箱目录权限三条链路，而安装/卸载往返验收需要
+    干净机器、长期做不到。因此这条测试是**双向**的 —— 既要钉住便携包发布，
+    也要钉住"不许再出现安装包"，否则那次移除会在某次重构里被悄悄还原。
     """
-    text = (Path(__file__).resolve().parents[2] / ".github" / "workflows"
-            / "release.yml").read_text(encoding="utf-8")
+    root = Path(__file__).resolve().parents[2]
+    text = (root / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
     assert "gh release create" in text, "没有任何 GitHub Release 发布步骤"
     # 必须只在打 tag 时发布，workflow_dispatch 试跑不得误发公开版本
     assert "startsWith(github.ref, 'refs/tags/v')" in text
@@ -208,6 +212,23 @@ def test_workflows_publish_an_installer_users_can_actually_download():
     assert "contents: read" in text
     build_job = text.split("  publish-release:")[0]
     assert "contents: write" not in build_job, "写权限泄漏到了构建 job"
+
+    # 便携包是唯一分发物
+    assert "*-portable-x64.zip" in text, "发布物里没有便携包"
+    # 构建命令必须显式 --no-bundle，让"不产安装包"成为命令的一部分
+    assert "--no-bundle" in text, "tauri build 没有禁用 bundle"
+
+    # 安装包通道不得复活：既不能有产出它的步骤，也不能有认领它的校验
+    assert "Build NSIS installer" not in text, "安装包构建步骤被加回来了"
+    assert "bundle/nsis" not in text, "发布流程又把 NSIS 目录当成产物来源了"
+    assert "installerHooks" not in text
+
+    # 配置层面也必须关掉 bundle：只改 workflow 而留 targets: ["nsis"]，
+    # 手工 `cargo tauri build` 仍会产出安装包。
+    conf = json.loads((root / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
+    assert conf["bundle"]["active"] is False, "tauri.conf.json 又打开了 bundle"
+    assert "targets" not in conf["bundle"], "bundle.targets 被加回来了（安装包通道已移除）"
+    assert not (root / "src-tauri" / "nsis").exists(), "nsis/ 目录（安装脚本）被加回来了"
 
 
 def test_the_project_gitignore_still_mirrors():
