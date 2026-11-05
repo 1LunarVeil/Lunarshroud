@@ -79,6 +79,9 @@ def _base_url(inst: Any) -> str:
     host = str(inst.host or "127.0.0.1")
     if host in {"0.0.0.0", "::", "[::]", ""}:
         host = "127.0.0.1"
+    # IPv6 字面量在 URL 里必须带方括号（`http://::1:8080` 的 hostname 是 None）。
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
     return f"http://{host}:{inst.port}"
 
 

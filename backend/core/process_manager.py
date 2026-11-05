@@ -126,6 +126,18 @@ INSTANCE_LOG_MAX_BYTES = 5 * 1024 * 1024
 # 后者会放行任何写进来的域名或远程地址，让探测器替调用方对外发请求。
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
+# 健康探测的**主机常量表**：键是用户参数里可能出现的监听地址，值是唯一会被
+# 拼进探测 URL 的字面量。不在表里的键回落到 127.0.0.1 —— 于是"探测哪个主机"
+# 永远由这张表决定，用户输入只能在这几个常量之间选择，无法引入新目标。
+# IPv6 字面量在这里就已经带上方括号：URL 里的 `::1` 不加括号会被 urlsplit
+# 解析成 hostname=None（端口串变成 ":1:8080"），探测将永远失败。
+_PROBE_HOSTS = {
+    "127.0.0.1": "127.0.0.1",
+    "localhost": "127.0.0.1",   # 探测直接连地址，不必再做一次名字解析
+    "::1": "[::1]",
+    "[::1]": "[::1]",
+}
+
 # 单条日志行的字符上限。llama-server/GGUF 元数据可能吐出一行几十 MB 的内容；
 # 环形缓冲只限制行数，不限制单行大小，于是这一行会被原样 JSON 序列化进
 # WebSocket、再塞进一个 DOM 文本节点。截断并显式标注，比让 UI 卡死好。
@@ -1250,15 +1262,22 @@ class ProcessManager:
         """
         # 通配监听地址不能作为连接目标，统一探测回环（与 chat 接口的转换一致）。
         #
-        # 候选集合是**显式白名单**：健康探测问的是"我刚启动的子进程起来了吗"，
-        # 与任何外部服务无关。`instance.host` 来自用户可编辑的启动参数，所以
-        # 不能把任意值直接拼进 URL —— 一个被改成远程地址的 host 会让探测器
-        # 替调用方发起外部请求。不在白名单里的一律按回环处理。
-        # 健康探测的目标**只能是本机**：它问的是"我刚启动的那个子进程起来了吗"。
-        # `instance.host` 来自用户可编辑的启动参数，所以这里不让它进入 URL ——
-        # 主机名固定为 LOOPBACK_HOSTS 里的形态，端口先过 int() 与 TCP 范围校验。
-        host = instance.host if instance.host in LOOPBACK_HOSTS else "127.0.0.1"
-        url = f"http://{host}:{int(instance.port)}/health"
+        # 健康探测问的是"我刚启动的子进程起来了吗"，与任何外部服务无关。
+        # `instance.host` 来自用户可编辑的启动参数，所以**它不进入 URL**：
+        # 这里用一张常量表映射出固定的探测主机，表里没有的值一律回落到
+        # 127.0.0.1。这样探测目标在结构上就只能是本机常量，而不是"经过校验
+        # 的用户输入" —— 后者一旦哪天漏掉一次校验就是 SSRF。
+        host = _PROBE_HOSTS.get(instance.host, "127.0.0.1")
+        port = int(instance.port)
+        if not 1 <= port <= 65535:
+            instance._probe_attempts += 1
+            instance._last_probe = f"端口 {port} 超出 TCP 范围，跳过探测"
+            return False
+        # IPv6 字面量在 URL 里必须加方括号：`http://::1:8080/health` 会被
+        # urlsplit 解析成 hostname=None、端口串变成 ":1:8080"，于是下面的
+        # 边界校验报"URL 没有主机名"并拒绝 —— 用 `::1` 监听的实例会永远
+        # 探测不通过，用户只看到反复的启动超时（实测已复现）。
+        url = f"http://{host}:{port}/health"
         instance._probe_attempts += 1
         # 请求前显式校验：协议必须是 http，且**解析之后**的地址必须是回环。
         # 白名单挡住了参数里的异常值，这一层不依赖调用方 —— 见
@@ -1268,12 +1287,15 @@ class ProcessManager:
             instance._last_probe = f"{url} -> 拒绝探测：{refusal}"
             return False
         try:
-            # trust_env=False 是必须的：httpx 默认读取 HTTP_PROXY/HTTPS_PROXY
-            # （Windows 上还会回退到注册表里的系统代理）。用户开着 Clash/V2Ray
-            # 之类的系统代理时，发往 127.0.0.1 的 /health 会被送进代理；代理没
-            # 运行就是 ConnectTimeout，于是 llama-server 明明已就绪，界面却报
-            # "startup timed out"。回环探测永远不该经过代理。
-            r = httpx.get(url, timeout=1.0, trust_env=False)
+            # 用一个**没有代理、没有重定向**的短生命周期客户端，并且只请求上面
+            # 那张常量表 + 已校验端口拼出来的地址。trust_env=False 是必须的：
+            # httpx 默认读取 HTTP_PROXY/HTTPS_PROXY（Windows 上还会回退到注册表
+            # 里的系统代理），用户开着 Clash/V2Ray 而代理没起来时，发往
+            # 127.0.0.1 的请求会被送进死代理，于是 llama-server 明明已就绪、
+            # 界面却报 "startup timed out"。follow_redirects=False 让服务端
+            # 无法用一个 302 把探测器引到别的地址上去。
+            with httpx.Client(timeout=1.0, trust_env=False, follow_redirects=False) as client:
+                r = client.get(url)
         except httpx.TimeoutException:
             instance._last_probe = f"{url} -> 连接超时（1.0s）"
             return False

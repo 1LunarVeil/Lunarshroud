@@ -340,6 +340,33 @@ def test_chat_proxy_streams_and_injects_stream_true(chat_client, monkeypatch):
     assert upstream.closed is True
 
 
+def test_upstream_base_brackets_ipv6_and_translates_wildcards():
+    """IPv6 字面量必须带方括号，通配地址必须翻译成回环。
+
+    裸拼 `http://::1:8080` 时 urlsplit 的 hostname 是 None、端口串变成
+    ":1:8080"：Chat 转发、知识服务与健康探测都会因此直接失败，而用户在参数
+    面板里填 `::1` 是完全合法的回环监听地址。
+    """
+    from types import SimpleNamespace
+
+    from core.chat_proxy import upstream_base
+
+    assert upstream_base(SimpleNamespace(host="127.0.0.1", port=8080)) == "http://127.0.0.1:8080"
+    assert upstream_base(SimpleNamespace(host="::1", port=8080)) == "http://[::1]:8080"
+    assert upstream_base(SimpleNamespace(host="[::1]", port=8080)) == "http://[::1]:8080"
+    for wildcard in ("0.0.0.0", "::", "[::]", ""):
+        assert upstream_base(SimpleNamespace(host=wildcard, port=8080)) == "http://127.0.0.1:8080"
+
+    # 每个产物都必须能被 urlsplit 还原出主机名与端口 —— 这条才真正钉住
+    # "加括号"有没有做对，只比字符串会把 "http://::1:8080" 也判成合法。
+    from urllib.parse import urlsplit
+
+    for host in ("127.0.0.1", "::1"):
+        parsed = urlsplit(upstream_base(SimpleNamespace(host=host, port=8080)))
+        assert parsed.hostname in {"127.0.0.1", "::1"}, parsed.hostname
+        assert parsed.port == 8080, parsed.port
+
+
 def test_chat_proxy_uses_last_api_key_from_argv(chat_client):
     _, main = chat_client
     from types import SimpleNamespace

@@ -1952,12 +1952,27 @@ def test_health_probe_uses_loopback_for_wildcard_host(monkeypatch):
     class Response:
         status_code = 200
 
-    def fake_get(url, timeout=None, **kwargs):
-        captured["url"] = url
-        captured.update(kwargs)
-        return Response()
+    class FakeClient:
+        """探测走 `httpx.Client(...)` 上下文管理器，patch 点也随之改变。
 
-    monkeypatch.setattr(process_manager.httpx, "get", fake_get)
+        用 Client 而不是模块级 `httpx.get`：探测需要一个**不跟随重定向**的
+        客户端，否则服务端一个 302 就能把探测器引去别处。
+        """
+
+        def __init__(self, **kwargs):
+            captured["client_kwargs"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def get(self, url):
+            captured["url"] = url
+            return Response()
+
+    monkeypatch.setattr(process_manager.httpx, "Client", FakeClient)
 
     instance = Instance(
         id="wildcard",
@@ -1973,7 +1988,9 @@ def test_health_probe_uses_loopback_for_wildcard_host(monkeypatch):
 
     assert ProcessManager()._probe_health(instance) is True
     assert captured["url"] == "http://127.0.0.1:1234/health"
-    assert captured["trust_env"] is False
+    assert captured["client_kwargs"]["trust_env"] is False
+    # 不跟随重定向：探测目标只能是我们拼出来的那个回环地址
+    assert captured["client_kwargs"]["follow_redirects"] is False
 
 
 def test_error_responses_carry_cors_headers(monkeypatch):
@@ -2468,6 +2485,42 @@ def test_probe_health_records_what_it_saw():
     assert inst._probe_attempts == 1
     manager._probe_health(inst)
     assert inst._probe_attempts == 2
+
+
+def test_probe_health_brackets_an_ipv6_loopback_host():
+    """`host="::1"` 必须拼成 ``http://[::1]:<port>/health``。
+
+    `LOOPBACK_HOSTS` 收 `::1`，但裸拼 `http://::1:8080/health` 时 urlsplit 把
+    hostname 解析成 None（端口串变成 ":1:8080"），`refuse_non_loopback` 于是
+    回 "URL 没有主机名" —— 用 IPv6 回环监听的实例**永远探测不通过**，用户只会
+    看到反复的启动超时。IPv6 字面量在 URL 里必须带方括号。
+    """
+    from core.process_manager import get_process_manager
+
+    inst = _probe_instance(host="::1", port=6)
+    manager = get_process_manager()
+    assert manager._probe_health(inst) is False
+    assert "http://[::1]:6/health" in inst._last_probe, inst._last_probe
+    assert "没有主机名" not in inst._last_probe, inst._last_probe
+
+
+def test_probe_health_rejects_a_port_outside_the_tcp_range():
+    """越界端口要在拼 URL 之前就被拒绝，并留下可读原因。
+
+    `int(instance.port)` 曾经只做转换、不做范围检查，而注释声称"端口先过
+    int() 与 TCP 范围校验"—— 注释里有、代码里没有。urlsplit 对 70000 会抛
+    ValueError，被外层的 except Exception 吞成一句含糊的失败原因；这里钉住
+    "显式拒绝 + 说清是端口问题"。
+    """
+    from core.process_manager import get_process_manager
+
+    manager = get_process_manager()
+    for bad_port in (0, 70000, -1):
+        inst = _probe_instance(port=bad_port)
+        assert manager._probe_health(inst) is False
+        assert "超出 TCP 范围" in inst._last_probe, (bad_port, inst._last_probe)
+        # 不得把越界端口拼进 URL 去请求
+        assert "http://" not in inst._last_probe, inst._last_probe
 
 
 def test_test_suite_never_uses_the_repository_data_directory():

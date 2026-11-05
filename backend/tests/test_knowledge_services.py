@@ -139,6 +139,26 @@ def test_service_parameters_request_the_right_endpoints():
     assert ocr["ctx_size"] == 8192
 
 
+def test_service_base_url_brackets_ipv6_and_translates_wildcards():
+    """知识服务连实例的基址同样要给 IPv6 字面量加方括号。
+
+    `http://::1:8080` 的 hostname 是 None：`llama_services._base_url` 的
+    loopback 校验会直接抛 LlamaServiceError，索引与检索全部失败，而 `::1`
+    是参数面板允许的监听地址。
+    """
+    from urllib.parse import urlsplit
+
+    for host in ("::1", "[::1]"):
+        parsed = urlsplit(knowledge_services._base_url(SimpleNamespace(host=host, port=8080)))
+        assert parsed.hostname == "::1", parsed.hostname
+        assert parsed.port == 8080, parsed.port
+
+    for wildcard in ("0.0.0.0", "::", "[::]", ""):
+        assert knowledge_services._base_url(
+            SimpleNamespace(host=wildcard, port=8080)
+        ) == "http://127.0.0.1:8080"
+
+
 def test_release_stops_and_removes_only_owned_services(monkeypatch):
     running = _instance("i9", model="m.gguf", embeddings=True)
     manager = _Manager([running])

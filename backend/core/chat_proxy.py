@@ -456,6 +456,10 @@ def upstream_base(inst: Any) -> str:
     host = inst.host
     if host in {"0.0.0.0", "::", "[::]", ""}:
         host = "127.0.0.1"
+    # IPv6 字面量必须加方括号，否则 urlsplit/h11 拿到的是 `http://::1:8080`，
+    # hostname 解析成 None、端口串变成 ":1:8080" —— 请求直接失败。
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
     return f"http://{host}:{inst.port}"
 
 
