@@ -522,12 +522,12 @@ DLL 判别）、`test_multibackend_runtimes.py`（四包归属与设备枚举）
 
 已实际踩过的四类（2026-11-05 一轮审计全部命中）：
 
-1. **文档指向被排除的文件**：`CHANGELOG.md` 让读者看 `docs/RISK_ASSESSMENT.md`、
-   `docs/STATUS.md`；`docs/KNOWLEDGE_BASE.md` 让读者 `python
-   tools/eval_knowledge_retrieval.py`；`FRONTEND_CONTRACT.md` 让贡献者跑
-   `tools/ui_preview.py`。这些文件全在 `CURATED_EXCLUDES` 里，公开树里不存在。
-2. **注释指向被排除的文档**：`backend/api/*.py` 写"见 `docs/ROADMAP.md` §P1"。
-   源码也是公开的，注释同样是给读者看的。
+1. **文档指向被排除的文件**：`CHANGELOG.md` 曾让读者去看两份内部状态/风险文档；
+   `docs/KNOWLEDGE_BASE.md` 曾让读者直接执行一个检索评测脚本；`FRONTEND_CONTRACT.md`
+   曾让贡献者跑本机预览工具。这些都指向 `CURATED_EXCLUDES` 里的条目，公开树里
+   不存在。
+2. **注释指向被排除的文档**：`backend/api/*.py` 的模块文档字符串曾写"见
+   `<内部规划文档>` §P1"。源码也是公开的，注释同样是给读者看的。
 3. **文档与工作流互相矛盾**：README 说"本版不提供 NSIS 安装包"，而
    `release.yml` 硬性要求"恰好 1 个安装包"否则 `throw` —— 按文档打 tag 发布会
    直接失败。反过来也一样危险：配置留着但没人验收。

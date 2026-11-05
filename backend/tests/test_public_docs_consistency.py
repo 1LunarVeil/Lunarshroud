@@ -59,16 +59,20 @@ TOOL_PATH = re.compile(r"tools/[A-Za-z0-9_\-]+\.(?:py|js|mjs|ps1|sh)")
 def _candidates() -> list[Path]:
     """会写进公开文档、读者可能照着找的文件。
 
-    测试文件被排除：它们大量出现 `docs/a.md`、`tmp/x.yaml` 这类 **fixture
-    数据**——是喂给被测函数的输入，不是给读者的指路。把它们算进来只会让这条
-    断言变成"夹具不许用合成路径"，与本测试要防的东西无关。
+    两类刻意排除：
+
+    * **测试文件**：它们大量出现 `docs/a.md`、`tmp/x.yaml` 这类 **fixture
+      数据**——是喂给被测函数的输入，不是给读者的指路。
+    * **`check_release_mirror.py`**：它逐个列出被排除的文件名，那是它的
+      职责（规则表）。这份清单是"这些路径不得进镜像"的断言对象，本身不是
+      指路；把它算进来等于要求规则表不许写出它要拦的文件名。
     """
     return [
         p
         for p in _published_files()
         if p.suffix.lower() in {".md", ".py", ".mjs", ".js", ".yml", ".yaml", ".ps1"}
         and not p.name.startswith("test_")
-        and p.name != "conftest.py"
+        and p.name not in {"conftest.py", "check_release_mirror.py"}
     ]
 
 
@@ -104,11 +108,16 @@ def test_published_docs_and_code_only_reference_paths_that_exist():
     )
 
 
-def test_the_gate_rule_table_is_the_only_place_that_names_excluded_files():
-    """门禁的排除名单必须仍然**只是**一份规则表。
+def test_no_published_file_names_a_deliberately_excluded_document():
+    """除了门禁的规则表，公开文件不该点名那些被刻意排除的内部材料。
 
-    它天然会逐个写出被排除的文件名（那是它的职责），但除了它之外，任何公开
-    文件都不该再点名这些内部材料——否则等于把"我们有哪些私有材料"印在封面上。
+    这条与上面那条互补：上一条管"这不存在的路径能不能打开"，这一条管"该不该
+    在封面上写出私有材料的名字"——即便只是顺口一提，也等于告诉读者这个项目有
+    哪些内部文档。
+
+    门禁脚本本身豁免：它必须逐个列出要拦的文件名，那是规则表的全部意义。
+    中文文件名（`独立代码审计报告.md` 之类）不在这里列：它们出现在门禁规则表与
+    本测试自身的断言里，属于同一豁免逻辑，重复列举只会让这条断言更难维护。
     """
     internal_names = [
         "docs/STATUS.md",
@@ -120,8 +129,6 @@ def test_the_gate_rule_table_is_the_only_place_that_names_excluded_files():
     ]
     offenders: list[str] = []
     for path in _candidates():
-        if path.name == "check_release_mirror.py":
-            continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:  # pragma: no cover

@@ -40,6 +40,9 @@ def service():
     finally:
         server.shutdown()
         server.server_close()
+        # 等 serve_forever 真正退出再放行：全量并发跑时，下一个用例可能立刻
+        # 复用同一个端口/线程，shutdown() 只保证"停止受理"而不保证线程已退出。
+        thread.join(timeout=10)
 
 
 def test_embed_texts_preserves_input_order(service):
@@ -120,6 +123,7 @@ def test_errors_are_readable_and_non_loopback_hosts_are_rejected(service):
     finally:
         server.shutdown()
         server.server_close()
+        thread.join(timeout=10)
 
     with pytest.raises(llama_services.LlamaServiceError, match="loopback"):
         llama_services.embed_texts("http://192.0.2.10:8080", ["x"])

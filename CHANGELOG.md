@@ -49,10 +49,10 @@ releases. `1.0.0` is the first version to own the whole body of work.
 ### Documentation
 
 - Published documents no longer point at things this repository does not ship.
-  `CHANGELOG.md` referenced `docs/RISK_ASSESSMENT.md` and `docs/STATUS.md`,
-  `docs/KNOWLEDGE_BASE.md` told readers to run an unpublished evaluation
-  script, `FRONTEND_CONTRACT.md` pointed contributors at local-only preview
-  tools, and `backend/api/*.py` docstrings referenced `docs/ROADMAP.md`. Each
+  `CHANGELOG.md` referenced two internal status/risk documents, the knowledge
+  base guide told readers to run an unpublished evaluation script,
+  `FRONTEND_CONTRACT.md` pointed contributors at local-only preview tools, and
+  `backend/api/*.py` docstrings referenced an internal planning document. Each
   now states its conclusion inline or points at a file that exists.
 - Documented counts were stale: the sanitization report claimed 244 mirrored
   files against an actual 246, and the README baseline still read 903 tests /
