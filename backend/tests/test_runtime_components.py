@@ -291,8 +291,12 @@ def test_gpu_monitor_parses_snapshots_and_processes(monkeypatch):
         calls.append(kwargs)
         return results.pop(0)
 
-    # 强制走 nvidia-smi 子进程路径（本机有 N 卡时 NVML 会优先返回真实数据）
+    # 强制走 nvidia-smi 子进程路径（本机有 N 卡时 NVML 会优先返回真实数据）。
+    # `_nvidia_smi()` 必须一并注入：没有 N 卡的机器（含 CI runner）上它会返回
+    # None 并**按设计禁用** GPU 指标，于是 subprocess.run 一次都不会被调用，
+    # 用例在本机绿、在 CI 红。工具是否存在是被测行为的前置条件，不是被测行为。
     monkeypatch.setattr(gpu_monitor, "_nvml_try_init", lambda: False)
+    monkeypatch.setattr(gpu_monitor, "_nvidia_smi", lambda: "nvidia-smi-stub")
     monkeypatch.setattr(gpu_monitor.subprocess, "run", run)
     monkeypatch.setattr(gpu_monitor.psutil, "cpu_percent", lambda interval=None: 12.5)
     monkeypatch.setattr(
@@ -433,7 +437,10 @@ def test_nvidia_smi_calls_pin_utf8(monkeypatch):
 
     # 强制走 nvidia-smi 兜底路径。源码里 NVML 判断的真实名字是 _nvml_try_init
     # （早期方案稿写的 _has_nvml 在源码中不存在，以源码为准）。
+    # `_nvidia_smi()` 同样要注入：CI runner 没有 nvidia-smi，解析失败会按设计
+    # 跳过 GPU 指标，断言"必须被调用"就变成了对宿主机的依赖（本机绿、CI 红）。
     monkeypatch.setattr(gpu_monitor, "_nvml_try_init", lambda: False)
+    monkeypatch.setattr(gpu_monitor, "_nvidia_smi", lambda: "nvidia-smi-stub")
     monkeypatch.setattr(gpu_monitor.subprocess, "run", fake_run)
 
     monitor = SystemMonitor()

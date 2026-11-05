@@ -773,6 +773,10 @@ def test_nvml_init_failure_falls_back_to_nvidia_smi(monkeypatch):
             stdout="0, Fake GPU, 1024, 4096, 10, 50\n",
         )
 
+    # 宿主机没有 nvidia-smi 时（CI runner 就是），`_nvidia_smi()` 返回 None，
+    # 源码会**按设计禁用** GPU 指标 —— 那样子进程一次都不会被调用。工具路径
+    # 是这条用例的前置条件，必须注入，否则用例只在装了 N 卡的机器上成立。
+    monkeypatch.setattr(gpu_monitor, "_nvidia_smi", lambda: "nvidia-smi-stub")
     monkeypatch.setattr(gpu_monitor.subprocess, "run", fake_run)
     gpus = gpu_monitor.SystemMonitor()._query_gpus()
     assert called.subprocess_runs == 1
@@ -823,9 +827,8 @@ def test_schema_and_presets_expose_english_fields():
     #  1) 每个参数在 schema 里都必须有非空 label_en/help_en（上面的循环）；
     #  2) 两份过渡字典不得比定义多出孤儿条目，也不得漏掉任何定义。
     # 单源化的终态是把英文写进 ParamMeta（`label_en`/`help_en` 字段已就位，
-    # schema 读取时优先取内联值）。迁移是逐参数进行的：已完成内联的参数
-    # 不再依赖字典，仍靠字典的参数由第 2 条钉住"字典必须覆盖它"。
-    # docs/ROADMAP.md §P2 记录了完整迁移步骤与 JSON diff 验收方式。
+    # 迁移是逐参数进行的：已完成内联的参数不再依赖字典，仍靠字典的参数由
+    # 第 2 条钉住"字典必须覆盖它"。
     from core.param_schema import PARAM_HELP_EN, PARAM_LABELS_EN
 
     defined = {p.key for p in PARAM_DEFINITIONS}
