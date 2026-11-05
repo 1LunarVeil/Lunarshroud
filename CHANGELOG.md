@@ -15,8 +15,9 @@ complete local AI chat application: bring your own llama.cpp build, bring your
 own GGUF files, no account, no network, all data on this machine.
 
 **Known limits at this version** — 8-hour soak and the multi-hardware matrix are
-not done; artifacts are unsigned. See `docs/RISK_ASSESSMENT.md`. This is a
-feature-complete release, not an unqualified "production-grade stable" claim.
+not done; artifacts are unsigned. The README's "已知限制" section states both.
+This is a feature-complete release, not an unqualified "production-grade stable"
+claim.
 
 **How this release was qualified.** An earlier candidate was reported as
 passing 903 tests, a clean release mirror and a bootable packaged backend — and
@@ -183,10 +184,12 @@ green tests do not mean the product works.
 - OCR provenance is disclosed: documents indexed from scans show an `OCR` badge
   in the base and on every citation, with a tooltip that the wording is
   best-effort.
-- `tools/eval_knowledge_retrieval.py` scores 21 labelled questions plus 10
-  deliberately unanswerable ones against a real 377-chunk legal index and
-  ablates dense / hybrid / per-document cap / rerank. Shipped path: **hit@1 76%,
-  hit@3 95%, MRR 0.841**.
+- Retrieval quality was measured on 21 labelled questions plus 10 deliberately
+  unanswerable ones, against a real 377-chunk legal index, ablating dense /
+  hybrid / per-document cap / rerank. Shipped path: **hit@1 76%, hit@3 95%,
+  MRR 0.841**. The evaluation harness needs a local legal index and embedding and
+  rerank models, so it is not part of the published tree; the method and the
+  per-configuration numbers are in [docs/KNOWLEDGE_BASE.md](docs/KNOWLEDGE_BASE.md).
 
 **Runtime and models**
 
@@ -554,8 +557,8 @@ rust       cargo test                               23 passed, 0 failed
 
 The Rust suite needs `CARGO_TARGET_DIR` pointed at a short path outside the
 repository; under `src-tauri/target` the `ring` C compile fails with an empty
-stderr. `docs/STATUS.md` records the full measurement and states plainly that
-the root cause is not narrowed to a line.
+stderr. The root cause is not narrowed to a line, so treat that setting as a
+workaround rather than an explanation.
 
 Release artifacts (portable channel only):
 

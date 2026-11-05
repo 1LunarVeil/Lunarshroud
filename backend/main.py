@@ -612,7 +612,7 @@ def _collect_system_overview() -> dict:
 
 # ========== 预设管理 ==========
 #
-# 9 条路由已搬进 ``api/presets.py``（docs/ROADMAP.md §P1 的拆分模板）。
+# 9 条路由已搬进 ``api/presets.py``（拆分模板，约定见 ``api/__init__.py``）。
 # 路由在 app 装配处 include_router；认证由全局 session_auth_middleware 覆盖，
 # 无需逐个处理（test_auth_coverage.py 会穷举验证）。
 # 本文件顶部仍从 core.preset_store 导入这些函数：其它路由（如启动实例读预设）

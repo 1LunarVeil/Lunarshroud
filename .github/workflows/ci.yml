@@ -37,10 +37,10 @@ jobs:
         # 对 PyPI 官方 JSON 摘要交叉验证。保险库文件的重新生成说明见其头注释。
         run: python -m pip install --require-hashes -r backend/requirements-dev.lock
       - name: Lint backend and tools (ruff)
-        # tools/ 一并 lint：它们也随镜像发布，此前只 lint backend 会让工具脚本的
-        # 问题（18 处）长期不进 CI，而 docs/STATUS.md 的 "lint clean" 容易被读成
-        # 全仓干净。公开镜像 github/ 不必单独 lint —— 镜像门禁已强制它与工作树
-        # 逐字节一致，working tree 侧过了就等于过了。
+        # tools/ 一并 lint：它们也随仓库发布，只 lint backend 会让工具脚本的
+        # 问题长期不进 CI，而某份历史记录里的 "lint clean" 容易被读成全仓干净。
+        # 公开镜像 github/ 不必单独 lint —— 镜像门禁已强制它与工作树逐字节
+        # 一致，working tree 侧过了就等于过了。
         run: python -m ruff check backend tools
       - name: Backend tests and product-code coverage
         run: python -m pytest --cov=backend --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=75

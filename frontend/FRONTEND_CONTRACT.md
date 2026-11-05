@@ -21,15 +21,15 @@
    ```
 4. **颜色/间距/圆角/字号/阴影/动效只能引用 `css/tokens.css` 的变量**，不得写死 hex / rgba / px。
    （`style.css` 当前已清零写死颜色；新增规则请保持。）
-5. **视觉改动要用证据验收**，不能只靠肉眼：
+5. **视觉改动要用证据验收**，不能只靠肉眼：跑浏览器几何门禁，它读真实的
+   `getBoundingClientRect` 与计算样式，而不是"元素存在"：
    ```powershell
-   py --% -X utf8 tools/ui_preview.py --out tmp/shots/x.png --page param_editor `
-       --expand speculative --compare tmp/shots/baseline.png --compare-skip-top 60 `
-       --compare-image tmp/shots/x_diff.png
+   npm ci
+   npm run test:browser        # core-paths：渲染、axe、首屏性能
+   npm run test:browser:deep   # 深路径：每个控件的真实交互（串行）
    ```
-   注意：同一状态两次渲染之间本身有约 0.1% 的抗锯齿噪声（实测已验证），
-   所以"差异像素不为 0"不等于有回归 —— 要看 `--compare-image` 的标红位置，
-   并核对每段差异的最大通道差（1/255 量级即噪声）。
+   后端要先用 `$env:LUNARSHROUD_ALLOW_INSECURE_DEV = '1'` 起在 17520。
+   同源/跨源差异、WebSocket 握手与几何溢出只有真实窗口能测到，纯接口测试测不到。
 
 ---
 
@@ -733,9 +733,9 @@ cli_no_value, unit, order`
 
 1. ~~**`style.css` 末尾有"更精致/更美观"的追加覆盖块**~~ ✅ **已修复（2026-09-16）**：
    原 L1132-1300 的"UI 精致度优化"段（约 123 行）重新声明了 15 个与前面重复的选择器。
-   现已把全部声明归位到各自原始规则并删除该段。验证手段不是截图，而是
-   `tools/css_cascade_probe.js` 导出的级联声明表——改动前后 **SHA-256 完全一致**，
-   且报告由 `DUPLICATES(15)` 变为 `NO_DUPLICATES (259 unique selectors)`。
+   现已把全部声明归位到各自原始规则并删除该段。验证手段不是截图，而是导出的级联
+   声明表——改动前后 **SHA-256 完全一致**，且报告由 `DUPLICATES(15)` 变为
+   `NO_DUPLICATES (259 unique selectors)`。
    `style.css` 从 1302 行降至 1178 行。
 2. ~~`settings` 用 `data-field`，其它模块用 `data-key`~~ ✅ **已确认不需要统一**（见 §4.3 说明）。
    已修掉的真问题是：`settings.js` 的 `.param-field` 外层还留着从 `param_editor.js`

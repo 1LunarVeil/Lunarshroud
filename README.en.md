@@ -170,9 +170,12 @@ Pop-Location
 cargo test --manifest-path src-tauri\Cargo.toml --locked
 ```
 
-Baseline at the 2026-11-03 working tree: **903 Python tests (902 passed, 1
+Baseline at the 2026-11-05 working tree: **925 Python tests (924 passed, 1
 skipped)**, 117 frontend unit tests, all JavaScript syntax checks passing, and
-**84.92%** product-code coverage (gate ≥ 75%). The Rust suite is **23 passed,
+**84.75%** product-code coverage (gate ≥ 75%). A clean checkout has no
+prebuilt llama.cpp packages under `study/`, so the 6 multi-backend cases that
+need them skip (**918 passed, 7 skipped**); that is expected. The Rust suite is
+**23 passed,
 0 failed**, but `CARGO_TARGET_DIR` must point at a short path outside the
 repository: under the default `src-tauri/target/` the `ring` C compile fails on
 a path-location issue, unrelated to the MSVC install, the SDK or the source.

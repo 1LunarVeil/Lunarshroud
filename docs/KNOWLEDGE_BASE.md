@@ -53,18 +53,19 @@ Job Object 回收，不会绕过启动器直接拉起进程。
 | 混合 + 文档限额 | 47% | **76%** | **80%** | 0.612 | 385 |
 | 混合 + 文档限额 + 重排（**默认路径**） | **76%** | **95%** | **95%** | **0.841** | 1033 |
 
-复现（会自行拉起两个 llama-server，跑完关闭）：
+复现方法（评测脚本不在公开树内：它需要一份本机法规索引与 embedding/rerank
+模型，clone 下来无从运行。下表是用同一套 21 题标注集 + 10 道故意不可答题，
+对真实 377 片段法规索引逐配置消融得到的）：
 
 ```powershell
+# 环境变量与脚本内的题集/端口约定相同，供想在自己语料上复刻的人参考
 $env:LUNARSHROUD_LLAMA_SERVER = "C:\path\to\llama-server.exe"
 $env:LUNARSHROUD_TEST_EMBEDDING = "C:\path\to\embedding.gguf"
 $env:LUNARSHROUD_TEST_RERANK = "C:\path\to\reranker.gguf"
 $env:LUNARSHROUD_TEST_KB = "<knowledge base id>"
-python tools/eval_knowledge_retrieval.py
 ```
 
-题目与 gold 都在脚本里；gold 先对索引正文校验存在，不存在的题会直接中止而不是
-算成 miss。
+评测时 gold 先对索引正文校验存在，不存在的题会直接中止而不是算成 miss。
 
 三个结论值得单独记：
 
