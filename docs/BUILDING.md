@@ -47,3 +47,63 @@ Before publishing, byte-scan the built launcher and backend sidecar for builder 
 For reproducible review, build from a clean checkout, retain the source commit/tag and `Cargo.lock`, capture tool versions, and publish SHA-256 checksums. Python runtime and dev dependencies are hash-locked (`backend/requirements.lock` / `requirements-dev.lock`) and CI plus `setup.ps1` install with `--require-hashes`; when a pin changes, regenerate both the `.txt` and the corresponding lock (see the lock header for the exact commands).
 
 For a local portable runtime, run `tools/Publish-PortableRuntime.ps1` after both builds. It copies the exact release launcher and its matching PyInstaller backend, verifies SHA-256 for both files, and rewrites the Desktop shortcut. Do not point a shortcut at an old standalone EXE.
+
+## Running the browser gate locally
+
+The gate is what CI runs; run it the same way or it will report failures that
+do not exist (or miss ones that do).
+
+```bash
+# 1. backend on the port the gate expects, with an ISOLATED data directory
+LUNARSHROUD_ALLOW_INSECURE_DEV=1 LUNARSHROUD_LAUNCHER_PORT=17520 \
+  python tools/dev_backend.py
+
+# 2. browser runtime — playwright-core ships no browser binary, and
+#    `npx playwright install` fetches the *latest* Playwright, whose revision
+#    does not match the pinned one (measured: npx pulls 1248, the pinned
+#    playwright-core@1.57 wants 1200). Use the pinned CLI.
+node node_modules/playwright-core/cli.js install chromium
+
+# 3. the gate
+npm run test:browser          # core paths, axe accessibility, first paint
+npm run test:browser:diagnose # same boot probe, dumps console/DOM on failure
+```
+
+Two things that produce **false reds** if skipped:
+
+- `LUNARSHROUD_LAUNCHER_PORT` must equal the port the tests use.
+  `trusted_origins()` derives the WebSocket allow-list from the *configured*
+  port (AGENTS §2.7), so a mismatch returns HTTP 200 for REST but
+  `403 Forbidden` for every WebSocket handshake.
+- Use `tools/dev_backend.py`, not `python -m uvicorn`: it points `DATA_DIR` at
+  a temp directory, so the suite cannot rewrite your real chats/history.
+
+`LUNARSHROUD_BROWSER_CHANNEL=msedge` runs against the installed Edge instead of
+the bundled Chromium, which is useful for checking WebView-adjacent behaviour.
+
+### Branches your machine cannot reach
+
+Some defects only appear in states a normal developer box never enters — no GPU
+(therefore the empty hardware-chip branch), light colour scheme (headless
+Chromium reports `prefers-color-scheme: light` while most dev machines are
+dark), a clean database, or a machine without the registry entries that give
+`.mjs` a MIME type. CI is the only place those states occur naturally, which is
+why a suite can be green locally for weeks and red on every run.
+
+Construct the state explicitly instead of waiting for CI:
+
+```js
+await page.evaluate(() => {
+  document.body.className = 'theme-light';
+  document.querySelectorAll('.hardware-chip').forEach((c) => c.classList.add('is-empty'));
+});
+```
+
+When a gate fails, make it say *which* node and *what* numbers — a message like
+`color-contrast: 2 node(s)` costs a debugging round; `#6d6d76 on #eeeef1 =
+4.42:1 (needs 4.5)` identifies the cause immediately. `describeViolations()` in
+`frontend/tests/browser/helpers.mjs` does this for axe results.
+
+And after a fix, prove the gate can still fail: inject a real defect and watch
+it go red. "It turned green" alone cannot distinguish a fix from a loosened
+assertion.

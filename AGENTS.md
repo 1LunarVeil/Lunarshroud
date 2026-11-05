@@ -553,6 +553,52 @@ README 的中英两份、`docs/RELEASE.md`/`BUILDING.md`/`GETTING_STARTED.md`、
 （双向断言 + 配置层校验）、
 `test_packaging_contracts.py::test_build_rs_does_not_stage_a_bundle_resource_copy`。
 
+### 2.35 CI 是"开发机进不去的状态"的唯一环境，必须本地构造
+
+2026-11-05 追一条 CI 红点花了六轮。事后看，每一次"本地全绿"都不是因为代码
+正确，而是因为**开发机的状态恰好避开了那个缺陷**：
+
+| 缺陷 | 开发机为什么看不到 |
+|---|---|
+| 3 个 GPU 用例依赖宿主机 `nvidia-smi` | 本机装了 N 卡驱动 |
+| `.mjs` 被当 `text/plain`（MIME 来自 Windows 注册表） | 本机注册表有 `.mjs` 映射 |
+| a11y 测到 `page-fade-in` 中途的混合色 | 本机快，页面早已稳定 |
+| `.hardware-chip.is-empty` 用 `opacity: 0.55` | 本机有 N 卡，不走空态分支 |
+| 浅色主题对比度 | 本机主题是 dark；headless 默认报 light |
+
+**规则：凡是"只在 CI 红"的现象，第一个问题不是"哪行代码错了"，而是
+"CI 有哪些状态我的机器永远进不去"。** 列出这些状态（无 GPU / 浅色 /
+干净数据库 / 无注册表项 / 慢机器），然后在本地**强行构造**它们：
+
+```js
+// 强制一个开发机不可达的 UI 分支
+await page.evaluate(() => {
+  document.body.className = 'theme-light';
+  document.querySelectorAll('.hardware-chip').forEach((c) => c.classList.add('is-empty'));
+});
+```
+
+配套的两条硬要求：
+
+1. **门禁失败时必须自带证据**。只打印 `color-contrast: 2 node(s)` 等于没有信息；
+   `gotoApp()` 失败要 dump HTTP 状态、DOM 快照、全部 console 错误与失败请求，
+   axe 断言要带**选择器 + HTML + 前景/背景色 + 实测比值**。本轮正是靠
+   `4.42 / #6d6d76 / #eeeef1` 一行点破根因的。
+2. **"变绿"不能单独作为"修好"的证据**。修完后必须**注入一个真缺陷**，
+   证明门禁仍会红（本轮注入 `--color-text-tertiary: #C8C8D0` → 报 17 个并失败）。
+   只验变绿分不清"修好了"和"把断言放宽了"。
+
+**判据**：违规**数量**在多次运行间变化（实测 0/2/4/5），说明测到了中间态（竞态）；
+固定缺陷的数量是稳定的。
+
+*为什么*：这类缺陷全部是真实产品问题（无显卡用户的白屏、读不清的芯片、
+深色机器上看不到的浅色主题缺陷），不是"CI 太挑剔"。在本地构造状态比等 CI
+快一个数量级，而且能拿到可复现的证据。
+
+*钉它的测试*：`test_design_tokens.py::test_is_empty_states_never_dim_with_opacity`、
+`::test_empty_chip_colors_meet_wcag_aa_in_both_themes`；
+`frontend/tests/browser/diagnose.test.mjs`（门禁前的自检探针，CI 里先跑它）。
+
 ## 3. 发布镜像与门禁
 
 `github/` 是**精选的公开镜像**，不是工作树快照。任何被镜像文件的改动，
