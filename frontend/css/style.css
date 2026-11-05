@@ -753,7 +753,15 @@ body:not(.sidebar-collapsed) .sidebar-reveal { display: none; }
 }
 .hardware-chip-key { color: var(--color-text-tertiary); }
 .hardware-chip-value { font-weight: var(--font-weight-medium); font-family: var(--font-mono); }
-.hardware-chip.is-empty { opacity: 0.55; }
+/* 空态的"没有数据" cues 由文本本身（"No GPU data"）与更淡的 tertiary 色承担。
+   此前用 `opacity: 0.55` 调暗整块芯片：tertiary(#63636C) 与 text(#1C1C1F) 混到
+   浅背景上后实测只剩 2.34:1 / 2.81:1（要求 4.5:1），axe 在 CI 上报了这两个
+   节点 —— 无 N 卡的用户每次启动都看着一块几乎读不清的芯片。透明度会破坏
+   对比度，"调暗"必须改用更淡的**令牌**而不是透明度。 */
+.hardware-chip.is-empty .hardware-chip-key,
+.hardware-chip.is-empty .hardware-chip-value {
+  color: var(--color-text-tertiary);
+}
 
 /* ---------- 2.6 窗口状态条 ----------
    LM Studio 把内存/显存读数钉在窗口左下角：长对话里随时判断"还能不能再开一个"。
