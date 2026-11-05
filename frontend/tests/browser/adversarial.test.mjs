@@ -39,7 +39,7 @@ before(async () => {
   }
   await writeFile(path.join(FIXTURES, 'adv-big.md'), '# 大文件\n\n' + paragraphs.join('\n\n'), 'utf8');
   ({ browser, page, consoleErrors } = await launchPage());
-  await page.goto(BASE_URL, { waitUntil: 'networkidle' });
+  await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('.sidebar-item');
   untouched = (await api('/api/knowledge')).body.bases.map((b) => ({
     id: b.id,

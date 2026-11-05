@@ -38,7 +38,7 @@ async function launch() {
 }
 
 async function openChat(page) {
-  await page.goto(BASE, { waitUntil: 'networkidle' });
+  await page.goto(BASE, { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('.sidebar-item');
   await page.evaluate(() => {
     document.querySelector('.sidebar-item[data-page="chat"]')?.click();

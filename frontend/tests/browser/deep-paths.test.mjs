@@ -65,7 +65,7 @@ before(async () => {
     };
     record();
   });
-  await page.goto(BASE_URL, { waitUntil: 'networkidle' });
+  await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('.sidebar-item');
   untouched = (await api('/api/knowledge')).body.bases.map((b) => ({
     id: b.id,

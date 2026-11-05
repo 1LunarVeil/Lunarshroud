@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { mkdir } from 'node:fs/promises';
-import { BASE_URL, launchPage, runAxe, SCREENSHOT_DIR } from './helpers.mjs';
+import { BASE_URL, gotoApp, launchPage, runAxe, SCREENSHOT_DIR } from './helpers.mjs';
 
 async function gotoPage(page, label) {
   await page.click(`.sidebar-item[data-page="${label}"]`);
@@ -15,10 +15,9 @@ async function gotoPage(page, label) {
 
 test('core navigation, knowledge modal and chat controls stay error-free', async () => {
   await mkdir(SCREENSHOT_DIR, { recursive: true });
-  const { browser, page, consoleErrors } = await launchPage();
+  const { browser, page, consoleErrors, failedRequests } = await launchPage();
   try {
-    await page.goto(BASE_URL, { waitUntil: 'networkidle' });
-    await page.waitForSelector('.sidebar-item');
+    await gotoApp(page, consoleErrors, failedRequests);
     const sidebar = await page.locator('.sidebar-item').allTextContents();
     // 8 个导航入口：会话组（仪表盘 / Chat）、服务组（本地 API 服务）、
     // 资源组（模型工作区 / 知识库 / 可观测性）、工具组（加载模型 / 新手指南）。
@@ -59,9 +58,11 @@ test('core navigation, knowledge modal and chat controls stay error-free', async
 
 test('dashboard and knowledge pages meet the accessibility gate', async () => {
   const { browser, page } = await launchPage();
+  const consoleErrors = [];
+  const failedRequests = [];
   try {
     for (const route of ['dashboard', 'knowledge']) {
-      await page.goto(BASE_URL, { waitUntil: 'networkidle' });
+      await gotoApp(page, consoleErrors, failedRequests);
       await gotoPage(page, route);
       const results = await runAxe(page);
       const violations = results.violations.map(
@@ -77,7 +78,9 @@ test('dashboard and knowledge pages meet the accessibility gate', async () => {
 test('first render stays under the performance budget', async () => {
   const { browser, page } = await launchPage();
   try {
-    await page.goto(BASE_URL, { waitUntil: 'networkidle' });
+    // 性能预算只关心首屏绘制，不该被轮询请求的 quiescence 拖住；用
+    // domcontentloaded 拿到导航时间线即可（networkidle 在慢 runner 上会拖到超时）。
+    await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
     const metrics = await page.evaluate(() => {
       const paint = performance.getEntriesByType('paint').find((entry) => entry.name === 'first-contentful-paint');
       const navigation = performance.getEntriesByType('navigation')[0];

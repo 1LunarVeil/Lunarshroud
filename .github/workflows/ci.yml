@@ -88,6 +88,21 @@ jobs:
             # both a build error and needless payload.
             npm ci
             if ($LASTEXITCODE -ne 0) { throw 'npm ci failed.' }
+            # playwright-core 不带浏览器二进制。这里用**项目锁定的** CLI 装它
+            # 自己期望的那个 Chromium revision：`npx playwright install` 会去
+            # 解析最新的 Playwright，装下来的版本与 playwright-core@1.57 要找的
+            # 不一致（实测 npx 装 1248，而锁定的 core 要 1200），门禁仍然起不来。
+            # 也不默认 `channel: msedge`：那要求 runner 预装 Edge，是一条外部
+            # 假定——runner 镜像换版或 Edge 被策略限制时，故障会表现为"页面没
+            # 渲染"，极难定位。测试可用 LUNARSHROUD_BROWSER_CHANNEL=msedge 覆盖。
+            node node_modules/playwright-core/cli.js install chromium
+            if ($LASTEXITCODE -ne 0) { throw 'playwright install failed.' }
+            # 先跑自检探针：它只断言"应用启动并渲染出侧栏"，失败时会把 HTTP 状态、
+            # 页面 DOM 快照、全部 console 输出与失败请求一起打出来。没有这一步时，
+            # 门禁超时只会留下一句 "Timeout 30000ms exceeded"，既看不到 console
+            # 报错也看不到响应体，定位要花掉整轮（2026-11-05 实际发生）。
+            node --test frontend/tests/browser/diagnose.test.mjs
+            if ($LASTEXITCODE -ne 0) { throw 'App did not boot in the browser; see the diagnostic dump above.' }
             npm run test:browser
             if ($LASTEXITCODE -ne 0) { throw 'Browser acceptance tests failed.' }
           } finally {

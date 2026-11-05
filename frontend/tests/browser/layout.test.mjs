@@ -35,7 +35,7 @@ const MEASURE = () => {
 };
 
 async function openChat(page) {
-  await page.goto(BASE, { waitUntil: 'networkidle' });
+  await page.goto(BASE, { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('.sidebar-item');
   // 窄窗口下侧栏是抽屉，导航项在视口外；直接派发 click 不要求可见。
   await page.evaluate(() => {
