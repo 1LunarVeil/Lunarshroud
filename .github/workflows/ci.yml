@@ -69,6 +69,13 @@ jobs:
         shell: pwsh
         run: |
           $env:LUNARSHROUD_ALLOW_INSECURE_DEV = '1'
+          # 端口必须与 `--port` 一致：`trusted_origins()` 按**配置里的**
+          # launcher_port 派生 WebSocket 信任表（AGENTS §2.7），两者不一致时
+          # HTTP 正常但每个 WebSocket 都被 403 拒掉 —— 界面看着是好的，只有
+          # 实时推送死掉，而且报错只出现在浏览器 console 里。干净检出没有
+          # data/config.json 时默认端口就是 17520，这里显式设一次，让"两边
+          # 一致"不再依赖那个默认值。
+          $env:LUNARSHROUD_LAUNCHER_PORT = '17520'
           $backend = Start-Process -FilePath python -ArgumentList '-m', 'uvicorn', 'main:app', '--host', '127.0.0.1', '--port', '17520', '--log-level', 'warning' -WorkingDirectory backend -PassThru
           try {
             $ready = $false

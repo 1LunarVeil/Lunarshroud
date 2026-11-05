@@ -2610,6 +2610,11 @@ body.page-has-panel .page .page-header {
   padding: var(--space-2) var(--space-3);
   background: var(--color-code-bg-alt);
   border-bottom: var(--hairline) solid var(--color-code-border);
+  /* 终端面固定深色，但文字色默认来自主题（浅色主题 = 深字）。
+     视觉上一行日志不经过这里，可 axe 会算隐藏 label 的对比度：
+     "搜索关键词..." / "日志级别" 曾报 contrast 1.13（#1C1C1F on #26262B）。
+     给整个工具条钉上终端前景色，隐藏标签也就跟着正确了。 */
+  color: var(--color-code-fg);
 }
 .logs-toolbar input,
 .logs-toolbar select {
