@@ -8,64 +8,7 @@ entry and sorted after it. Nothing was ever collapsed into a released version,
 so the file read as an endless stream of iterations rather than as a history of
 releases. `1.0.0` is the first version to own the whole body of work.
 
-## [Unreleased]
-
-### Removed
-
-- **The NSIS installer channel is gone, not merely optional.** Until now
-  `docs/RELEASE.md` described the installer as "optional per release" while
-  `release.yml` demanded *exactly one* installer and threw otherwise — so
-  following the documentation and tagging a release failed the build. Rather
-  than keep a second channel nobody could verify, it is removed outright:
-  `src-tauri/nsis/` is deleted, `bundle.active` is `false` with no `targets`,
-  the release workflow builds with `tauri build --no-bundle`, and it now fails
-  if any `.exe` shows up in the artifact set. The portable zip is the only
-  distribution channel. `build.rs` also stopped staging a second copy of the
-  backend runtime into `src-tauri/backend/`; that copy existed only to feed
-  bundle resources.
-
-### Fixed
-
-- Chat forwarding, the knowledge-base services, and the health probe all broke
-  on an IPv6 loopback listener. `host="::1"` is accepted as loopback, but every
-  URL builder concatenated it bare (`http://::1:8080`), which `urlsplit` reads
-  as `hostname=None` with the port string `":1:8080"`. The probe guard then
-  refused the URL and startup timed out repeatedly with no usable diagnostic.
-  IPv6 literals are now bracketed, and the probe maps the host through a
-  constant table so user input never reaches the request target; it also
-  rejects ports outside 1-65535 and no longer follows redirects.
-- `release.yml` published with `--no-bundle` but had no guard against a stray
-  installer reappearing; it does now.
-- The backend test suite failed on every CI runner and passed locally, because
-  three GPU tests stubbed `subprocess.run` but not the `nvidia-smi` resolver.
-  On a host without an NVIDIA driver the resolver returns `None` and the
-  monitor disables GPU metrics by design, so the "a subprocess must have run"
-  assertions could only pass on a machine with nvidia-smi installed. The tool
-  path is now injected.
-- `requirements-dev.lock` still pinned pypdf 6.18.1 with its old digest even
-  though 6.21.4 was declared, so the hash-locked install that CI and `setup.ps1`
-  use kept pulling the vulnerable release. The pin now matches.
-
-### Documentation
-
-- Published documents no longer point at things this repository does not ship.
-  `CHANGELOG.md` referenced two internal status/risk documents, the knowledge
-  base guide told readers to run an unpublished evaluation script,
-  `FRONTEND_CONTRACT.md` pointed contributors at local-only preview tools, and
-  `backend/api/*.py` docstrings referenced an internal planning document. Each
-  now states its conclusion inline or points at a file that exists.
-- Documented counts were stale: the sanitization report claimed 244 mirrored
-  files against an actual 246, and the README baseline still read 903 tests /
-  84.92% coverage.
-- `.gitignore` never ignored `release/`. The `*.zip` rule covered the archive
-  but not the deployed launcher/backend tree or `release/dist/SHA256SUMS.txt`,
-  so one local packaging run left ~40 MB of build output in the working tree
-  for the mirror gate to treat as publishable source.
-- A new `test_public_docs_consistency.py` reads every published document and
-  source comment for `docs/*.md` and `tools/*` references and fails when one
-  does not exist, so this class of drift cannot come back silently.
-
-## [1.0.0] - 2026-11-03
+## [1.0.0] - 2026-11-06
 
 First stable release. The product moved from "launcher for `llama-server`" to a
 complete local AI chat application: bring your own llama.cpp build, bring your
@@ -400,6 +343,16 @@ green tests do not mean the product works.
 - The emoji/initial avatar text box.
 - The old chat settings modal; its fields live in the inspector's Configuration
   view.
+- **The NSIS installer channel.** Until now `docs/RELEASE.md` described the
+  installer as "optional per release" while `release.yml` demanded *exactly
+  one* installer and threw otherwise — following the documentation and tagging
+  a release failed the build. Rather than keep a second channel nobody could
+  verify, it is removed outright: `src-tauri/nsis/` is deleted, `bundle.active`
+  is `false` with no `targets`, the release workflow builds with
+  `tauri build --no-bundle`, and it fails if any `.exe` shows up in the
+  artifact set. The portable zip is the only distribution channel. `build.rs`
+  also stopped staging a second copy of the backend runtime into
+  `src-tauri/backend/`; that copy existed only to feed bundle resources.
 
 ### Fixed
 
@@ -594,6 +547,62 @@ green tests do not mean the product works.
   `SOURCE_DATE_EPOCH` alone made the launcher reproducible was wrong.
 - **`cargo tauri build` could no longer build the shell** once Node test
   dependencies lived under `frontend/`.
+
+**States a developer machine never enters** — these surfaced only after the
+gates ran on CI, which is the sole environment with no GPU, a light colour
+scheme, a clean database and no registry entries of its own:
+
+- **IPv6 loopback instances never became ready.** `host="::1"` is accepted as
+  loopback, but every URL builder concatenated it bare (`http://::1:8080`),
+  which `urlsplit` reads as `hostname=None` with the port string `":1:8080"`;
+  the probe guard refused the URL and startup timed out repeatedly with no
+  usable diagnostic. IPv6 literals are now bracketed, and the health probe maps
+  the host through a constant table so user input never reaches the request
+  target; it also rejects ports outside 1-65535 and no longer follows
+  redirects.
+- **The source-run UI was blank on clean Windows machines.** `FileResponse` and
+  `StaticFiles` derive Content-Type from `mimetypes.guess_type()`, which on
+  Windows supplements its table from `HKEY_CLASSES_ROOT`; a machine without a
+  `.mjs` mapping served the module scripts as `text/plain`, the browser refused
+  all eight of `app.js`'s imports, and `boot()` never ran — every HTTP status a
+  200, no error in any log. Static responses now come from an explicit table in
+  `api/static_ui.py` (`/assets` included), never falling back to `text/plain`.
+  The packaged build was never affected (Tauri serves `frontendDist` through
+  the `mime` crate).
+- **The backend suite failed on every CI runner** while passing locally: three
+  GPU tests stubbed `subprocess.run` but not the `nvidia-smi` resolver, and on
+  a host without an NVIDIA driver the resolver returns `None` so the monitor
+  disables GPU metrics by design — "a subprocess must have run" could only pass
+  where nvidia-smi is installed. The tool path is now injected.
+- **`requirements-dev.lock` still pinned pypdf 6.18.1** with its old digest
+  even though 6.21.4 was declared, so the hash-locked install that CI and
+  `setup.ps1` use kept pulling the vulnerable release. The pin now matches.
+- **The accessibility gate raced the page entrance animation** and measured
+  mid-fade blend colours (`#6d6d76` at 4.42:1 for a token that is 5.13:1 when
+  settled); it now waits for finite animations to finish. The fixed-dark log
+  toolbar also never set a foreground colour, so its visually-hidden labels
+  measured 1.13:1. And the empty hardware chips were dimmed with
+  `opacity: 0.55`, which blended "VRAM" to 2.34:1 and "No GPU data" to 2.81:1 —
+  unreadable for users without an NVIDIA GPU; the empty state now uses a muted
+  token that passes WCAG AA in both themes, with regression tests pinning the
+  ratios.
+- **The browser gate depended on the runner's Edge and on `networkidle`.**
+  Headless runners are slow enough that "no requests for 500 ms" never happens
+  on a page polling every 5 s, so tests timed out waiting for a sidebar that
+  was already there. The gate now waits for `domcontentloaded` plus the app's
+  own render, launches the bundled Chromium (`npx playwright install` fetches a
+  revision the pinned playwright-core does not look for — measured 1248 vs
+  1200 — so CI invokes the pinned CLI directly), and a diagnostic probe dumps
+  HTTP status, DOM snapshot, console errors and failed requests before the
+  assertions run.
+- **Documentation and packaging drift.** Six published references pointed at
+  files this repository does not ship; documented counts (mirror file count,
+  test baseline) were stale; `.gitignore` never ignored `release/`, so one
+  local packaging run left ~40 MB of build output in the tree; and
+  `release.yml` had no guard against a stray installer returning. A new
+  `test_public_docs_consistency.py` reads every published document and source
+  comment for `docs/*.md` and `tools/*` references and fails when one does not
+  exist, so this class of drift cannot come back silently.
 
 ### Verification
 
