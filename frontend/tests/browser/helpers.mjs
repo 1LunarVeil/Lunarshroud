@@ -115,3 +115,25 @@ export async function runAxe(page) {
     resultTypes: ['violations'],
   }));
 }
+
+/**
+ * 把 axe 违例整理成可直接行动的文本。
+ *
+ * 门禁原本只打印 `color-contrast: 2 node(s)`。一句话之外什么都没有：不知道
+ * 是哪个元素、哪个 token、实测比值多少，于是只能靠猜（2026-11-05 为此多花了
+ * 两轮）。这里把 axe 自己给出的**前景色、背景色、实测比值**原样带出来。
+ */
+export function describeViolations(violations) {
+  const lines = [];
+  for (const violation of violations) {
+    lines.push(`${violation.id}: ${violation.nodes.length} node(s)`);
+    for (const node of violation.nodes) {
+      lines.push(`  target: ${node.target.join(' ')}`);
+      if (node.html) lines.push(`  html:   ${String(node.html).slice(0, 200)}`);
+      if (node.failureSummary) {
+        lines.push(`  why:    ${String(node.failureSummary).replace(/\n/g, ' | ')}`);
+      }
+    }
+  }
+  return lines.join('\n');
+}

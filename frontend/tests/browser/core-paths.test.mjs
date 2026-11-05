@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { mkdir } from 'node:fs/promises';
-import { BASE_URL, gotoApp, launchPage, runAxe, SCREENSHOT_DIR } from './helpers.mjs';
+import { BASE_URL, describeViolations, gotoApp, launchPage, runAxe, SCREENSHOT_DIR } from './helpers.mjs';
 
 async function gotoPage(page, label) {
   await page.click(`.sidebar-item[data-page="${label}"]`);
@@ -64,11 +64,43 @@ test('dashboard and knowledge pages meet the accessibility gate', async () => {
     for (const route of ['dashboard', 'knowledge']) {
       await gotoApp(page, consoleErrors, failedRequests);
       await gotoPage(page, route);
+      // 等页面入场动画结束再测，否则 axe 测到的是**淡入中途**的混合色。
+      //
+      // 实测证据（2026-11-05）：切到 knowledge 后立刻测，axe 报
+      //   .page-subtitle — #6d6d76 on #eeeef1 = 4.42:1（要求 4.5）
+      // 而同一元素的 token 是 --color-text-tertiary = #63636C，单独算是 5.13:1。
+      // #6d6d76 正是 #63636C 以 page-fade-in 动画的中间透明度压在画布上的结果。
+      // 等 2s 后违例归零。
+      //
+      // 这解释了为什么"数量会变"：慢机器读到更早的帧。CI 报 2 个、本地报 0 或 5 个
+      // 都是同一个原因，不是两个不同缺陷。
+      //
+      // 用 Web Animations API 等真正的动画收敛，而不是魔法延时。
+      //
+      // 只等**有限次**动画结束：`.badge-running::before` 的 `pulse` 是
+      // `infinite`，只要有实例在跑就永远不会停，对 `every(...)` 会让这里
+      // 每次都吃满 15s 超时（并让整轮变慢）。无限动画本就不影响入场淡入的
+      // 中间态，跳过它们。
+      await page
+        .waitForFunction(
+          () =>
+            document
+              .getAnimations()
+              .filter((a) => a.effect?.getTiming?.().iterations !== Infinity)
+              .every((a) => a.playState !== 'running'),
+          undefined,
+          { timeout: 15000 },
+        )
+        .catch(() => {});
       const results = await runAxe(page);
       const violations = results.violations.map(
         (item) => `${item.id}: ${item.nodes.length} node(s)`
       );
-      assert.deepEqual(violations, [], `${route} accessibility violations: ${violations.join(', ')}`);
+      assert.deepEqual(
+        violations,
+        [],
+        `${route} accessibility violations:\n${describeViolations(results.violations)}`
+      );
     }
   } finally {
     await browser.close();
