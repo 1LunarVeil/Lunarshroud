@@ -333,3 +333,13 @@ if (-not $SkipDesktopShortcut) {
 }
 
 Write-Host "Portable runtime deployed: $launcherDestination"
+
+# CI 的发布工作流在调用本脚本后检查 `$LASTEXITCODE`。本脚本在 -SkipSigning
+# 路径下**不运行任何原生命令**，而 $LASTEXITCODE 只由原生命令/exit 设置：
+# 在 GitHub Actions 的全新 pwsh 会话里它一直是 $null，`$null -ne 0` 为 True，
+# 于是脚本明明成功、工作流却在同一秒抛 "deployment failed"（2026-11-05
+# v1.0.0 首次 tag 实测，步骤总耗时 1.7 秒、成功消息之后紧跟 throw）。
+# 本地测试从未暴露它：测试经 `powershell.exe -File` 调用并看**进程**退出码，
+# 正常结束就是 0。显式 exit 0 让退出码成为本脚本自己声明的契约，而不是
+# "会话里最后一个原生命令"的遗留值。
+exit 0

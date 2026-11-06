@@ -179,6 +179,45 @@ def _run_deployer(deployer, launcher_source, backend_source, destination):
     )
 
 
+def test_deployer_sets_lastexitcode_for_session_based_callers(tmp_path):
+    """部署器成功结束必须把 `$LASTEXITCODE` 设为 0，而不是留成 $null。
+
+    GitHub Actions 的发布工作流在**同一个 pwsh 会话**里先调本脚本、再检查
+    `$LASTEXITCODE`。而 `$LASTEXITCODE` 只由原生命令或 `exit` 设置：本脚本在
+    -SkipSigning 路径下不运行任何原生命令，于是在全新会话里它一直是 `$null`，
+    `$null -ne 0` 为 True —— 脚本明明成功、工作流却立刻 throw（2026-11-05
+    v1.0.0 首次 tag 实测：步骤 1.7 秒跑完、成功消息之后紧跟
+    "portable runtime deployment failed"）。
+
+    这里的调用方式刻意复刻工作流：不用 `-File`（那是独立进程，退出码正常），
+    而是 `-Command` 里 `& 调用` 后在**同一会话**检查。PowerShell 5.1 没有
+    `??` 运算符，$LASTEXITCODE 为 $null 时显式退出 42，避免与真实失败混淆。
+    """
+    deployer, launcher_source, backend_source = _make_new_release(tmp_path)
+    destination = tmp_path / "installed"
+    command = (
+        f"& '{deployer}' -LauncherSource '{launcher_source}' "
+        f"-BackendSource '{backend_source}' -Destination '{destination}' "
+        f"-SkipDesktopShortcut -SkipSigning -AllowRunning; "
+        f"if ($null -eq $LASTEXITCODE) {{ exit 42 }} else {{ exit $LASTEXITCODE }}"
+    )
+    result = subprocess.run(
+        [
+            "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-Command", command,
+        ],
+        capture_output=True,
+        text=True, errors="replace",
+        encoding="utf-8",
+        timeout=120,
+    )
+    assert result.returncode != 42, (
+        "deployer 成功结束但没有设置 $LASTEXITCODE —— CI 的会话内检查会把它"
+        f"误判为失败:\n{result.stdout}\n{result.stderr}"
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def _make_new_release(tmp_path):
     root = Path(__file__).resolve().parents[2]
     runtime = tmp_path / "dist" / "backend"
