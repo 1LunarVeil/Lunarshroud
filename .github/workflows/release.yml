@@ -198,11 +198,21 @@ jobs:
       # 用 runner 自带的 gh CLI 取回上游 job 的 artifact，刻意不引入
       # actions/download-artifact：本仓库的约定是所有 action 固定到完整 40 位
       # commit SHA 且优先官方 actions/*，为一步搬运新增一个待核实的固定值不划算。
+      #
+      # `-R` 是必须的：这个 job 跑在 ubuntu 上且**没有 checkout 仓库**
+      # （它只需要产物，不需要源码）。而 `gh` 默认从当前目录的 git 仓库推断
+      # owner/repo，没有 checkout 时报
+      # `failed to run git: fatal: not a git repository`。
+      # 2026-11-05 v1.0.0 首次发布的实测结果就是构建全部成功、发布 job 在第一步
+      # 就挂掉。显式传 $GITHUB_REPOSITORY 让这一步不依赖工作目录。
       - name: Download build artifacts
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh run download "$GITHUB_RUN_ID" -n "lunarshroud-windows-$GITHUB_REF_NAME" -D dist/
+          gh run download "$GITHUB_RUN_ID" \
+            -R "$GITHUB_REPOSITORY" \
+            -n "lunarshroud-windows-$GITHUB_REF_NAME" \
+            -D dist/
           ls -l dist/
       - name: Refuse to publish an incomplete release
         shell: bash
@@ -248,8 +258,15 @@ jobs:
             echo ""
             echo "本版本只提供便携包：解压后用 LunarShroud.exe 启动，无需安装。"
           } > notes.md
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          # 同样必须带 `-R`：本 job 没有 checkout，从工作目录推断不出仓库。
+          # `gh release view` 的失败会被 `>/dev/null 2>&1` 吞掉，于是缺 `-R` 时
+          # 它**永远**判定"release 不存在"、每次都走 create —— 在本步失败过的
+          # tag 上重跑就会报 release 已存在而失败。显式传仓库名，让这个分支
+          # 判断是真的在问 GitHub。
+          if gh release view "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* -R "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              -R "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" --notes-file notes.md
           fi

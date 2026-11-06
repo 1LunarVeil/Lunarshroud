@@ -231,6 +231,45 @@ def test_release_workflow_publishes_the_portable_zip_and_no_installer():
     assert not (root / "src-tauri" / "nsis").exists(), "nsis/ 目录（安装脚本）被加回来了"
 
 
+def test_every_gh_command_in_the_publish_job_names_the_repository():
+    """发布 job 里的每条 `gh ...` 都必须带 `-R`。
+
+    该 job 跑在 ubuntu 上且**没有 checkout 仓库**（只需要产物）。`gh` 默认从
+    当前工作目录的 git 仓库推断 owner/repo，没有 checkout 时报
+    `failed to run git: fatal: not a git repository` —— 2026-11-05 v1.0.0
+    首次发布就是这样：构建全部成功，发布 job 在下载产物的第一步挂掉。
+
+    更隐蔽的是 `gh release view`：它的失败被 `>/dev/null 2>&1` 吞掉，缺 `-R`
+    时永远判定"release 不存在"并走 create 分支，于是在本步失败过的 tag 上重跑
+    会报 "release already exists"。
+
+    这条断言按**行**扫描，因为漏掉任何一条都会以不同方式失败。
+    """
+    root = Path(__file__).resolve().parents[2]
+    text = (root / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    publish_job = text.split("  publish-release:")[1]
+    offenders = []
+    # 续行：把以 `gh ` 开头的命令与它后面缩进的行拼起来再判断。
+    lines = publish_job.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith("gh "):
+            continue
+        block = [stripped]
+        for follow in lines[index + 1 :]:
+            if follow.startswith("            ") or not follow.strip():
+                block.append(follow.strip())
+            else:
+                break
+        joined = " ".join(part for part in block if part)
+        if "-R " not in joined and "--repo" not in joined:
+            offenders.append(joined[:90])
+    assert not offenders, (
+        "发布 job 里的 gh 命令缺少 -R $GITHUB_REPOSITORY（该 job 没有 checkout）:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
 def test_the_project_gitignore_still_mirrors():
     """反向保护：排除 AI 工具忽略文件时，别把项目自己的 .gitignore 也排掉。"""
     assert not gate.is_excluded(".gitignore")[0]
