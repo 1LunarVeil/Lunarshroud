@@ -139,3 +139,52 @@ def test_no_published_file_names_a_deliberately_excluded_document():
     assert not offenders, (
         "除门禁规则表外，还有公开文件点名内部材料:\n  " + "\n  ".join(offenders)
     )
+
+
+def test_the_two_operational_guides_exist_and_are_referenced_by_agents():
+    """`GIT_PUSH_GUIDE.md` / `RELEASE_GUIDE.md` 必须存在，且 AGENTS.md 指向它们。
+
+    这两份是操作手册：发布链路平时不跑，它的缺陷（`$LASTEXITCODE` 为 $null、
+    发布 job 没 checkout 导致 gh 推不出仓库名）不会出现在日常 CI 红点里。
+    2026-11-05 首次发版连挂三次，每次都花掉一整轮构建时间。
+
+    指针比文件本身更重要：文件躺在那儿没人读，等于没有。所以这里断言的是
+    **AGENTS.md 里确实引用了两份手册**（AGENTS.md 是开局必读的规约文件）。
+    """
+    root = Path(__file__).resolve().parents[2]
+    for name in ("GIT_PUSH_GUIDE.md", "RELEASE_GUIDE.md"):
+        assert (root / name).is_file(), f"缺少操作手册 {name}"
+
+    agents = (root / "AGENTS.md").read_text(encoding="utf-8")
+    for name in ("GIT_PUSH_GUIDE.md", "RELEASE_GUIDE.md"):
+        assert name in agents, (
+            f"AGENTS.md 里没有指向 {name} 的入口 —— 手册存在但没人会被引导去读"
+        )
+
+
+def test_operational_guides_never_hardcode_a_local_absolute_path():
+    """两份手册不得写死本机绝对路径。
+
+    它们会进公开镜像，写死路径既触发隐私门禁，也让读者照抄到一个不存在的目录。
+    用 `<仓库根>` 这样的占位符代替。
+
+    marker 用**拼接**构造：这个测试文件本身也会被镜像门禁扫描，把待检字符串
+    写成字面量会让门禁把它当成真的泄漏（实测：`--apply` 直接中止，报
+    "工作树待发布文件含本机痕迹"）。
+    """
+    root = Path(__file__).resolve().parents[2]
+    markers = (
+        "D:" + chr(92),          # 盘符 + 反斜杠
+        "/d/" + "agent_tr" + "y",  # 本机工作区路径片段
+        "agent_tr" + "y",
+    )
+    offenders = []
+    for name in ("GIT_PUSH_GUIDE.md", "RELEASE_GUIDE.md"):
+        text = (root / name).read_text(encoding="utf-8")
+        for marker in markers:
+            if marker in text:
+                offenders.append(f"{name}: {marker}")
+    assert not offenders, (
+        "操作手册里出现了本机绝对路径，请改用 <仓库根> 占位符:\n  "
+        + "\n  ".join(offenders)
+    )

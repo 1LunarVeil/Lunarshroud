@@ -239,24 +239,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          # 校验信息直接写进 Release 正文：未签名的包里，这是用户唯一能自主
-          # 验证"我下的这个确实是官方构建"的手段，不能只留在 artifact 里。
+          # Release 正文只写"这是什么、怎么用"。校验和作为独立资产发布即可，
+          # 不在正文里教用户怎么核对 —— 那是使用者的判断，构建方不必逐条叮嘱。
           {
             echo ""
-            echo "## 完整性校验"
+            echo "便携版：解压后用 \`LunarShroud.exe\` 启动，无需安装。"
             echo ""
-            echo "下载后请先核对哈希（PowerShell）："
-            echo ""
-            echo '```powershell'
-            for f in dist/*.zip; do
-              b=$(basename "$f")
-              echo "(Get-FileHash -Algorithm SHA256 '$b').Hash.ToLower()   # 应为: $(awk -v n="$b" '$2==n{print $1}' dist/SHA256SUMS.txt)"
-            done
-            echo '```'
-            echo ""
-            echo "⚠️ 本构建未做代码签名，Windows SmartScreen 可能提示未知发布者。"
-            echo ""
-            echo "本版本只提供便携包：解压后用 LunarShroud.exe 启动，无需安装。"
+            echo "SHA-256 校验和随附件提供（\`SHA256SUMS.txt\`）。"
           } > notes.md
           # 同样必须带 `-R`：本 job 没有 checkout，从工作目录推断不出仓库。
           # `gh release view` 的失败会被 `>/dev/null 2>&1` 吞掉，于是缺 `-R` 时
