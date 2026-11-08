@@ -192,7 +192,7 @@ docs/           架构、构建、发布与安全说明
 
 ### 前端审美规范
 
-界面的设计令牌、间距刻度、层级与配色规则参考了 **polishkit** 插件（v0.1.1版本，原仓库名为frontend-aesthetics）：
+界面的设计令牌、间距刻度、层级与配色规则参考了 **polishkit** 插件（v0.1.2，原仓库名为 frontend-aesthetics）：
 
 <https://github.com/1LunarVeil/polishkit.git>
 

@@ -57,7 +57,8 @@ Two sources are recorded in the project READMEs under "致谢与来源" /
 
 - AI-assisted development by **DeepSeek-V4.1-Flash**
   (`deepseek-v4.1-flash-10-17`).
-- Frontend design rules from the **frontend-aesthetics** plugin,
-  <https://github.com/1LunarVeil/frontend-aesthetics.git> — a method and token
+- Frontend design rules from the **polishkit** plugin (v0.1.2, formerly
+  `frontend-aesthetics`),
+  <https://github.com/1LunarVeil/polishkit.git> — a method and token
   specification, not a runtime dependency, and not part of the shipped
   artifacts.

@@ -314,9 +314,9 @@ telemetry, no network access.
 ### Frontend aesthetics
 
 The design tokens, spacing scale, hierarchy and contrast rules follow the
-**frontend-aesthetics** plugin:
+**polishkit** plugin (v0.1.2, formerly `frontend-aesthetics`):
 
-<https://github.com/1LunarVeil/frontend-aesthetics.git>
+<https://github.com/1LunarVeil/polishkit.git>
 
 That plugin supplies **rules and method** (tokens first, contrast thresholds, a
 visual-hierarchy checklist), not a runtime dependency, and it is not part of the
