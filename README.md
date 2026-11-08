@@ -192,9 +192,9 @@ docs/           架构、构建、发布与安全说明
 
 ### 前端审美规范
 
-界面的设计令牌、间距刻度、层级与配色规则参考了 **frontend-aesthetics** 插件：
+界面的设计令牌、间距刻度、层级与配色规则参考了 **polishkit** 插件（v0.1.1版本，原仓库名为frontend-aesthetics）：
 
-<https://github.com/1LunarVeil/frontend-aesthetics.git>
+<https://github.com/1LunarVeil/polishkit.git>
 
 该插件提供的是**规范与方法**（令牌层先行、对比度门槛、视觉层级检查清单），不是运行时依赖，也不进入发布产物。具体实现见 `frontend/css/tokens.css` 与 [docs/DESIGN_1.0.md](docs/DESIGN_1.0.md)。
 
