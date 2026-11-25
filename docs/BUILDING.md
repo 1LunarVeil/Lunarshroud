@@ -95,14 +95,14 @@ Construct the state explicitly instead of waiting for CI:
 ```js
 await page.evaluate(() => {
   document.body.className = 'theme-light';
-  document.querySelectorAll('.hardware-chip').forEach((c) => c.classList.add('is-empty'));
+  document.querySelectorAll('[data-testid="status-gpu"]').forEach((c) => c.classList.add('is-empty'));
 });
 ```
 
 When a gate fails, make it say *which* node and *what* numbers — a message like
 `color-contrast: 2 node(s)` costs a debugging round; `#6d6d76 on #eeeef1 =
 4.42:1 (needs 4.5)` identifies the cause immediately. `describeViolations()` in
-`frontend/tests/browser/helpers.mjs` does this for axe results.
+`ui/tests/browser/a11y.spec.ts` does this for axe results.
 
 And after a fix, prove the gate can still fail: inject a real defect and watch
 it go red. "It turned green" alone cannot distinguish a fix from a loosened

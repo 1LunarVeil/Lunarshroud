@@ -7,7 +7,7 @@ goal. The automated guard is `backend/tests/test_offline_contract.py`.
 ## What never needs the network
 
 - Frontend assets: HTML, CSS, ES modules, icons and fonts are all shipped under
-  `frontend/`. There are no CDN scripts, remote fonts or remote `@import`s.
+  `ui/` (built into `ui/dist`). There are no CDN scripts, remote fonts or remote `@import`s.
 - Backend startup, config, presets, history, model scanning, GGUF probing,
   runtime registration and capability probing are pure local operations.
 - The UI talks to the backend over loopback (`127.0.0.1`); the backend talks to
@@ -26,7 +26,7 @@ goal. The automated guard is `backend/tests/test_offline_contract.py`.
 
 ## The one external interaction
 
-`frontend/js/help.js` contains links to llama.cpp releases and related public
+`ui/src/features/help/HelpPage.tsx` contains links to llama.cpp releases and related public
 documentation. They are ordinary user-clicked `<a target="_blank">` links that
 open in the system browser. The app does not fetch them, and the UI remains
 fully usable when they are unavailable.
@@ -67,3 +67,25 @@ The CSP and these calls are pinned by the offline contract test.
 It must be **opt-in, off by default, and never required for launch**. Any new
 remote asset or import should fail the offline contract test first; update the
 test and this document together only when the product decision is explicit.
+
+## The one opted-in exception: web search
+
+`web_search` is the single feature that reaches the network, and it is built to
+the policy above rather than around it:
+
+- **Off by default, twice.** The global setting (`web_search_enabled`) must be on
+  *and* an endpoint must be configured *and* the conversation must tick "allow web
+  search". Any one of the three missing means the tool is not declared at all.
+- **The endpoint is yours.** There is no built-in search provider in the code, so
+  "where do my queries go" always has a visible answer you typed. Non-loopback
+  endpoints are refused unless `LUNARSHROUD_ALLOW_REMOTE_ENGINES=1` is set.
+- **Every call is approved individually**, and the approval card shows the exact
+  query. A query is user text leaving the machine; it is not a background request.
+- **Bounded and direct.** Requests use `trust_env=False` (no inherited proxy) and
+  `follow_redirects=False` (a redirect to another host would silently change the
+  destination), with caps on response bytes and result count.
+- **Nothing else changed.** Startup, configuration, scanning, history, knowledge
+  indexing against local models, and the whole UI still work with no network.
+
+`backend/tests/test_web_search.py` pins all of the above, including "a fresh
+install cannot reach the network".

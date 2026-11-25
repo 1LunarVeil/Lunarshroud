@@ -90,6 +90,24 @@ async def api_api_server_logs_clear():
     return {"cleared": True}
 
 
+@router.delete("/api/api-server/key")
+async def api_api_server_key_delete():
+    """清除网关的 Bearer 密钥（回到"仅本机访问、不校验"）。
+
+    为什么需要一条独立路由：`PUT /api/system/config` 把**空串**当作"保持不变"
+    （设置页会把脱敏后的整份配置回写，空串不能被理解成删除）。没有这条路由，
+    密钥一旦设置就再也无法从界面清除 —— 而文档里又写着"用这条路由"，
+    这正是 AGENTS §2.34 的"文档指向不存在的东西"（2026-11-23 引擎审计 F5）。
+
+    清除是一个**安全控制的移除**，所以它有自己的端点：任何"保存设置"的路径
+    都不会顺带触发它。
+    """
+    from config import update_config
+
+    update_config({"api_server_key": ""})
+    return {"cleared": True, "key_configured": False}
+
+
 @router.post("/api/api-server/restart")
 async def api_api_server_restart():
     """按当前配置重新对齐网关（保存设置后立即生效，免重启启动器）。

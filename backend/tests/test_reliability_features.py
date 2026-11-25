@@ -810,6 +810,46 @@ def test_config_supports_new_keys(monkeypatch, tmp_path):
         backend_config.update_config({"persist_instance_logs": "yes"})
 
 
+def test_every_parameter_has_a_short_summary_and_a_long_help():
+    """Two prose fields, with different jobs.
+
+    The pre-2.0.1 UI printed the whole `help` paragraph under every control: 92
+    parameters became a wall of text, which is exactly the "descriptions dumped
+    inline, bloated interface" complaint. The fix needs a short line to show and a
+    long one to hide, so `summary` is now part of the contract.
+
+    The fallback (`_derive_summary`) must never leave a gap: a parameter that only
+    declares `help` still gets a usable one-liner, so this test cannot be satisfied
+    by adding 92 hand-written strings and forgetting the next parameter.
+    """
+    from core.param_schema import _derive_summary, get_schema_for_frontend
+
+    schema = get_schema_for_frontend()
+    assert len(schema["params"]) >= 40
+
+    empty = [p["key"] for p in schema["params"] if not p["summary"]]
+    assert not empty, f"parameters with no short summary: {empty}"
+    empty_en = [p["key"] for p in schema["params"] if not p["summary_en"]]
+    assert not empty_en, f"parameters with no English summary: {empty_en}"
+
+    too_long = [(p["key"], len(p["summary"])) for p in schema["params"] if len(p["summary"]) > 60]
+    assert not too_long, f"summaries too long to read as a one-liner: {too_long}"
+
+    # The short line must actually be shorter than the detailed one wherever the
+    # detailed one is long enough to matter — otherwise "summary" is just `help`.
+    redundant = [
+        p["key"]
+        for p in schema["params"]
+        if len(p["help"]) > 80 and p["summary"] == p["help"]
+    ]
+    assert not redundant, f"summary duplicates help: {redundant}"
+
+    # The fallback itself: first sentence, bounded, and empty input stays empty.
+    assert _derive_summary("") == ""
+    assert _derive_summary("短说明。后面还有很长的一段解释文字。") == "短说明。"
+    assert len(_derive_summary("没有句号的超长文本" * 20)) <= 60
+
+
 def test_schema_and_presets_expose_english_fields():
     """schema 应输出英文字段供前端按语言挑选（预设已不再内置）。"""
     from core.param_schema import PARAM_DEFINITIONS, get_schema_for_frontend

@@ -71,6 +71,16 @@ _SAMPLES = {
     "name": "sample-backup",
     "prompt_id": "sample-prompt",
     "runtime_id": "sample-runtime",
+    # Agent workbench: run ids are opaque `run_<hex>` strings generated per run.
+    "run_id": "run_sample",
+    # External engines: ids are opaque `eng_<hex>` strings generated on registration.
+    "engine_id": "eng_sample",
+    # Projects: ids are opaque `proj_<hex>` strings generated on creation.
+    "project_id": "proj_sample",
+    # Skills: ids are opaque `skill_<hex>` strings generated on creation.
+    "skill_id": "skill_sample",
+    # Scheduled tasks: ids are opaque `task_<hex>` strings generated on creation.
+    "task_id": "task_sample",
 }
 
 

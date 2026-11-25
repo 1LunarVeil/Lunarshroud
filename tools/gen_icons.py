@@ -41,7 +41,8 @@ PNG_SIZES = {
     "src-tauri/icons/icon.png": 512,
     "src-tauri/icons/128x128.png": 128,
     "src-tauri/icons/32x32.png": 32,
-    "frontend/assets/logo.png": 512,
+    # 2.0 的界面资源根是 ui/public（Vite 会把 public/ 原样复制进 dist）。
+    "ui/public/logo.png": 512,
 }
 ICO_SIZES = (16, 32, 48, 64, 128, 256)
 ICO_PATH = "src-tauri/icons/icon.ico"

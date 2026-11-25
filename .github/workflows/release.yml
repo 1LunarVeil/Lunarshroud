@@ -48,23 +48,22 @@ jobs:
       - uses: actions/setup-node@0a44ba7841725637a19e28fa30b79a866c81b0a6 # v4.0.4
         with:
           node-version: '22'
-      - name: Frontend unit tests
+      - name: UI dependencies, typecheck, tests and build
+        working-directory: ui
         shell: pwsh
         run: |
-          $tests = @(Get-ChildItem frontend/tests -File -Filter '*.test.mjs')
-          if ($tests.Count -eq 0) { throw 'No frontend test files found; refusing a false-green check.' }
-          node --test $tests.FullName
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Write-Host "Ran $($tests.Count) frontend test file(s)."
-      - name: Frontend syntax check
-        shell: pwsh
-        run: |
-          $scripts = @(Get-ChildItem frontend/js -File | Where-Object Extension -in '.js', '.mjs')
-          if ($scripts.Count -eq 0) { throw 'No JavaScript files found; refusing a false-green check.' }
-          foreach ($script in $scripts) {
-            node --check $script.FullName
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
+          # 发布路径必须自己把门禁跑一遍：打 tag 时不一定有对应的 push CI。
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'npm ci failed in ui/.' }
+          npm run typecheck
+          if ($LASTEXITCODE -ne 0) { throw 'TypeScript typecheck failed.' }
+          npm test
+          if ($LASTEXITCODE -ne 0) { throw 'UI unit tests failed.' }
+          # 构建产物就是 Tauri 要嵌进去的东西；缺了它 `cargo tauri build`
+          # 会产出一个没有界面的 exe，而 build.rs 的 release 检查会先拦下来。
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'UI production build failed.' }
+          if (-not (Test-Path dist/index.html)) { throw 'ui/dist/index.html is missing after build.' }
       - name: Build Python backend
         working-directory: backend
         run: python -m PyInstaller backend.spec --clean -y

@@ -82,8 +82,9 @@ MUST_STILL_MIRROR = [
     "backend/main.py",
     "backend/core/param_builder.py",
     "backend/tests/test_release_mirror_gate.py",
-    "frontend/js/app.js",
-    "frontend/index.html",
+    "ui/src/main.tsx",
+    "ui/index.html",
+    "ui/package.json",
     "tools/check_release_mirror.py",
     "README.md",
     "CHANGELOG.md",
@@ -283,6 +284,72 @@ def test_publishable_sources_are_not_over_excluded(rel):
     """反向保护：整目录排除 data/ 之后，别把该发布的源码也一起排掉。"""
     assert not gate.is_excluded(rel)[0], f"{rel} 应该进镜像"
     assert not gate.is_forbidden(rel), f"{rel} 不该被判违规"
+
+
+def test_readme_settings_sections_match_the_code():
+    """README 说的设置分类数必须等于代码里的 tab 数（AGENTS §2.34）。
+
+    这条补的是一次真实漂移：2.1 把设置页拆成十个分类，而 README 中英两份还写着
+    1.0 时代的"硬件 / 开发者"（那个"硬件"分类在 2.0 里根本不存在，设置页当时只有
+    五个）。文档说 A、代码做 B 时所有测试仍然全绿 —— 读者照文档找不到，而这正是
+    公开仓库最该保证的东西。
+
+    断言只钉"计数一致"，不钉措辞：数字写在文案里，改文案时这条会提醒你同步。
+    """
+    import re
+
+    repo = Path(__file__).resolve().parents[2]
+    source = (repo / "ui" / "src" / "features" / "settings" / "SettingsSheet.tsx").read_text(
+        encoding="utf-8"
+    )
+    tabs_block = source.split("const TABS", 1)[1].split("];", 1)[0]
+    tab_count = len(re.findall(r"id: '", tabs_block))
+    assert tab_count > 0, "cannot count the settings tabs"
+
+    zh = (repo / "README.md").read_text(encoding="utf-8")
+    # 中文文案用的是中文数字（"设置页十个分类"），所以两种拼法都要认 —— 门禁
+    # 的职责是"数字对得上"，不是规定作者用哪种写法。表要盖住实际会出现的数字：
+    # 只到"十"时，加到第 11 个分类会红在"找不到数字"而不是"数字不一致"，那是
+    # 门禁的洞，不是文案的错。
+    zh_words = {
+        5: "五",
+        6: "六",
+        7: "七",
+        8: "八",
+        9: "九",
+        10: "十",
+        11: "十一",
+        12: "十二",
+        13: "十三",
+        14: "十四",
+        15: "十五",
+    }
+    zh_expected = zh_words.get(tab_count, str(tab_count))
+    assert (
+        f"设置页{zh_expected}个分类" in zh
+        or f"设置页 {zh_expected} 个分类" in zh
+        or f"设置页{tab_count}个分类" in zh
+        or f"设置页 {tab_count} 个分类" in zh
+    ), f"README.md 没有写明真实的分类数（{tab_count}）；tab 变化时同步改文案"
+
+    words = {
+        5: "Five",
+        6: "Six",
+        7: "Seven",
+        8: "Eight",
+        9: "Nine",
+        10: "Ten",
+        11: "Eleven",
+        12: "Twelve",
+        13: "Thirteen",
+        14: "Fourteen",
+        15: "Fifteen",
+    }
+    expected = words.get(tab_count, str(tab_count))
+    en = (repo / "README.en.md").read_text(encoding="utf-8")
+    assert f"**{expected} settings sections" in en, (
+        f"README.en.md 没有写明真实的分类数（{expected}）；tab 变化时同步改文案"
+    )
 
 
 def test_privacy_scan_reads_suffixes_outside_the_old_allowlist(tmp_path):

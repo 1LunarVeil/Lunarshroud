@@ -122,3 +122,4 @@ docs/archive/
 # rather than protect the tree.
 .*-session/
 *-session-*/
+.mimosa/

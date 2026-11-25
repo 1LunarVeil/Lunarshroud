@@ -34,7 +34,7 @@ STANDALONE = [
     "src-tauri/icons/icon.png",
     "src-tauri/icons/128x128.png",
     "src-tauri/icons/32x32.png",
-    "frontend/assets/logo.png",
+    "ui/public/logo.png",
 ]
 
 ICO_SIZES = {16, 32, 48, 64, 128, 256}

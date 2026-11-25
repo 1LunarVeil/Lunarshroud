@@ -254,6 +254,21 @@ def main() -> int:
     (STAGE / "使用说明.txt").write_text(
         README.format(version=VERSION), encoding="utf-8", newline="\r\n"
     )
+    # 便携标记：让后端把数据放在**解压目录**，而不是 `%APPDATA%`。
+    #
+    # 为什么需要一个显式标记：zip 里永远不含 `data/`（那是构建产物，§2.34 的
+    # 隐私规则要求排除），所以"解压后旁边有没有 data/"这个判据在全新解压时
+    # 恒为假。没有标记时后端仍按历史行为落到 `%APPDATA%\LunarShroud` ——
+    # 对便携包来说那意味着"用户把解压目录搬到 D 盘，数据还留在 C 盘"，而
+    # 知识库可能很大。标记文件让"便携版 = 数据跟着走"成为一个确定的承诺。
+    #
+    # 后端读 `<backend>/portable.txt` 或 `<launcher>/portable.txt`，外壳也读
+    # 同一对位置（`data_dir_candidates`），两侧对"便携"的判断因此不会分叉。
+    (STAGE / "portable.txt").write_text(
+        "This portable package keeps its data in the data/ folder next to this file.\r\n",
+        encoding="utf-8",
+        newline="\r\n",
+    )
     # 便携包的 `backend/` 目录**只允许**装运行时必需的两项：
     #   backend.exe + _internal/
     #

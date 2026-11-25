@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 import time
 from typing import Any
 
@@ -32,6 +33,23 @@ LOG_CAPACITY = 200
 
 HOST = "127.0.0.1"
 
+# Request-body ceiling for the local API **data plane**.
+#
+# The management API has a size middleware (AGENTS §2.4's neighbour); the gateway
+# had none, so a 10 MB body was fully parsed and a 10-million-character `model`
+# string was stored verbatim in `REQUEST_LOG` and served back by
+# `GET /api/api-server/logs` (audit F6). With the documented empty-key mode any
+# local process can reach this port, which makes an unbounded body a memory and
+# log-amplification lever rather than a theoretical concern.
+#
+# 16 MiB matches the launcher's own chat allowance and is far above any legitimate
+# OpenAI request (a full multimodal turn with several images is a few MiB).
+GATEWAY_MAX_BODY_BYTES = 16 * 1024 * 1024
+
+# Logged strings are bounded independently of the body: the log is a 200-entry ring
+# shipped to the UI on every poll.
+LOG_FIELD_CHARS = 200
+
 
 def create_gateway_app() -> FastAPI:
     app = FastAPI(
@@ -40,6 +58,34 @@ def create_gateway_app() -> FastAPI:
         redoc_url=None,
         openapi_url=None,
     )
+
+    @app.middleware("http")
+    async def body_size_middleware(request: Request, call_next):
+        """Refuse an oversized body before it is read.
+
+        `Content-Length` is advisory, so a chunked request without it is also
+        checked: the declared length is the fast path, and the read below enforces
+        the real cap.
+        """
+        declared = request.headers.get("content-length")
+        if declared is not None:
+            try:
+                if int(declared) > GATEWAY_MAX_BODY_BYTES:
+                    return JSONResponse(
+                        status_code=413,
+                        content={"error": "request body is too large"},
+                    )
+            except ValueError:
+                return JSONResponse(
+                    status_code=400, content={"error": "invalid Content-Length"}
+                )
+        body = await request.body()
+        if len(body) > GATEWAY_MAX_BODY_BYTES:
+            return JSONResponse(
+                status_code=413, content={"error": "request body is too large"}
+            )
+        return await call_next(request)
+
     app.include_router(_router())
     return app
 
@@ -92,16 +138,19 @@ def record_request(
 
     if not get_config().get("api_server_log_requests", True):
         return
+    # Bound the attacker-controlled strings. `model` is echoed from the request body,
+    # and this log is serialised into every `GET /api/api-server/logs` poll — a
+    # 10-million-character value made each poll tens of megabytes (audit F6).
     REQUEST_LOG.append(
         {
             "at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started)),
             "method": method,
-            "path": path,
+            "path": path[:LOG_FIELD_CHARS],
             "status": status,
-            "model": model,
+            "model": str(model)[:LOG_FIELD_CHARS],
             "stream": bool(stream),
             "ms": int((time.time() - started) * 1000),
-            "error": error,
+            "error": str(error)[:LOG_FIELD_CHARS],
         }
     )
 
@@ -474,6 +523,25 @@ class GatewayManager:
 
         await self.stop()
         self.error = ""
+        # **Bind the socket ourselves.** `uvicorn.Server.serve()` calls
+        # `sys.exit(3)` from `startup()` when `create_server` fails, and `SystemExit`
+        # is a `BaseException` — neither the `except Exception` in the lifespan nor a
+        # route-level handler catches it, so a local process holding the configured
+        # port took the **whole backend down** (reproduced twice in the 2026-11-23
+        # audit: on startup, and via `POST /api/api-server/restart`).
+        #
+        # Pre-binding turns "port in use" into an `OSError` we can report, which is
+        # what the UI already knows how to display.
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((HOST, port))
+            sock.listen(128)
+            sock.set_inheritable(True)
+        except OSError as error:
+            self.error = f"could not bind {HOST}:{port} ({error.strerror or error})"
+            return
+
         config = uvicorn.Config(
             create_gateway_app(),
             host=HOST,
@@ -484,11 +552,11 @@ class GatewayManager:
             lifespan="off",
         )
         server = uvicorn.Server(config)
-        # 绑定失败（端口被占）时 uvicorn 的 serve() 会正常返回而不是抛异常，
-        # 所以要自己观测 server.started 才能如实报告"没起来"。
         self._server = server
         self._port = port
-        self._task = asyncio.create_task(server.serve(), name="lunarshroud-api-server")
+        self._task = asyncio.create_task(
+            server.serve(sockets=[sock]), name="lunarshroud-api-server"
+        )
         for _ in range(50):
             if server.started:
                 return
@@ -496,7 +564,7 @@ class GatewayManager:
                 break
             await asyncio.sleep(0.04)
         if not server.started:
-            self.error = f"could not bind 127.0.0.1:{port} (port in use?)"
+            self.error = f"could not bind {HOST}:{port} (port in use?)"
             await self.stop()
 
     async def stop(self) -> None:

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from pathlib import Path
 from typing import Any
 
 from config import get_config, update_config
@@ -93,11 +94,25 @@ async def api_update_config(body: dict):
 
     同步失败不回滚配置保存：路径本身是有效设置，而注册表同步只是尽力而为，
     失败时保留"配置路径可用、注册表未跟随"的降级状态（启动仍按配置路径走）。
+
+    **空串 ``api_server_key`` 表示"保持不变"，不是"清空"。** GET 端点从不回传
+    密钥（见上），而设置页把整份响应播种进草稿再整体 PUT 回来 —— 于是"改个
+    端口后保存"会把用户已配置的网关密钥静默覆盖成空串，网关在下一次请求起
+    不再要求 Bearer（2026-11-23 前端审计复现）。要真正清除密钥用
+    ``DELETE /api/api-server/key``，那是独立路由，语义明确，不会在任何"保存
+    设置"的路径上被顺带触发。
+
+    **响应同样做脱敏。** 这个端点返回的是 `update_config()` 的完整配置，曾经
+    把库里的密钥原样回显 —— GET 脱敏了、PUT 又漏出来，等于白做（引擎审计 F4）。
     """
     import main
 
-    updated = update_config(body)
-    if "llama_server_path" in body:
+    updates = dict(body)
+    if not str(updates.get("api_server_key") or ""):
+        updates.pop("api_server_key", None)
+
+    updated = update_config(updates)
+    if "llama_server_path" in updates:
         try:
             mirrored = await asyncio.to_thread(
                 runtime_registry.sync_config_path_to_default_preference,
@@ -107,7 +122,12 @@ async def api_update_config(body: dict):
                 updated = {**updated, "runtime_default_synced": mirrored}
         except Exception:  # noqa: BLE001 - 同步是增强，不得让配置保存失败
             main.LOGGER.exception("could not mirror llama_server_path into runtime default")
-    return updated
+    # Same redaction as the GET. The contract "the key never leaves the backend" has to
+    # hold on every response, not just the one that was audited in 2026-11-03.
+    response = dict(updated)
+    if str(response.get("api_server_key") or ""):
+        response["api_server_key"] = ""
+    return response
 
 
 @router.get("/api/system/overview")
@@ -215,7 +235,71 @@ async def api_system_storage():
             report["writable"] = False
             report["reasons"].append(reason)
 
+    # Size + free space. The user's question was "a knowledge base on C: will eat
+    # the system drive" — answering it needs three numbers, and making the UI ask
+    # for them separately means three more probes that can each hang on a slow
+    # network drive.
+    report["usage"] = await asyncio.to_thread(_disk_usage_report, data_dir)
     return report
+
+
+def _disk_usage_report(directory: Path) -> dict[str, Any]:
+    """数据目录占用与所在卷的剩余空间。
+
+    目录大小是**有预算**的递归求和：遇到权限/竞态错误跳过而不是抛（这个端点
+    是给界面看的诊断，不能因为一个被锁住的日志文件 500）。条目数与总耗时有
+    上限，避免在一个十几万文件的目录上把请求拖到超时。
+
+    ``Path`` 是模块级导入的（函数签名用到了它），所以这里不再重复 import ——
+    之前把它写在路由函数体内，导致这个辅助函数在运行时 `NameError`。
+    """
+    import shutil
+    import time
+
+    budget_entries = 50_000
+    budget_seconds = 2.0
+    started = time.monotonic()
+    total = 0
+    files = 0
+    truncated = False
+    for root, _dirnames, filenames in os.walk(directory, onerror=lambda _error: None):
+        for name in filenames:
+            files += 1
+            if files > budget_entries or time.monotonic() - started > budget_seconds:
+                truncated = True
+                break
+            try:
+                total += (Path(root) / name).stat().st_size
+            except OSError:
+                continue
+        if truncated:
+            break
+
+    free = None
+    capacity = None
+    try:
+        usage = shutil.disk_usage(str(directory))
+        free = usage.free
+        capacity = usage.total
+    except OSError:
+        pass
+
+    databases: dict[str, int] = {}
+    for label in ("chats", "history", "knowledge"):
+        candidate = directory / f"{label}.db"
+        try:
+            databases[label] = candidate.stat().st_size if candidate.is_file() else 0
+        except OSError:
+            databases[label] = 0
+
+    return {
+        "data_dir_bytes": total,
+        "data_dir_files": files,
+        "truncated": truncated,
+        "volume_free_bytes": free,
+        "volume_total_bytes": capacity,
+        "database_bytes": databases,
+    }
 
 
 def _probe_directory_writable(directory) -> str:
@@ -230,6 +314,71 @@ def _probe_directory_writable(directory) -> str:
         return ""
     except OSError as error:
         return f"data directory is not writable ({directory}): {error}"
+
+
+@router.post("/api/system/data-dir/migrate")
+async def api_migrate_data_dir(body: dict):
+    """Copy the data directory to ``target`` and point the launcher at it.
+
+    The move is a **copy plus a pointer file**; the source stays untouched so the
+    user can roll back by deleting the pointer. It is refused while an instance is
+    running: the databases are open, and a snapshot taken mid-generation is not a
+    state the user would recognise as "my data".
+
+    Response: the copied file manifest plus `restart_required: true`. The new
+    location is read on the next start (`config._frozen_data_dir`), never mid-run:
+    the SQLite path constants are bound at import time.
+    """
+    import config as config_module
+    import main
+    from core import data_migration
+
+    target = str(body.get("target") or "").strip() if isinstance(body, dict) else ""
+    if not target:
+        raise HTTPException(400, "target is required")
+
+    manager = main.get_process_manager()
+    live = [
+        instance.id
+        for instance in manager.list_instances()
+        if instance.status in {
+            main.InstanceStatus.STARTING,
+            main.InstanceStatus.RUNNING,
+            main.InstanceStatus.STOPPING,
+        }
+    ]
+    if live:
+        raise HTTPException(
+            409,
+            "stop every running instance first; a live database cannot be snapshotted "
+            f"consistently (running: {len(live)})",
+        )
+
+    pointer = Path(config_module.PROJECT_ROOT) / config_module.DATA_LOCATION_FILE
+    try:
+        return await asyncio.to_thread(
+            data_migration.migrate, Path(main.DATA_DIR), Path(target), pointer
+        )
+    except data_migration.MigrationError as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@router.delete("/api/system/data-dir/location")
+async def api_clear_data_dir_location():
+    """Roll back a migration by removing the pointer file.
+
+    Kept separate from the migrate route for the same reason `DELETE
+    /api/api-server/key` is separate from the config PUT: a destructive action
+    must have its own name, so no "save settings" path can trigger it by accident.
+    """
+    import config as config_module
+    from core import data_migration
+
+    removed = await asyncio.to_thread(
+        data_migration.remove_pointer,
+        Path(config_module.PROJECT_ROOT) / config_module.DATA_LOCATION_FILE,
+    )
+    return {"removed": removed, "restart_required": removed}
 
 
 @router.get("/api/system/paths")

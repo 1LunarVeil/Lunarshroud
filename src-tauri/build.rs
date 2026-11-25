@@ -93,6 +93,26 @@ fn main() {
         );
     }
 
+    // ── 前端构建产物 ──
+    //
+    // `tauri.conf.json` 的 `frontendDist` 指向 `ui/dist`，而那是 `npm run build`
+    // 的产物。缺了它 Tauri 会在自己那一步报一个笼统的错误；更糟的情况是它静默
+    // 嵌入一个空目录，产出一个"能启动但没有界面"的 exe。
+    //
+    // 所以 release 构建在这里直接失败，并给出**要跑哪条命令**。与 backend
+    // sidecar 的检查同等严格：两者都是"缺了就发布不出去"的输入。
+    //
+    // 开发构建（debug）不校验：`cargo run` 时前端可能正由 Vite dev server
+    // 提供，强制要求 dist 会让纯后端调试变得别扭。
+    let frontend_index = project_root.join("ui").join("dist").join("index.html");
+    println!("cargo:rerun-if-changed={}", frontend_index.display());
+    if profile == "release" && !frontend_index.is_file() {
+        panic!(
+            "release build requires {} (run `npm ci && npm run build` in ui/ first)",
+            frontend_index.display()
+        );
+    }
+
     // Tauri validates configured bundle resources during its build hook, so the
     // generated backend must be staged before that validation runs.
     tauri_build::build();

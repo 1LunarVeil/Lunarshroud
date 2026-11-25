@@ -606,9 +606,292 @@ await page.evaluate(() => {
 深色机器上看不到的浅色主题缺陷），不是"CI 太挑剔"。在本地构造状态比等 CI
 快一个数量级，而且能拿到可复现的证据。
 
-*钉它的测试*：`test_design_tokens.py::test_is_empty_states_never_dim_with_opacity`、
+*钉它的测试*：`test_ui_tokens.py::test_is_empty_states_never_dim_with_opacity`、
 `::test_empty_chip_colors_meet_wcag_aa_in_both_themes`；
-`frontend/tests/browser/diagnose.test.mjs`（门禁前的自检探针，CI 里先跑它）。
+`ui/tests/visual/acceptance.mjs`（门禁前的自检矩阵，含四种强制状态）。
+
+### 2.36 前端颜色只能来自令牌，且主题相关的角色不能用 Tailwind 任意值
+
+**规则。** 所有颜色字面量只能出现在 `ui/src/styles/tokens.css`；组件里必须用
+`var(--token)`。会随主题变化的角色（`--primary-fill` / `--on-primary` /
+`--danger-fill` / `--on-danger`）必须走 `app.css` 里的普通类
+（`.fill-primary` / `.fill-danger` / `.fill-success`），**不能**写成
+`bg-[var(--primary-fill)]`。
+
+另两条同源禁令：
+
+- `text-[var(--text-sm)]` 在 Tailwind 4 里编译成 **`color: var(--text-sm)`** ——
+  一个无效颜色，元素回退到继承色。必须写 `text-[length:var(--text-sm)]`。
+- 禁用态**不得**用 `opacity` 调暗整个控件：标签会跟着变淡。
+
+*为什么*：`@theme inline` 在**构建时**把令牌值代进去，所以
+`bg-[var(--primary-fill)]` 一旦写死就再也跟不上 `.theme-dark` 的覆盖；实测结果是
+深色主题里出现白底白字（1.01:1）。`text-[var(--text-sm)]` 那条更隐蔽：**183 处**
+调用点全部静默丢失字号，单元测试全绿，只有 axe 抓到。`disabled:opacity-45` 把禁用
+主按钮的标签压到 3.1:1——禁用控件仍然需要被读懂（"我为什么点不动"）。
+
+*钉它的测试*：`test_ui_tokens.py`（195 条：无颜色字面量、无调色板工具类、任意值必须
+声明类型、主题角色只能走类、双主题 AA、代码面板对 `--code-bg` 的对比度）；
+`ui/tests/browser/a11y.spec.ts`（axe 双主题）。
+
+### 2.37 Agent 工具的四条硬边界
+
+**规则。** ①任何工具路径必须先 `Path.resolve()` 再与授权根比较，绝对路径 / UNC /
+盘符相对路径 / `..` 逃逸一律拒绝；②`run_command` **永不**带 shell（`shell=False`
++ argv 列表），且子进程环境必须经 `sanitized_child_env()`；③写操作与命令**逐次批准**，
+待批准时循环必须**挂起**——既不执行也不丢弃，超时按拒绝处理；④**`argv[0]` 的裸名
+不得交给 `CreateProcess` 直接解析**，必须先用 `which_on_path` 解析成绝对路径，解析
+不出来就拒绝。
+
+*为什么*：这套能力的边界只能由代码保证，不能靠模型的判断。字符串前缀比较会被一条
+`link -> C:\Users` 绕过；带 shell 的 argv 会让 `&&` 和反引号变成程序；而"跳过未决
+审批"等于让模型执行用户没看过的东西——这正是审批门存在的理由。
+
+*第四条是 2026-11-23 安全审计实测出来的，不是推测*：Windows 的 `CreateProcess`
+按**调用进程自己的当前目录**优先搜索裸名——**不是**子进程的 `cwd=`。实测在启动器
+cwd 放一个 `agentprobe.exe`，然后 `run_command(["agentprobe", ...])` 就直接执行了
+它。用户批准一条看起来无害的命令，实际跑的是别人种下的二进制。这条与 §2.1 是同一
+类缺陷，只是出现在新路径上。
+
+*一个测试陷阱*：Windows 上 `subprocess.run(shell=True)` 对**列表** argv 会正确加
+引号，所以"命令能跑通且退出码不变"这类断言在有无 shell 时结果相同，**测不出
+shell**；同理"裸名能跑通"也测不出 §2.37④（父母的 cwd 里恰好没有同名文件时全绿）。
+这类不变量只能钉在行为上：shell 用 spy 断言 `shell is False`，裸名劫持**在启动器
+cwd 里真的种一个 exe**再断言请求被拒。
+
+*钉它的测试*：`test_agent_tools.py`（42 条：批准门、拒绝回灌、逃逸拒绝、无 shell、
+环境清洗、裸名劫持拒绝、重复调用上限、取消不报 done、每条声明都真的可执行）；
+注入缺陷验证：关掉批准分支 → 4 条红；`shell=True` → 调用点断言红；退回裸名解析 →
+劫持测试红。
+
+### 2.38 外部引擎是"用户已经在跑的服务"，不是启动器的子进程
+
+**规则。** `engine_registry` 只记录 `{kind, label, base_url, model, api_key_env}`；
+**永不**安装、升级或 spawn 一个外部引擎。默认只接受回环地址
+（`LUNARSHROUD_ALLOW_REMOTE_ENGINES=1` 才放开）；`api_key_env` 必须是**环境变量名**，
+不是密钥本身。`openai_compat` 引擎**没有** `/tokenize`，因此它的 token 数必须标注为
+估算，不得输出精确外观的数字。
+
+*为什么*：vLLM 官方文档明确写 "does not support Windows natively"，SGLang 同理；
+"一键安装"需要多 GB 下载、WSL 发行版与匹配驱动，失败信息用户无法行动，并且直接
+破坏离线承诺。而一个精确外观的 token 数会让上下文裁剪看起来有依据，实际是字符数
+猜测——用户会毫无解释地丢掉长对话的尾部。
+
+*钉它的测试*：`test_engines.py`（35 条：回环策略、未知 kind 不默认、密钥名校验、
+注册表损坏容错、探测历史保留、CJK 估算、`usage_estimated` 标记，以及 2026-11-23
+审计新增的 URL/凭据/响应预算用例）；
+`backend/tests/manual_engine_e2e.py`（9/9，对着真实 HTTP 的假 OpenAI 服务）。
+
+### 2.39 "不可能成功"的外部输入必须在边界处变成可读的错误，不能变成 500 或进程退出
+
+**规则。** 四条，各自对应一个已实测的失败形态：
+
+1. **`base_url` 必须用 `httpx.URL` 解析**，不能用 `urlparse`。`urlparse` 是字符串
+   切分器：它接受 `http://127.0.0.1:abc`，而 `httpx.InvalidURL` **不是**
+   `HTTPError`，于是 probe 的 `except httpx.HTTPError` 接不住，端点回 500。
+   同时拒绝 userinfo（`http://user:pw@…` 会被持久化进 `engines.json` 并作为
+   Basic auth 发出）、query/fragment（我们追加 `/v1/models`，query 会改变实际
+   请求）、端口越界、路径空白。
+2. **`probe()` 捕获 `Exception`**，不是 `HTTPError`。它是个**诊断**工具：它的职责
+   就是说出哪里不对。非 ASCII 的 `api_key_env` 会在构造 header 时抛
+   `UnicodeEncodeError`，那也是 probe 该报告的事实。
+3. **`uvicorn.Server.serve()` 在绑定失败时调 `sys.exit(3)`。** `SystemExit` 是
+   `BaseException`，`except Exception` 接不住 —— 一个本地进程占住
+   `api_server_port` 就能让**整个后端退出**（启动期与 `POST /api/api-server/restart`
+   各实测一次）。网关必须**自己预绑定 socket**，把失败变成 `manager.error`。
+4. **注册表/引擎响应必须有字节预算**，不只是条数预算。`/v1/models` 的响应会被
+   写进 `engines.json` 并由每次 `GET /api/engines` 回传；200 个 1 MiB 的 id 就是
+   200 MB 的注册表。
+
+*为什么*：这四条的共同点是"输入本身就不可能成功"，而失败被表达成了
+"服务端出错了"或"进程消失了"。用户看到的 500 让他们以为启动器坏了；退出的后端
+则根本没有界面可以报错。
+
+*钉它的测试*：`test_engines.py` 的 `test_urls_httpx_rejects_are_refused_at_validation`、
+`test_credentials_in_the_url_are_refused`、`test_api_key_env_cannot_name_an_internal_variable`、
+`test_an_unhashable_kind_is_a_400_not_a_500`、`test_probe_reports_a_broken_url_instead_of_raising`、
+`test_probe_refuses_an_unreasonably_large_model_list`、`test_a_deeply_nested_registry_reads_as_empty`；
+`test_api_server_gateway.py` 的 `test_a_busy_port_is_reported_instead_of_killing_the_process`、
+`test_the_gateway_refuses_an_oversized_body`、`test_the_request_log_bounds_attacker_controlled_fields`。
+
+### 2.40 密钥字段在**每一条**响应上都要脱敏，且"清除"必须有独立路由
+
+**规则。** `api_server_key` 在 GET、PUT、以及任何返回整份配置的路径上都必须被
+替换成空串；空串在写入方向上表示**保持不变**，绝不表示删除。清除密钥只能走
+`DELETE /api/api-server/key`。
+
+*为什么*：2026-11-03 只修了 GET 的脱敏，2026-11-23 的引擎审计发现
+`PUT /api/system/config` 直接把 `update_config()` 的返回值回显，同一个密钥从另一
+条路径又进了 WebView。而同一次修复里，我写的注释推荐了一条**并不存在**的路由
+（§2.34 的原样重演）——这说明"只改一半"是这个仓库里最容易复发的一类缺陷。
+
+*钉它的测试*：`test_regressions.py::test_putting_the_settings_form_back_does_not_clear_the_gateway_key`
+（同时断言 PUT 不回显）、`test_the_system_config_endpoint_never_returns_the_gateway_key`。
+
+### 2.41 TS 类型是**断言**，不是校验 —— 每个手写类型都要有对账测试
+
+**规则。** `apiGet<T>` 不做运行时校验（`request()` 最后是 `return payload as T`），
+所以一个写错的 TS 接口会让整条链路一路活到渲染时。任何**手写的**后端响应类型
+（`types.ts` 里的 `interface`/`type`）都必须有一条 pytest 把它的字段与路由源码对账，
+方向是双向的：后端多一个字段、前端多一个字段，都要红。
+
+**已实测的三种形态**（全部在 2.0.0 上真实发生）：
+
+| 形态 | 例子 | 后果 |
+|---|---|---|
+| 信封当裸值 | `/api/chats` 返回 `{conversations:[…]}`，类型写成 `Conversation[]` | 侧栏永远"没有会话" |
+| 对象当数组 | `/api/system/storage` 的 `databases` 是 `Record<label, …>`，类型写成 `Array<{name,…}>` | 点开设置→开发者 **整个窗口崩成白屏** |
+| 字段名臆造 | `SystemPaths` 写 `python`/`log_dir`/`launcher_port`，路由发的是 `python_version`/`logs_dir`/`listening_port` | 页面不报错，只是那些行永远空白 |
+
+第三种最危险：前两种会抛，第三种安静地显示空值，没有任何信号。
+
+*为什么不能靠 typecheck 兜住*：`npm run build` 里确实有 `tsc --noEmit`，但它校验
+的是"代码与**类型**一致"。类型本身就是谎的时候，编译器无法反对——它只知道 `.map`
+在 `Array` 上存在。所以这类缺陷只能在**边界**上对账（源码 ↔ 类型），或者用真实
+浏览器跑一遍那条路径。
+
+*钉它的测试*：`test_frontend_contracts.py::test_the_conversation_list_call_matches_the_response_envelope`、
+`::test_the_storage_report_matches_the_ui_type`、
+`::test_the_system_paths_type_names_the_fields_the_route_returns`；
+浏览器侧 `ui/tests/browser/settings-and-params.spec.ts` 的第一条（点开开发者页，
+断言不出现 `[data-testid="app-crash"]`）。
+
+### 2.42 源码用到的每个 i18n key 必须存在于字典里
+
+**规则。** `translate('x')` 的静态 key、以及由路由 id 拼出来的 `nav.*`，都必须
+在合并后的字典（`zh-CN.ts` + `en-US.ts` + `extra.ts`）里存在。
+
+*为什么*：现有的奇偶性测试只比对**中英两边键集合相同**，所以一个**两边都没有**的
+key 能安然通过，然后在界面上原样显示成 `nav.params`。2.0.0 就这样发布了：路由 id
+是 `params`，字典里只有 1.0 遗留的 `nav.param_editor`，于是工具栏标题、页面副标题、
+模型字段标签全是原始 key。新门禁一上线就抓出 **19 个**（排除 2 个正则误捕后 17 个）。
+
+*一个测试陷阱*：正则扫源码会把注释里的 `translate('constructor')` 和动态拼接的
+`translate('app.theme.' + x)` 也扫进来。前者要显式排除，后者按"前缀"跳过——动态
+key 由 `nav.${route}` 那条单独覆盖。
+
+*钉它的测试*：`ui/tests/i18n.test.ts` 的
+`every static translate() key exists in the dictionaries` 与
+`every route id has a nav.* translation`。
+
+### 2.43 参数界面的"短描述"与"长说明"必须分开，控件类型必须按后端词汇渲染
+
+**规则。** ①`ParamMeta` 同时有 `summary`（一行，≤60 字）与 `help`（完整说明），
+前者直接显示、后者默认折叠；`summary` 留空时由 `_derive_summary()` 从 `help` 首句
+确定性兜底。②控件分支必须认后端实际发出的 `type`（`switch`/`float`/`password`/
+`multi`），不能自己发明词汇。③分组用**单页可折叠区段**，初始展开状态读后端的
+`default_open`；④`depends_on*` 必须用于过滤，不能用"全都显示"。
+
+*为什么*：92 个参数每个都挂一段完整说明，就是一面文字墙——用户的原话是
+"描述内容直接暴露展示，界面臃肿浮夸"，而 8 个分组 tab 让"看全所有参数"需要点 8 次。
+更严重的是②：前端判断的是 `'boolean'` 而后端发 `'switch'`，于是 **14 个开关全部
+渲染成文本框**（里面写着 `"true"`），7 个 `float` 落进文本分支，而唯一的
+`password` 参数（`api_key`）**明文显示**。
+
+后端的 `default_open` 与 39 条 `depends_on*` 从 1.0 就存在，`ParamGroup` 的注释
+甚至写着"用于前端折叠面板渲染"——设计意图有，实现没落。
+
+*钉它的测试*：`test_reliability_features.py::test_every_parameter_has_a_short_summary_and_a_long_help`
+（非空、≤60、不与 help 重复、兜底函数本身）；
+`ui/tests/browser/settings-and-params.spec.ts` 的第三条（8 个区段同时在 DOM、
+默认只展开 3 个、说明默认折叠、搜索生效）。
+
+### 2.44 颜色令牌不得放进字号槽位
+
+**规则。** `text-[length:var(--text-tertiary)]` 是错的：`--text-tertiary` 是**颜色**，
+放进 `font-size` 后声明无效、被浏览器丢弃，元素静默继承正文字号。要写
+`text-[length:var(--text-xs)] text-[var(--text-tertiary)]`——字号与颜色各写各的。
+
+*为什么*：这是 §2.36 的镜像缺陷（那条钉的是"字号令牌当颜色"）。实测有 **96 处**，
+包括参数页每一个说明段落。它们以**正文大小、正文对比度**渲染，所以"说明文字"
+看起来和控件正文一样重——这正是"界面臃肿"的观感来源之一。
+
+修的时候要当心：把失效声明改成生效声明，会**暴露**原本被掩盖的对比度不足。
+本轮修完 96 处后 axe 立刻在深/浅两个主题上报出两处 `--text-quaternary` 不够
+AA（侧栏搜索框 placeholder、composer 下方提示行），一并降级到 `--text-tertiary`。
+
+*钉它的测试*：`test_ui_tokens.py::test_colour_tokens_are_never_used_as_a_font_size`；
+`ui/tests/browser/a11y.spec.ts`（axe 双主题）是第二道网。
+
+### 2.45 路径字段必须有原生选择器，且只有一处 IPC 封装
+
+**规则。** 任何让用户填绝对路径的字段（可执行文件、模型目录、授权目录、嵌入模型）
+都用 `PathInput`（`ui/src/components/ui/Input.tsx`），它内部调 `pickPath()`
+（`ui/src/lib/api/client.ts`）。**不得**再手写 `window.__TAURI__` cast。
+取消（`null`）必须**保持字段不变**——把"取消"当成"清空"，或在取消时弹
+`window.prompt`，都是把用户的操作理解反了。
+
+*为什么*：Tauri 侧 `open_file_dialog`/`open_directory_dialog` 一直都在，但前端只有
+两处各自手写了一遍 cast，其余 8 个路径字段是纯文本框——设置里最关键的那个
+"llama-server.exe 路径"只能靠手打。1.0 有过这功能，2.0 移植时丢了（字典里
+`params.browse`、`knowledge.browse`、`params.dialogFailed` 至今留着，但无人引用，
+这就是痕迹）。
+
+*钉它的测试*：`ui/tests/browser/settings-and-params.spec.ts` 的第二条（两处路径行
+都有"浏览…"按钮）。**边界诚实披露**：Tauri 原生弹窗无法在 Playwright 里驱动，
+"真的弹出资源管理器"只能在打包态手工点一次；自动测试钉的是"控件存在且接了
+正确的字段"。
+
+### 2.46 前端类型**不得**留索引签名，且每个响应形状都要对账
+
+**规则。** `types.ts` 里任何镜像后端响应的 `interface` **不得**写
+`[key: string]: unknown`；字段集合必须与路由/`DEFAULT_CONFIG` 双向一致，并由
+pytest 双向断言。
+
+*为什么*：2.0.0 发布了"设置里保存默认模型目录必失败"。根因是前端发
+`model_directory`、后端只认 `default_model_dir`，而 `update_config` 对未知键
+直接 400 —— 一个错名让整个"常规"页永远无法保存。它之所以能通过所有门禁，正是
+因为 `AppConfig` 上那行索引签名让 `tsc` 没有立场反对，而 `apiGet<T>` 只做
+`return payload as T`。同一轮还发现两个从未报错的同类：`SystemOverview` 写
+`memory_used_mb` 而路由发 `memory_used_gb`（状态栏 RAM 恒为"—"）、`GpuInfo`
+写 `utilization_percent/temperature_c` 而路由发 `utilization/temperature`
+（监控表两列恒为"—"）。这类缺陷的共同点是**界面只是空着，没有任何错误**。
+
+*钉它的测试*：`test_frontend_contracts.py` 的
+`test_the_app_config_type_matches_the_backend_config_keys`（双向）、
+`test_every_key_the_settings_sheet_writes_exists_in_the_backend`（扫设置页源码里
+实际写入的键）、`test_the_system_overview_type_matches_the_route_it_reads`。
+**门禁扫不到东西必须红**：设置页从 `setDraft` 改成 `patch()` 后匹配数归零，
+该测试报的是"could not find any settings-field writes"而不是空过。
+
+### 2.47 数据目录：显式意图才算数，且指针文件不可信
+
+**规则。** 冻结态的 `DATA_DIR` 解析顺序是
+`LUNARSHROUD_DATA_DIR` → `<exe>/data-location.txt` → `<exe>/portable.txt`
+→ `%APPDATA%` → `%LOCALAPPDATA%` → 用户目录 → exe → TEMP，**每个候选都必须
+实测可写**才生效。三条额外约束：
+
+1. 便携判定**只认显式标记 `portable.txt`**，不得用"`<app>/data` 恰好存在"。
+2. `data-location.txt` 只接受**绝对路径**，且同样要过写探测——它躺在用户可写的
+   exe 旁边，照单全收等于让一个被种下的文件把数据库与密钥重定向到任意目录。
+3. 迁移是 **copy + 指针**：源目录保留、逐文件校验、SQLite 走 backup API（避开
+   WAL 半截）、有实例在跑时拒绝、指针文件最后原子写入。删指针即回滚。
+
+Rust 外壳的 `data_dir_candidates` 必须逐条复刻同一顺序，否则外壳读的是另一个
+`config.json`，端口/托盘设置会与后端分叉。
+
+*为什么*：便携包没有安装器，数据跟着解压目录走是用户能理解的承诺；而"目录
+恰好存在"不是意图的证据——源码树永远有 `<repo>/data`，用存在性判定会让开发机
+的 data 被当成便携目录（实测让 `test_frozen_data_dir_*` 变红）。
+
+*钉它的测试*：`test_data_migration.py`（四个解析分支、目标已存在、相对路径、
+目标在源内、不可写、WAL 内容、损坏库按字节复制、有实例时 409）、
+`test_regressions.py::test_frozen_data_dir_falls_back_when_appdata_is_unwritable`。
+
+### 2.48 联网搜索是唯一出站功能，必须三重开启且逐次批准
+
+**规则。** `web_search` 只有在**全局开关开 + 端点已配置 + 该会话勾选**三者齐备
+时才被声明；缺任一条连工具声明都不出现。端点由用户提供（代码里不得内置搜索
+服务），默认只接受回环地址；请求 `trust_env=False`、`follow_redirects=False`；
+响应受字节与条数双上限；每一次调用单独批准，批准条显示查询词。
+
+*为什么*：`docs/OFFLINE.md` 的离线契约是产品承诺，而搜索是唯一主动出站的动作。
+三重条件各自能独立漂移（设置开着但没端点、端点配了但会话没勾），任何一条单独
+成立就开始发请求，都会让"我的查询去了哪里"失去可解释性。
+
+*钉它的测试*：`test_web_search.py`（关闭态拒绝、远端端点拒绝、不跟随重定向、
+不走环境代理、超大响应拒绝、非 http(s) 结果被丢弃、声明只在开启时出现）、
+`test_offline_contract.py::test_web_search_is_the_only_network_feature_and_it_is_off_by_default`。
 
 ## 3. 发布镜像与门禁
 

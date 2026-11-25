@@ -56,23 +56,17 @@ def test_the_module_type_map_covers_every_extension_the_frontend_ships():
     for ext, mime in expected.items():
         assert static_ui.STATIC_MEDIA_TYPES.get(ext) == mime, ext
 
-    # 反向保护:前端目录里出现的扩展名都在表里,避免新增资源类型时漏配。
-    # 跳过工具状态目录(被 .gitignore 忽略、从不发布,自然也不经 SPA 路由提供)。
-    frontend = REPO_ROOT / "frontend"
-    skipped_dirs = {".mimosa", ".claude", ".git", "node_modules", ".vscode", ".idea"}
-    shipped = {
-        p.suffix.lower()
-        for p in frontend.rglob("*")
-        if p.is_file()
-        and p.suffix
-        and not (set(p.relative_to(frontend).parts[:-1]) & skipped_dirs)
-    }
-    # 测试夹具与文档不通过 SPA 路由提供。
-    shipped.discard(".md")
-    shipped.discard(".source")
+    # 反向保护:前端**构建产物**里出现的扩展名都在表里,避免新增资源类型时漏配。
+    #
+    # 2.0 的前端是 React 工程,构建输出在 ui/dist;扫描源工程会把 .tsx/.ts 这类
+    # 不经 SPA 路由提供、只存在于构建过程中的文件也算进来,那是错的扫描对象。
+    dist = REPO_ROOT / "ui" / "dist"
+    if not (dist / "index.html").is_file():
+        pytest.skip("ui/dist has not been built")
+    shipped = {p.suffix.lower() for p in dist.rglob("*") if p.is_file() and p.suffix}
     missing = sorted(shipped - set(static_ui.STATIC_MEDIA_TYPES))
     assert not missing, (
-        "前端里有这些扩展名但静态 MIME 表没覆盖,"
+        "构建产物里有这些扩展名但静态 MIME 表没覆盖,"
         f"干净机器上会被当作 text/plain: {missing}"
     )
 

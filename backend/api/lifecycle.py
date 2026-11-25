@@ -197,8 +197,18 @@ async def lifespan(app):
         await gateway.gateway_manager().apply(main.get_config())
     except Exception:  # noqa: BLE001 - 可选服务，永不阻断启动
         main.LOGGER.exception("local API server failed to start")
+    # 定时任务守护线程。它**只在启动器运行期间**推进：关掉窗口就没有人在跑
+    # 定时任务，这正是"本机应用"的语义。一个坏的任务行不能阻断启动。
+    try:
+        main.task_runner.start()
+    except Exception:  # noqa: BLE001 - 可选功能，永不阻断启动
+        main.LOGGER.exception("scheduled task loop failed to start")
     yield
     # 关闭时清理
+    try:
+        main.task_runner.stop()
+    except Exception:  # noqa: BLE001 - shutdown must keep going
+        main.LOGGER.exception("scheduled task loop shutdown failed")
     try:
         from api import gateway
 

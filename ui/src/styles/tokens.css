@@ -1,0 +1,347 @@
+/* ==========================================================================
+   LunarShroud 2.0 — design tokens
+
+   **This file is the only place in `ui/` allowed to contain colour literals.**
+   `backend/tests/test_design_tokens.py` scans `ui/src` and fails on a hex,
+   rgb(), hsl() or oklch() value anywhere else.
+
+   Direction: "月蚀界面" — the *look* of a macOS native tool, the *behaviour* of a
+   Windows native window. System window chrome stays (no fake traffic lights),
+   Ctrl shortcuts stay, and control heights respect the 32px floor — but the
+   type, layering, radii, motion and surface ladder follow the macOS language.
+
+   Three surfaces, separated by lightness rather than borders:
+     canvas  — the outermost window ground (behind the sidebar)
+     panel   — sidebar, inspector, status bar
+     surface — conversation area, popovers, cards
+
+   Accent is deliberately narrow: selection, focus ring, links, live status. The
+   "primary button" is near-black fill (macOS System Settings vocabulary), which
+   also avoids the flat blue-everywhere look of 1.0.
+
+   Every text pair below was measured with the WCAG relative-luminance formula
+   over all three surfaces, in both themes; the ratios are recorded in
+   docs/DESIGN_2.0.md. Three candidates were changed during verification because
+   they failed: light tertiary (4.46 → 5.03 on canvas), light success
+   (4.41 → 5.11), and the control-border step (added because border alone is
+   1.30:1 and may only be decorative).
+   ========================================================================== */
+
+:root {
+  color-scheme: light;
+
+  /* ---------- Surface ladder ---------- */
+  --canvas: #f2f2f5;
+  --panel: #fbfbfd;
+  --surface: #ffffff;
+  --surface-raised: #ffffff;
+  --surface-sunken: #ededf0;
+  /* Translucent overlays: only for transient layers (menus, dialogs), never
+     stacked, never behind body text. 1.0 allowed glass on long-reading
+     surfaces and paid for it in contrast and compositing cost. */
+  --overlay-scrim: rgb(0 0 0 / 0.28);
+  --overlay-scrim-strong: rgb(0 0 0 / 0.44);
+
+  /* ---------- Text ramp (measured, see header) ---------- */
+  --text: #1a1c1f; /* 15.28 canvas / 16.52 panel / 17.08 surface */
+  --text-secondary: #4b4f58; /* 7.35 / 7.94 / 8.21 */
+  --text-tertiary: #63686f; /* 5.03 / 5.43 / 5.61  (was #6b7078 = 4.46, failed) */
+  /* Quaternary is decorative only: separators, "·", counts inside a label the
+     reader already has. It is below AA by design and must never carry meaning. */
+  --text-quaternary: #8a8f98;
+  --text-inverse: #ffffff;
+
+  /* ---------- Lines ---------- */
+  /* `border` is a hairline between two surfaces. It is decorative; it does not
+     outline anything the user must find. */
+  --border: #e1e1e6;
+  --border-strong: #cfcfd6;
+  /* `border-control` outlines an interactive control and must reach 3:1
+     against the surface it sits on (WCAG 1.4.11). #868b93 = 3.43 on surface. */
+  --border-control: #868b93;
+  --border-focus: #2c5fd6;
+
+  /* ---------- Accent ---------- */
+  --accent: #2c5fd6; /* 5.65 on surface; fills and focus ring */
+  --accent-text: #1f4fc0; /* 7.15 on surface; accent used as text */
+  --accent-hover: #2450b8;
+  --accent-subtle: color-mix(in srgb, var(--accent) 10%, transparent);
+  --accent-subtle-hover: color-mix(in srgb, var(--accent) 16%, transparent);
+  --focus-ring: color-mix(in srgb, var(--accent) 45%, transparent);
+
+  /* ---------- Primary (near-black fill) ---------- */
+  --primary-fill: #1a1c1f;
+  --primary-fill-hover: #2a2d32;
+  --on-primary: #ffffff; /* 17.08 on primary-fill */
+  --primary-subtle: color-mix(in srgb, var(--text) 7%, transparent);
+  --primary-subtle-hover: color-mix(in srgb, var(--text) 12%, transparent);
+
+  /* ---------- Semantic ---------- */
+  --success: #0f7550; /* 5.11 canvas / 5.71 surface (was #12805a = 4.41) */
+  --success-subtle: #e6f5ee;
+  --warning: #9a5b00; /* 5.25 panel / 5.43 surface */
+  --warning-subtle: #fdf3e3;
+  --danger: #c0322b; /* 5.04 canvas / 5.63 surface */
+  --danger-subtle: #fdecea;
+  --danger-fill: #c0322b;
+  --danger-fill-hover: #a52620;
+  --on-danger: #ffffff;
+  --info: #2c5fd6;
+  --info-subtle: #eaf0fd;
+
+  /* ---------- Interaction washes (neutral, never tinted) ---------- */
+  --hover: color-mix(in srgb, var(--text) 5%, transparent);
+  --hover-strong: color-mix(in srgb, var(--text) 9%, transparent);
+  --selected: color-mix(in srgb, var(--accent) 12%, transparent);
+  --selected-strong: color-mix(in srgb, var(--accent) 20%, transparent);
+  --pressed: color-mix(in srgb, var(--text) 14%, transparent);
+
+  /* ---------- Code ----------
+     A code block keeps its own dark palette in both themes: model output is
+     read as source, and syntax colours verified against a dark ground. */
+  --code-bg: #16181d;
+  --code-fg: #e6e8ee;
+  --code-border: #2a2d34;
+  --code-inline-bg: color-mix(in srgb, var(--text) 7%, transparent);
+  --code-inline-fg: #a3332c;
+  --code-gutter: #8b9099; /* 5.54:1 on --code-bg (was #6b7078 = 3.56, failed AA) */
+  --code-accent: #8fb4f1;
+  /* Hover wash on code-block chrome buttons. The code panel keeps a fixed dark
+     ground in both themes, so this wash is a white overlay, not a text mix. */
+  --code-hover: rgb(255 255 255 / 0.08);
+
+  /* ---------- Charts ---------- */
+  --chart-cpu: #c0453d;
+  --chart-memory: #0f7550;
+  --chart-gpu: #9a5b00;
+  --chart-grid: color-mix(in srgb, var(--text) 10%, transparent);
+
+  /* ---------- Spacing (4px base) ---------- */
+  --space-0: 0;
+  --space-px: 1px;
+  --space-0-5: 2px;
+  --space-1: 4px;
+  --space-1-5: 6px;
+  --space-2: 8px;
+  --space-2-5: 10px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  /* ---------- Control metrics ----------
+     32px is the WinUI standard text-control height; the compact 24px step is
+     opt-in per panel (Fluent defines exactly two densities). */
+  --control-h-sm: 26px;
+  --control-h: 32px;
+  --control-h-lg: 38px;
+  --control-h-compact: 24px;
+  --tap-target: 32px;
+
+  /* ---------- Radii ----------
+     One scale, concentric nesting: outer = inner + inset. */
+  --radius-xs: 5px;
+  --radius-sm: 7px;
+  --radius-md: 9px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-2xl: 22px;
+  --radius-composer: 28px;
+  --radius-pill: 999px;
+  --radius-round: 50%;
+
+  /* ---------- Typography ---------- */
+  --font-sans:
+    'Inter Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI Variable Text',
+    'Segoe UI', 'PingFang SC', 'Microsoft YaHei UI', 'Microsoft YaHei', sans-serif;
+  --font-mono:
+    'JetBrains Mono Variable', 'Cascadia Mono', 'SF Mono', Consolas, 'Courier New', monospace;
+
+  --text-2xs: 11px;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-md: 15px;
+  --text-lg: 17px;
+  --text-xl: 20px;
+  --text-2xl: 24px;
+  --text-3xl: 30px;
+
+  --leading-none: 1;
+  --leading-tight: 1.25;
+  --leading-snug: 1.4;
+  --leading-normal: 1.55;
+  --leading-relaxed: 1.65;
+  /* CJK body text needs more air than Latin; applied on prose containers. */
+  --leading-cjk: 1.78;
+
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  --tracking-tight: -0.011em;
+  --tracking-normal: 0;
+  --tracking-wide: 0.02em;
+
+  /* ---------- Shadows ----------
+     Tinted toward the accent's hue rather than pure black, three steps only. */
+  --shadow-sm: 0 1px 2px rgb(24 28 38 / 0.06);
+  --shadow-md: 0 2px 6px -1px rgb(24 28 38 / 0.08), 0 6px 16px -6px rgb(24 28 38 / 0.10);
+  --shadow-lg: 0 10px 28px -10px rgb(24 28 38 / 0.16), 0 2px 8px -2px rgb(24 28 38 / 0.06);
+  --shadow-pop: 0 12px 32px -12px rgb(24 28 38 / 0.20), 0 2px 6px -2px rgb(24 28 38 / 0.08);
+  --shadow-composer: 0 1px 3px rgb(24 28 38 / 0.06), 0 8px 24px -12px rgb(24 28 38 / 0.14);
+
+  /* ---------- Motion ---------- */
+  --duration-fast: 110ms;
+  --duration-base: 170ms;
+  --duration-slow: 260ms;
+  --ease-standard: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --transition-fast: var(--duration-fast) var(--ease-standard);
+  --transition-base: var(--duration-base) var(--ease-standard);
+
+  /* ---------- Layers ---------- */
+  --z-base: 0;
+  --z-sticky: 10;
+  --z-sidebar: 20;
+  --z-inspector: 25;
+  --z-overlay: 8000;
+  --z-modal: 8100;
+  --z-popover: 8200;
+  --z-tooltip: 9000;
+  --z-toast: 9500;
+
+  /* ---------- Layout ---------- */
+  --sidebar-w: 272px;
+  --sidebar-w-min: 224px;
+  --sidebar-w-max: 440px;
+  --sidebar-rail-w: 56px;
+  --inspector-w: 320px;
+  --inspector-w-min: 264px;
+  --inspector-w-max: 520px;
+  --toolbar-h: 48px;
+  --statusbar-h: 28px;
+  --thread-max: 46rem;
+  --thread-pad: var(--space-5);
+
+  /* ---------- Chat surfaces ----------
+     The well is the recessed scroller behind messages; the composer floats above
+     it. Keeping them as separate roles prevents the "everything is a card" look. */
+  --chat-well: var(--canvas);
+  --composer-surface: var(--surface);
+  --bubble-user: color-mix(in srgb, var(--text) 5%, transparent);
+  --bubble-user-solid: #ececef;
+  --trace-ink: color-mix(in srgb, var(--text-secondary) 82%, transparent);
+}
+
+:root.theme-dark {
+  color-scheme: dark;
+
+  --canvas: #111113;
+  --panel: #18181b;
+  --surface: #1f1f23;
+  --surface-raised: #26262b;
+  --surface-sunken: #0d0d0f;
+  --overlay-scrim: rgb(0 0 0 / 0.5);
+  --overlay-scrim-strong: rgb(0 0 0 / 0.68);
+
+  --text: #f0f0f3; /* 16.58 canvas / 15.58 panel / 14.44 surface */
+  --text-secondary: #b4b7be; /* 9.39 / 8.82 / 8.18 */
+  --text-tertiary: #8c9099; /* 5.90 / 5.54 / 5.13 */
+  --text-quaternary: #6e727a;
+  --text-inverse: #111113;
+
+  --border: #2c2c31;
+  --border-strong: #3a3a42;
+  --border-control: #666b74; /* 3.07 on surface */
+  --border-focus: #7aa2ff;
+
+  --accent: #7aa2ff; /* 6.60 on surface */
+  --accent-text: #9cbbff; /* 8.58 on surface */
+  --accent-hover: #93b4ff;
+  --accent-subtle: color-mix(in srgb, var(--accent) 14%, transparent);
+  --accent-subtle-hover: color-mix(in srgb, var(--accent) 22%, transparent);
+  --focus-ring: color-mix(in srgb, var(--accent) 55%, transparent);
+
+  --primary-fill: #f2f2f5;
+  --primary-fill-hover: #ffffff;
+  --on-primary: #111113; /* 16.88 on primary-fill */
+  --primary-subtle: color-mix(in srgb, var(--text) 9%, transparent);
+  --primary-subtle-hover: color-mix(in srgb, var(--text) 14%, transparent);
+
+  --success: #4ade9b;
+  --success-subtle: #122c22;
+  --warning: #f0b45b;
+  --warning-subtle: #33250e;
+  --danger: #ff7a7a;
+  --danger-subtle: #3a1717;
+  --danger-fill: #c0322b;
+  --danger-fill-hover: #d1463f;
+  --on-danger: #ffffff;
+  --info: #7aa2ff;
+  --info-subtle: #16223c;
+
+  --hover: color-mix(in srgb, var(--text) 7%, transparent);
+  --hover-strong: color-mix(in srgb, var(--text) 11%, transparent);
+  --selected: color-mix(in srgb, var(--accent) 16%, transparent);
+  --selected-strong: color-mix(in srgb, var(--accent) 26%, transparent);
+  --pressed: color-mix(in srgb, var(--text) 16%, transparent);
+
+  --code-bg: #0c0d10;
+  --code-fg: #e6e8ee;
+  --code-border: #25272d;
+  --code-inline-bg: color-mix(in srgb, var(--text) 11%, transparent);
+  --code-inline-fg: #f2a19a;
+  --code-gutter: #8b9099; /* 5.54:1 on --code-bg (was #6b7078 = 3.56, failed AA) */
+  --code-accent: #8fb4f1;
+
+  --chart-cpu: #ef7b73;
+  --chart-memory: #4ade9b;
+  --chart-gpu: #f0b45b;
+  --chart-grid: color-mix(in srgb, var(--text) 12%, transparent);
+
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.4);
+  --shadow-md: 0 2px 8px -1px rgb(0 0 0 / 0.5), 0 8px 20px -8px rgb(0 0 0 / 0.55);
+  --shadow-lg: 0 12px 32px -12px rgb(0 0 0 / 0.7), 0 2px 8px -2px rgb(0 0 0 / 0.45);
+  --shadow-pop: 0 16px 40px -12px rgb(0 0 0 / 0.75), 0 2px 6px -2px rgb(0 0 0 / 0.5);
+  --shadow-composer: 0 1px 3px rgb(0 0 0 / 0.4), 0 10px 28px -14px rgb(0 0 0 / 0.7);
+
+  --bubble-user: color-mix(in srgb, var(--text) 8%, transparent);
+  --bubble-user-solid: #2a2a30;
+  --trace-ink: color-mix(in srgb, var(--text-secondary) 74%, transparent);
+}
+
+/* Windows exposes "show animations" in Settings; the OS maps it to this query. */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-fast: 0.01ms;
+    --duration-base: 0.01ms;
+    --duration-slow: 0.01ms;
+    --transition-fast: 0.01ms linear;
+    --transition-base: 0.01ms linear;
+  }
+}
+
+/* High-contrast mode: hand control back to the system palette. */
+@media (forced-colors: active) {
+  :root,
+  :root.theme-dark {
+    --border: CanvasText;
+    --border-strong: CanvasText;
+    --border-control: ButtonText;
+    --text: CanvasText;
+    --text-secondary: CanvasText;
+    --text-tertiary: CanvasText;
+    --surface: Canvas;
+    --panel: Canvas;
+    --canvas: Canvas;
+    --primary-fill: ButtonFace;
+    --on-primary: ButtonText;
+  }
+}

@@ -381,6 +381,32 @@ fn external_url_is_allowed(scheme: &str) -> bool {
     matches!(scheme, "http" | "https")
 }
 
+/// 主窗口自身允许停留的源。
+///
+/// 应用页面的来源有三条：打包态的 `tauri.localhost`（自定义协议）、源码运行
+/// 通道的 `http://127.0.0.1:<port>`、以及 dev server 的
+/// `http://localhost:<port>`。其余一律视为导航逃逸。
+///
+/// 为什么需要这条：Tauri 只在调用 `on_navigation` 时才安装导航处理器，
+/// 不安装等于"允许一切"。`Markdown` 的链接渲染器强制 `target="_blank"`，
+/// 所以今天没有可达的同窗导航汇；这是纵深防御，不是某个已知缺陷的补丁
+/// （2026-11-23 前端审计 L9）。
+fn navigation_is_internal(url: &tauri::Url) -> bool {
+    let scheme = url.scheme();
+    if scheme == "tauri" {
+        return true;
+    }
+    if scheme != "http" && scheme != "https" {
+        return false;
+    }
+    match url.host_str() {
+        Some("localhost") | Some("127.0.0.1") | Some("[::1]") => true,
+        // 打包态的页面源。
+        Some("tauri.localhost") => true,
+        _ => false,
+    }
+}
+
 /// 用系统默认浏览器打开外部链接。
 ///
 /// WebView2 的 `window.open` / `target="_blank"` 在没有 `on_new_window` 处理
@@ -553,7 +579,8 @@ pub fn run() {
             set_close_to_tray,
             quit_app,
             open_file_dialog,
-            open_directory_dialog
+            open_directory_dialog,
+            open_path
         ])
         .setup(move |app| {
             if let Some(dir) = &window_log_dir {
@@ -600,6 +627,20 @@ pub fn run() {
                             ));
                         }
                         tauri::webview::NewWindowResponse::Deny
+                    })
+                    // 同窗导航的兜底：不允许离开应用自己的源。没有这个处理器
+                    // 时 Tauri 视为"允许"，一个不带 target 的链接（或今后任何
+                    // `location` 汇）就能把应用页面换成一个远程页面，而那个
+                    // 页面继承不了 IPC（capabilities 限定 `windows: ["main"]`
+                    // 且 `local: true`），但会以应用的窗口身份显示钓鱼内容。
+                    .on_navigation(|url| {
+                        let allowed = navigation_is_internal(url);
+                        if !allowed {
+                            append_launcher_log(&format!(
+                                "blocked in-window navigation to {url}"
+                            ));
+                        }
+                        allowed
                     });
             // WebView2 默认把用户数据放在 %LOCALAPPDATA%/<identifier>；受限
             // 会话/沙箱里该目录不可写时，CreateCoreWebView2Environment 直接
@@ -1093,8 +1134,49 @@ fn dir_is_writable(path: &Path) -> bool {
 }
 
 /// 后端 `_frozen_data_dir()` 的候选顺序；两侧必须一致，否则端口/配置分叉。
+///
+/// 2026-11-24：后端多了三条**用户可控**的前置来源（`LUNARSHROUD_DATA_DIR`、
+/// `data-location.txt`、`portable.txt`）。这里必须逐条复刻，否则用户在设置里
+/// 迁移过数据目录之后，外壳仍然去读旧位置的 `config.json`，于是"端口/托盘设置
+/// 改了不生效"——正是这条注释上半段描述过的那种分叉。
 fn data_dir_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+
+    let launcher_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+
+    if let Some(dir) = &launcher_dir {
+        // 1. 环境变量覆盖（必须是绝对路径，与后端一致）。
+        if let Some(value) = std::env::var_os("LUNARSHROUD_DATA_DIR") {
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                candidates.push(path);
+            }
+        }
+
+        // 2. 迁移指针：<launcher_dir>/data-location.txt。
+        if let Ok(text) = std::fs::read_to_string(dir.join("data-location.txt")) {
+            let trimmed = text.trim().trim_start_matches('\u{feff}').trim();
+            let path = PathBuf::from(trimmed);
+            if !trimmed.is_empty() && path.is_absolute() {
+                candidates.push(path);
+            }
+        }
+
+        // 3. 便携标记：portable.txt（只认显式标记，不认"data 目录恰好存在"）。
+        //
+        // 后端在冻结态是 `<launcher_dir>/backend/backend.exe`，它的 `_app_dir()`
+        // 是 `<launcher_dir>/backend`，而外壳是 `<launcher_dir>`；两侧都要能识别
+        // 这个标记，因此这里同时看两个位置。
+        let marked = dir.join("portable.txt").is_file()
+            || dir.join("backend").join("portable.txt").is_file();
+        if marked {
+            candidates.push(dir.join("data"));
+            candidates.push(dir.join("backend").join("data"));
+        }
+    }
+
     if let Some(appdata) = std::env::var_os("APPDATA") {
         candidates.push(PathBuf::from(appdata).join("LunarShroud"));
     }
@@ -1104,14 +1186,12 @@ fn data_dir_candidates() -> Vec<PathBuf> {
     if let Some(home) = std::env::var_os("USERPROFILE") {
         candidates.push(PathBuf::from(home).join("LunarShroud"));
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            // 后端的 exe 在 <launcher_dir>\backend\backend.exe，它的
-            // `sys.executable.parent/data` 是 <launcher_dir>\backend\data，
-            // 不是 <launcher_dir>\data。候选目录必须逐字对齐，否则受限环境里
-            // 两侧仍会选到不同的数据目录。
-            candidates.push(dir.join("backend").join("data"));
-        }
+    if let Some(dir) = &launcher_dir {
+        // 后端的 exe 在 <launcher_dir>\backend\backend.exe，它的
+        // `sys.executable.parent/data` 是 <launcher_dir>\backend\data，
+        // 不是 <launcher_dir>\data。候选目录必须逐字对齐，否则受限环境里
+        // 两侧仍会选到不同的数据目录。
+        candidates.push(dir.join("backend").join("data"));
     }
     candidates.push(std::env::temp_dir().join("LunarShroud"));
     candidates
@@ -1860,12 +1940,48 @@ fn filepath_to_string(fp: tauri_plugin_dialog::FilePath) -> Option<String> {
     }
 }
 
+/// One file-type filter for the picker: a label and bare extensions.
+#[derive(serde::Deserialize)]
+struct DialogFilter {
+    name: String,
+    extensions: Vec<String>,
+}
+
 /// Tauri command：打开文件选择对话框（异步回调包装，避免阻塞 WebView2 主线程）
+///
+/// `filters` 与 `current` 都是可选的：前者让用户在对话框里只看 `.exe` / `.gguf`，
+/// 后者让对话框从字段当前值所在的目录打开。两者缺省时行为与旧版完全一致，所以
+/// 权限清单（`permissions/open-file-dialog.toml`）不需要改动 —— 命令名没变。
 #[tauri::command]
-async fn open_file_dialog(app: tauri::AppHandle) -> Option<String> {
+async fn open_file_dialog(
+    app: tauri::AppHandle,
+    filters: Option<Vec<DialogFilter>>,
+    current: Option<String>,
+) -> Option<String> {
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog().file().pick_file(move |path| {
+    let mut dialog = app.dialog().file();
+    if let Some(list) = filters {
+        for filter in list {
+            let extensions: Vec<&str> = filter.extensions.iter().map(|e| e.as_str()).collect();
+            if !extensions.is_empty() {
+                dialog = dialog.add_filter(&filter.name, &extensions);
+            }
+        }
+    }
+    if let Some(directory) = current.filter(|value| !value.trim().is_empty()) {
+        // `current` may be a file path; the dialog API wants a directory. A file's
+        // parent is what the user expects to land in.
+        let parent = std::path::Path::new(&directory)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| std::path::PathBuf::from(&directory));
+        if parent.is_dir() {
+            dialog = dialog.set_directory(parent);
+        }
+    }
+    dialog.pick_file(move |path| {
         let _ = tx.send(path);
     });
     let file_path = rx.await.ok().flatten();
@@ -1874,24 +1990,93 @@ async fn open_file_dialog(app: tauri::AppHandle) -> Option<String> {
 
 /// Tauri command：打开目录选择对话框（异步回调包装，避免阻塞 WebView2 主线程）
 #[tauri::command]
-async fn open_directory_dialog(app: tauri::AppHandle) -> Option<String> {
+async fn open_directory_dialog(
+    app: tauri::AppHandle,
+    current: Option<String>,
+) -> Option<String> {
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog().file().pick_folder(move |path| {
+    let mut dialog = app.dialog().file();
+    if let Some(directory) = current.filter(|value| !value.trim().is_empty()) {
+        if std::path::Path::new(&directory).is_dir() {
+            dialog = dialog.set_directory(directory);
+        }
+    }
+    dialog.pick_folder(move |path| {
         let _ = tx.send(path);
     });
     let folder_path = rx.await.ok().flatten();
     folder_path.and_then(filepath_to_string)
 }
 
+/// Tauri command：在系统文件管理器中打开一个路径（数据目录 / 日志目录）。
+///
+/// 用途是设置页「开发者 / 数据」里的“打开目录”按钮。没有这条命令时，用户只能
+/// 看到一个 `%LOCALAPPDATA%` 下的长字符串然后自己去粘贴 —— 而这条信息存在的
+/// 全部意义就是“能一键到达”。
+///
+/// **不走裸名 `explorer.exe`。** 与 AGENTS §2.1 同一条理由：裸名会让 Windows
+/// 按 CreateProcess 搜索序（当前目录 → 应用目录 → …）解析，打包态的应用目录
+/// 是用户可写的，一次改名就等于“点按钮执行别人的程序”。这里直接调
+/// `ShellExecuteW`（与 `open_external_url` 同一实现），由 shell 自己决定用
+/// 什么程序打开，进程不需要解析任何可执行文件名。
+///
+/// 只允许打开**存在的目录或文件**：ShellExecuteW 对
+/// `file:///C:/Windows/System32/cmd.exe` 之类的 URI 也会照办，而前端的输入
+/// 来自后端返回的路径字符串，没有理由让这个通道变成一个通用的“执行任意
+/// shell 命令”入口。
+/// Which `open_path` inputs are refused, and why.
+///
+/// Split out of the command so it can be unit-tested: this is the boundary that
+/// decides what a button in the settings UI is allowed to hand to `ShellExecuteW`,
+/// and "reviewed by eye" is not a test. The command keeps only the side effect.
+fn open_path_verdict(path: &str) -> Result<&str, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("path must not be empty".into());
+    }
+    // 只接受绝对路径；相对路径的解析基准是进程 CWD，而 CWD 不是用户能预期的
+    // 东西（§2.1 的同类问题）。UNC 也拒绝：那是网络位置，打开它等于发起一次
+    // 用户没有要求的出站连接。
+    if trimmed.starts_with("\\\\") || trimmed.starts_with("//") {
+        return Err("network paths are not opened from the app".into());
+    }
+    let candidate = std::path::Path::new(trimmed);
+    if !candidate.is_absolute() {
+        return Err("path must be absolute".into());
+    }
+    // A URL such as `file:///C:/Windows/System32` or `javascript:…` is not a
+    // filesystem path; `is_absolute()` already refuses both on Windows, and this
+    // keeps that explicit so a future refactor cannot widen it by accident.
+    if trimmed.contains("://") {
+        return Err("URLs are not opened through this command".into());
+    }
+    if !candidate.exists() {
+        return Err(format!("path does not exist: {trimmed}"));
+    }
+    Ok(trimmed)
+}
+
+#[tauri::command]
+fn open_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let target = open_path_verdict(&path)?;
+    open_external_url(target).map_err(|error| {
+        append_launcher_log(&format!("failed to open path {target}: {error}"));
+        error
+    })?;
+    let _ = app; // the handle is kept for future use (e.g. focus after open)
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         append_launcher_log_at, backend_readiness_is_authentic, backend_runtime_temp,
-        dir_is_writable, external_url_is_allowed, next_generation_failures, parse_backend_port,
-        parse_close_to_tray, random_session_secret, readiness_proof, ready_probe_url,
-        supervision_backoff, system_tool, wait_for_process_exit, webview2_data_dir,
-        BackendSupervisor, LAUNCHER_LOG_MAX_BYTES,
+        dir_is_writable, external_url_is_allowed, navigation_is_internal,
+        next_generation_failures, open_path_verdict, parse_backend_port, parse_close_to_tray,
+        random_session_secret, readiness_proof, ready_probe_url, supervision_backoff,
+        system_tool, wait_for_process_exit, webview2_data_dir, BackendSupervisor,
+        LAUNCHER_LOG_MAX_BYTES,
     };
     use std::path::Path;
     use std::time::Duration;
@@ -1939,6 +2124,53 @@ mod tests {
             parse_backend_port(r#"{"launcher_port":17620}"#),
             Some(17620)
         );
+    }
+
+    #[test]
+    fn open_path_refuses_everything_that_is_not_an_existing_absolute_path() {
+        // 空、相对、UNC、URL 一律拒绝。这些值都来自前端一处 `openPath()` 调用，
+        // 而那条调用传的是后端返回的路径字符串 —— 一个都不该被当成"要执行的
+        // 东西"。
+        assert!(open_path_verdict("").is_err());
+        assert!(open_path_verdict("   ").is_err());
+        assert!(open_path_verdict("relative/dir").is_err());
+        assert!(open_path_verdict("file:///C:/Windows").is_err());
+        assert!(open_path_verdict("javascript:alert(1)").is_err());
+    }
+
+    #[test]
+    fn open_path_refuses_unc_even_though_windows_calls_it_absolute() {
+        // 这条测试单独存在的原因是一次假绿：把 UNC 检查删掉后，上面那条
+        // （把 `\\server\share` 和别的一起断言）**仍然通过** —— 因为
+        // `Path::is_absolute()` 在 Windows 上对 `\\server\share` 返回 true，
+        // 后面的 `exists()` 恰好也返回 false。两个守卫重叠，掩盖了被删的那一个。
+        //
+        // 要证明 UNC 检查本身在起作用，必须**单独**断言 `is_absolute()` 为真：
+        // 那样一旦有人删掉 UNC 分支，这条会红，而重叠守卫不会再替它兜底。
+        assert!(
+            Path::new(r"\\server\share").is_absolute(),
+            "precondition changed: the overlap this test exists for is gone"
+        );
+        assert!(open_path_verdict(r"\\server\share").is_err());
+        assert!(open_path_verdict(r"\\127.0.0.1\c$").is_err());
+        assert!(open_path_verdict("//server/share").is_err());
+    }
+
+    #[test]
+    fn open_path_refuses_a_path_that_does_not_exist() {
+        let missing = std::env::temp_dir().join("lunarshroud-definitely-absent-xyz");
+        assert!(!missing.exists());
+        assert!(open_path_verdict(&missing.to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn open_path_accepts_an_existing_absolute_directory() {
+        // 用 TestDir：目录放在测试二进制旁边（受限令牌下 %TEMP% 可能不可写，
+        // AGENTS §6.8），并由 Drop 负责清理 —— 清理失败会留下可见记录。
+        let dir = TestDir::new("open-path");
+        let text = dir.path().to_string_lossy().into_owned();
+        let verdict = open_path_verdict(&text);
+        assert!(verdict.is_ok(), "existing dir rejected: {verdict:?}");
     }
 
     #[test]
@@ -2004,6 +2236,40 @@ mod tests {
         // file:// 能读本机文件；javascript:/data: 更不该交给 ShellExecuteW。
         for scheme in ["file", "javascript", "data", "ms-settings", "vbscript", ""] {
             assert!(!external_url_is_allowed(scheme), "{scheme}");
+        }
+    }
+
+    /// 同窗导航只允许应用自己的源。
+    ///
+    /// Tauri 在**没有** `on_navigation` 处理器时把导航视为允许，所以这条不变
+    /// 量只能靠这里的谓词 + 主窗口上的注册共同保证。纯函数可离线测，注册点是
+    /// 一行 `.on_navigation(...)`（见 `run()`）。
+    #[test]
+    fn only_the_application_origin_may_be_navigated_to_in_window() {
+        use tauri::Url;
+
+        for allowed in [
+            "tauri://localhost/index.html",
+            "http://tauri.localhost/",
+            "http://127.0.0.1:17520/",
+            "http://localhost:5173/",
+            "https://localhost/",
+        ] {
+            assert!(navigation_is_internal(&Url::parse(allowed).unwrap()), "{allowed}");
+        }
+        // 远程页面、协议处理器、以及伪装成子域的地址。
+        for blocked in [
+            "https://evil.example/",
+            "http://127.0.0.1.evil.example/",
+            "https://tauri.localhost.evil.example/",
+            "file:///C:/Windows/win.ini",
+            "ms-settings:privacy",
+            "javascript:alert(1)",
+        ] {
+            assert!(
+                !navigation_is_internal(&Url::parse(blocked).unwrap()),
+                "{blocked}"
+            );
         }
     }
 

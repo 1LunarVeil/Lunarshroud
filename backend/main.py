@@ -15,24 +15,31 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
+from api import agent as agent_api
 from api import api_server_admin as api_server_admin_api
 from api import backups as backups_api
 from api import chat as chat_api
 from api import chat_instances as chat_instances_api
 from api import chats as chats_api
+from api import engines as engines_api
 from api import history as history_api
 from api import instances as instances_api
 from api import knowledge as knowledge_api
 from api import lifecycle as lifecycle_api
+from api import memory as memory_api
 from api import middleware as middleware_api
 from api import models as models_api
 from api import params as params_api
 from api import presets as presets_api
+from api import projects as projects_api
 from api import prompts as prompts_api
 from api import runtimes as runtimes_api
+from api import scheduled as scheduled_api
+from api import skills as skills_api
 from api import static_ui as static_ui_api
 from api import streams as streams_api
 from api import system as system_api
+from api import usage as usage_api
 from config import (
     DATA_DIR,  # noqa: F401 - api/lifecycle.py 经 main 读它
     DEFAULT_CONFIG,
@@ -52,6 +59,8 @@ from core import (
     knowledge_services,  # noqa: F401 - api/lifecycle.py 经 main 停 reaper
     knowledge_store,  # noqa: F401 - api/lifecycle.py 经 main 初始化
     runtime_registry,
+    # api/lifecycle.py 经 ``main`` 启动/停止定时任务守护线程（patch 面不变）。
+    task_runner,  # noqa: F401
     user_backup,  # noqa: F401 - api/lifecycle.py 经 main 应用待恢复备份
 )
 
@@ -69,7 +78,7 @@ from core.server_probe import (
     # 表现为"能力探测预热失败（本轮降级为 schema 标记）"：启动看着正常，只是
     # 参数界面失去"按本机构建裁剪"的能力（2026-10-30 实测）。
     resolve_server_path,  # noqa: F401
-    )
+)
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse
 
@@ -386,11 +395,18 @@ app.include_router(system_api.router)
 app.include_router(params_api.router)
 app.include_router(prompts_api.router)
 app.include_router(knowledge_api.router)
+app.include_router(memory_api.router)
+app.include_router(projects_api.router)
+app.include_router(skills_api.router)
+app.include_router(scheduled_api.router)
 app.include_router(chats_api.router)
 app.include_router(runtimes_api.router)
 app.include_router(backups_api.router)
 app.include_router(instances_api.router)
 app.include_router(chat_api.router)
+app.include_router(agent_api.router)
+app.include_router(engines_api.router)
+app.include_router(usage_api.router)
 app.include_router(chat_instances_api.router)
 app.include_router(streams_api.router)
 # 本地 API 服务的**管理面**（状态/日志/接入片段）。数据面 /v1/* 在

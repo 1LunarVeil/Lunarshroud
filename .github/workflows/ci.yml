@@ -47,24 +47,34 @@ jobs:
       - uses: actions/setup-node@0a44ba7841725637a19e28fa30b79a866c81b0a6 # v4.0.4
         with:
           node-version: '22'
-      - name: Frontend unit tests
+      - name: Install UI dependencies
+        working-directory: ui
         shell: pwsh
         run: |
-          $tests = @(Get-ChildItem frontend/tests -File -Filter '*.test.mjs')
-          if ($tests.Count -eq 0) { throw 'No frontend test files found; refusing a false-green check.' }
-          node --test $tests.FullName
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Write-Host "Ran $($tests.Count) frontend test file(s)."
-      - name: Frontend syntax check
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'npm ci failed in ui/.' }
+      - name: UI typecheck
+        working-directory: ui
         shell: pwsh
         run: |
-          $scripts = @(Get-ChildItem frontend/js -File | Where-Object Extension -in '.js', '.mjs')
-          if ($scripts.Count -eq 0) { throw 'No JavaScript files found; refusing a false-green check.' }
-          foreach ($script in $scripts) {
-            node --check $script.FullName
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-          Write-Host "Checked $($scripts.Count) JavaScript files."
+          npm run typecheck
+          if ($LASTEXITCODE -ne 0) { throw 'TypeScript typecheck failed.' }
+      - name: UI unit tests
+        working-directory: ui
+        shell: pwsh
+        run: |
+          npm test
+          if ($LASTEXITCODE -ne 0) { throw 'UI unit tests failed.' }
+      - name: UI production build
+        working-directory: ui
+        shell: pwsh
+        run: |
+          # The build output is what Tauri embeds and what the backend serves in
+          # the source-run channel. A tree that passes unit tests but fails to
+          # bundle is not a usable artifact, so this is a gate.
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'UI production build failed.' }
+          if (-not (Test-Path dist/index.html)) { throw 'ui/dist/index.html is missing after build.' }
       - name: Browser core-path, accessibility and performance gate
         shell: pwsh
         run: |
@@ -76,10 +86,14 @@ jobs:
           # data/config.json 时默认端口就是 17520，这里显式设一次，让"两边
           # 一致"不再依赖那个默认值。
           $env:LUNARSHROUD_LAUNCHER_PORT = '17520'
-          $backend = Start-Process -FilePath python -ArgumentList '-m', 'uvicorn', 'main:app', '--host', '127.0.0.1', '--port', '17520', '--log-level', 'warning' -WorkingDirectory backend -PassThru
+          $env:LUNARSHROUD_TEST_URL = 'http://127.0.0.1:17520'
+          # tools/dev_backend.py, not a bare uvicorn: it points DATA_DIR at a temp
+          # directory. The browser suite creates conversations and writes rows, and
+          # those must never land in a real user data directory (AGENTS §6.7).
+          $backend = Start-Process -FilePath python -ArgumentList 'tools/dev_backend.py' -PassThru
           try {
             $ready = $false
-            for ($attempt = 0; $attempt -lt 60; $attempt++) {
+            for ($attempt = 0; $attempt -lt 90; $attempt++) {
               try {
                 if ((Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:17520/api/system/health').StatusCode -eq 200) {
                   $ready = $true
@@ -90,28 +104,21 @@ jobs:
               }
             }
             if (-not $ready) { throw 'Backend did not become ready for browser tests.' }
-            # The Node test package lives at the repository root: `frontend/` is
-            # Tauri's frontendDist, and embedding node_modules into the shell is
-            # both a build error and needless payload.
-            npm ci
-            if ($LASTEXITCODE -ne 0) { throw 'npm ci failed.' }
-            # playwright-core 不带浏览器二进制。这里用**项目锁定的** CLI 装它
-            # 自己期望的那个 Chromium revision：`npx playwright install` 会去
-            # 解析最新的 Playwright，装下来的版本与 playwright-core@1.57 要找的
-            # 不一致（实测 npx 装 1248，而锁定的 core 要 1200），门禁仍然起不来。
-            # 也不默认 `channel: msedge`：那要求 runner 预装 Edge，是一条外部
-            # 假定——runner 镜像换版或 Edge 被策略限制时，故障会表现为"页面没
-            # 渲染"，极难定位。测试可用 LUNARSHROUD_BROWSER_CHANNEL=msedge 覆盖。
-            node node_modules/playwright-core/cli.js install chromium
-            if ($LASTEXITCODE -ne 0) { throw 'playwright install failed.' }
-            # 先跑自检探针：它只断言"应用启动并渲染出侧栏"，失败时会把 HTTP 状态、
-            # 页面 DOM 快照、全部 console 输出与失败请求一起打出来。没有这一步时，
-            # 门禁超时只会留下一句 "Timeout 30000ms exceeded"，既看不到 console
-            # 报错也看不到响应体，定位要花掉整轮（2026-11-05 实际发生）。
-            node --test frontend/tests/browser/diagnose.test.mjs
-            if ($LASTEXITCODE -ne 0) { throw 'App did not boot in the browser; see the diagnostic dump above.' }
-            npm run test:browser
-            if ($LASTEXITCODE -ne 0) { throw 'Browser acceptance tests failed.' }
+            Push-Location ui
+            try {
+              # Install the Chromium revision **the pinned @playwright/test expects**.
+              # `npx playwright install` resolves the latest Playwright and downloads
+              # a revision the locked one does not look for (measured: 1248 vs 1200),
+              # so the gate could never start. Do not default to `channel: msedge`:
+              # that requires the runner to ship Edge, and a runner image change then
+              # shows up as "page did not render" rather than "no browser".
+              npx playwright install chromium
+              if ($LASTEXITCODE -ne 0) { throw 'playwright install failed.' }
+              npx playwright test
+              if ($LASTEXITCODE -ne 0) { throw 'Browser acceptance tests failed.' }
+            } finally {
+              Pop-Location
+            }
           } finally {
             if ($backend -and -not $backend.HasExited) { Stop-Process -Id $backend.Id -Force }
           }

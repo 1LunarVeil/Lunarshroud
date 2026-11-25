@@ -78,10 +78,17 @@ BACKEND_CSP = (
     "frame-ancestors 'none'; "
     "form-action 'self'; "
     "script-src 'self'; "
-    # 内联 style 属性是必需的：dashboard/monitor/history/param_editor/presets/
-    # logs/settings 都在运行时写 style="..."。脚本侧没有内联，故不加 unsafe-inline。
+    # 内联 style 属性是必需的：运行时写 style="..." 的地方很多（虚拟化列表的
+    # 行偏移、侧栏宽度、拖拽手柄位置）。脚本侧没有内联，故不加 unsafe-inline。
     "style-src 'self' 'unsafe-inline'; "
     "img-src 'self' data: blob:; "
+    # 字体必须显式放行 `data:`：KaTeX 的个别字体以 base64 data URL 内联进样式表，
+    # 而 `font-src` 未设置时会回退到 `default-src 'self'`，浏览器由此丢弃字体，
+    # 公式改用回退字体渲染 —— 看起来像排版 bug 而不是策略拦截。构建产物里 40 条
+    # @font-face 中只有 2 条是 data URL，其余 38 条是 `assets/*.woff2` 相对文件，
+    # 由 `'self'` 覆盖（2026-11-23 实测）。Tauri 侧那份 CSP 的源是 `asset:`，
+    # 因此另需放行 `asset: https://asset.localhost`。
+    "font-src 'self' data:; "
     "connect-src 'self' ws://127.0.0.1:*; "
     "frame-src 'self' http://127.0.0.1:*"
 )
@@ -191,6 +198,10 @@ def register_middleware(app: FastAPI) -> None:
                 "X-LunarShroud-Dropped-Turns",
                 "X-LunarShroud-Sources",
                 "X-LunarShroud-Knowledge",
+                # Added with the memory feature: the UI reads it to state that the
+                # saved notes were used. §2.31 — a header the frontend reads and
+                # this list omits is `null` in the packaged build only.
+                "X-LunarShroud-Memory",
             }
         ),
     )

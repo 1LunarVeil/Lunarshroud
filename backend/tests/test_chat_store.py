@@ -674,6 +674,36 @@ def test_params_reject_numbers_that_cannot_be_floats(chats):
         )
 
 
+def test_agent_mode_and_web_search_are_persisted_as_booleans(chats):
+    """两个会话级工具开关必须能存住，且必须是真布尔。
+
+    这个缺陷是本轮自己引入又自己抓到的：检查器把 `agent_mode` / `web_search`
+    写进 `params`，而 `PARAM_KEYS` 是**允许列表** —— 不在里面就被静默丢弃，
+    于是"勾上保存、刷新没了"，没有任何报错。
+
+    第二条断言同样重要：`"false"` 在 Python 里为真。一个手改成
+    `"agent_mode": "false"` 的配置会静默打开写文件与命令工具，而这两个键的
+    语义恰好是"要不要把危险工具交给模型" —— 字符串拼写绝不能变成一个授权
+    决定。红-绿：把这两个键从 PARAM_KEYS 删掉，前两条必红。
+    """
+    conversation = chats.create_conversation(title="tools")
+    updated = chats.update_conversation(
+        conversation["id"], {"params": {"agent_mode": True, "web_search": False}}
+    )
+    assert updated["params"]["agent_mode"] is True
+    assert updated["params"]["web_search"] is False
+
+    # Read back through a fresh query: persistence, not just the return value.
+    detail = chats.get_conversation(conversation["id"])
+    assert detail["params"]["agent_mode"] is True
+    assert detail["params"]["web_search"] is False
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        chats.update_conversation(
+            conversation["id"], {"params": {"agent_mode": "false"}}
+        )
+
+
 def test_export_import_round_trip_preserves_tool_messages(chats):
     """导出再导入必须保住 `role="tool"` 与其配对键。
 

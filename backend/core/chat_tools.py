@@ -76,6 +76,16 @@ def resolve_inside(root: Path, candidate: Any) -> Path:
     先 ``resolve(strict=False)`` 再比较前缀：``strict=False`` 让"还不存在的
     文件"也能算出规范路径（read_file 随后自己判断存在性），但 symlink/junction
     在 resolve 时就已展开，所以逃逸会在**真实**路径上被抓到。
+
+    **硬链接无法靠 resolve 防住，必须单独判。** 2026-11-23 安全审计实测：
+    `mklink /H <root>\\report.md <outside>\\secret.txt` 之后，`read_file(root,
+    "report.md")` 读出了 root 之外的内容——硬链接不是一个"链接"，`resolve()`
+    会原样返回 root 内的那个名字，前缀检查自然通过。而读工具**不需要审批**，
+    所以这条等于"授权一个目录，模型就能读任何被硬链接进来的文件"。
+
+    因此这里对**已存在的文件**检查 ``st_nlink > 1`` 并拒绝。这会误伤用户自己
+    在授权目录里手动建的硬链接（罕见），但那个方向的代价是"多拒绝一次"，另一
+    个方向的代价是"静默读走整块磁盘"。fail closed。
     """
     raw = "" if candidate is None else str(candidate).strip()
     if not raw:
@@ -96,6 +106,58 @@ def resolve_inside(root: Path, candidate: Any) -> Path:
     return target
 
 
+def assert_single_link(root: Path, target: Path) -> None:
+    """拒绝一个在授权根内、但存在多个硬链接的文件。
+
+    调用点：``read_file`` / ``grep_search`` 这类**不需要审批**的读路径。写路径
+    不必调用——`_write_atomic` 的 ``os.replace`` 会断开链接，写穿不成立（实测）。
+
+    ``st_nlink`` 只对已存在的文件有意义；不存在的目标交给调用方判断存在性。
+    ``st_nlink`` 在 Windows 上对目录恒为 1，所以这里只判文件。
+    """
+    try:
+        stat_result = target.stat()
+    except OSError:
+        return
+    if not _stat.S_ISREG(stat_result.st_mode):
+        return
+    if stat_result.st_nlink > 1:
+        raise ToolError(
+            "this file has multiple hard links, so its content may live outside the "
+            "authorized folder; refusing to read it"
+        )
+
+
+def sanitize_text(text: str) -> str:
+    """Make a string safe to store as SQLite TEXT and to JSON-encode.
+
+    Two classes of input break the pipeline rather than the reader:
+
+    * **U+0000** — SQLite's `TEXT` cannot hold it; `append_message` raises
+      `ValueError: the query contains a null character`, which aborts the whole
+      agent run with an "internal error" the user cannot act on. A text file with a
+      stray NUL (a truncated log, a mixed-format export) triggers it.
+    * **lone surrogates** — Python strings can hold `\\ud800`, but UTF-8 encoding
+      raises `UnicodeEncodeError`. They reach us when a model emits an escaped
+      surrogate pair or a file is decoded with `surrogateescape`.
+
+    Both are replaced with U+FFFD: the content stays readable and the transcript
+    keeps the fact that *something* was there, which is more useful to the model
+    than a dropped line or a dead run.
+
+    2026-11-23 audit finding L1.
+    """
+    if not text:
+        return text
+    if "\x00" in text:
+        text = text.replace("\x00", "\ufffd")
+    # `encode("utf-8", "replace")` maps lone surrogates to `?`, not U+FFFD, and also
+    # rewrites nothing else — the explicit pass is what keeps the marker consistent.
+    return "".join(
+        "\ufffd" if 0xD800 <= ord(char) <= 0xDFFF else char for char in text
+    )
+
+
 def _read_text(path: Path) -> tuple[str, bool]:
     """读文件，返回 ``(文本, 是否被截断)``。二进制文件明确拒绝。"""
     try:
@@ -112,7 +174,7 @@ def _read_text(path: Path) -> tuple[str, bool]:
         raise ToolError(f"could not read file: {error}") from error
     if b"\x00" in raw[:8192]:
         raise ToolError("refusing to read a binary file")
-    text = raw[:MAX_READ_BYTES].decode("utf-8", "replace")
+    text = sanitize_text(raw[:MAX_READ_BYTES].decode("utf-8", "replace"))
     return text, truncated
 
 
@@ -180,6 +242,9 @@ def _iter_files(root: Path) -> Iterable[Path]:
 def read_file(root: Any, path: Any) -> dict[str, Any]:
     base = _normalize_root(root)
     target = resolve_inside(base, path)
+    # A hard link inside the root can point at a file outside it; `resolve()` cannot see
+    # that, and reads need no approval, so it is checked here.
+    assert_single_link(base, target)
     text, truncated = _read_text(target)
     return {
         "tool": "read_file",
@@ -216,6 +281,11 @@ def file_glob_search(root: Any, pattern: Any, subpath: Any = None) -> dict[str, 
         raise ToolError("search path must be a directory")
     matches: list[str] = []
     for path in _iter_files(start):
+        # Skip files with multiple hard links: their content may live outside the root.
+        try:
+            assert_single_link(base, path)
+        except ToolError:
+            continue
         relative = _safe_relative(base, path)
         if relative is None:
             continue
@@ -253,6 +323,11 @@ def grep_search(root: Any, query: Any, subpath: Any = None, pattern: Any = None)
     for path in _iter_files(start):
         relative = _safe_relative(base, path)
         if relative is None:
+            continue
+        # A hardlinked file inside the root may hold content from outside it.
+        try:
+            assert_single_link(base, path)
+        except ToolError:
             continue
         if pattern and not fnmatch.fnmatch(path.name, str(pattern)):
             continue
@@ -299,3 +374,59 @@ def execute_tool(name: Any, arguments: dict[str, Any] | None, root: Any) -> dict
     if tool == "file_glob_search":
         return file_glob_search(root, args.get("pattern"), args.get("path"))
     return grep_search(root, args.get("query"), args.get("path"), args.get("pattern"))
+
+
+# ---------------------------------------------------------------------------
+# Path verdicts for callers that need to *describe* a call before running it.
+#
+# The agent workbench shows a resolved target in the approval card, which means it
+# needs the sandbox's verdict as data rather than as an exception. These wrap the
+# same primitives used above — one implementation of the boundary, two presentation
+# shapes.
+# ---------------------------------------------------------------------------
+
+
+def path_verdict(root: Any, candidate: Any) -> dict[str, Any]:
+    """Resolve a model-supplied path, returning a verdict instead of raising.
+
+    ``{ok: True, path}`` or ``{ok: False, reason}``. `reason` is a short slug
+    (`outside-root`, `unc-path`, …) so the UI can localize it.
+    """
+    try:
+        base = _normalize_root(root)
+    except ToolError as error:
+        return {"ok": False, "reason": str(error)}
+    raw = "" if candidate is None else str(candidate).strip()
+    if not raw:
+        return {"ok": False, "reason": "empty-path"}
+    if raw.startswith(("\\\\", "//")):
+        return {"ok": False, "reason": "unc-path"}
+    if Path(raw).is_absolute() or (len(raw) > 1 and raw[1] == ":"):
+        return {"ok": False, "reason": "absolute-path"}
+    try:
+        target = resolve_inside(base, raw)
+    except ToolError as error:
+        return {"ok": False, "reason": str(error)}
+    try:
+        relative = target.relative_to(base)
+    except ValueError:
+        return {"ok": False, "reason": "outside-root"}
+    if not str(relative):
+        return {"ok": False, "reason": "is-root"}
+    return {"ok": True, "path": str(target)}
+
+
+def search_root_verdict(root: Any, candidate: Any) -> dict[str, Any]:
+    """Like `path_verdict`, but the root itself is a legal target.
+
+    Search tools default to "the whole authorized folder", which is the common case,
+    not an escape. Reading a directory, by contrast, is meaningless — hence two
+    verdicts instead of one with a flag.
+    """
+    raw = "" if candidate is None else str(candidate).strip()
+    if raw in ("", "."):
+        try:
+            return {"ok": True, "path": str(_normalize_root(root))}
+        except ToolError as error:
+            return {"ok": False, "reason": str(error)}
+    return path_verdict(root, raw)

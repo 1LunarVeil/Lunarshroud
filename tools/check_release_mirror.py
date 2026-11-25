@@ -66,6 +66,13 @@ EXCLUDED_DIR_NAMES = frozenset({
 EXCLUDED_DIR_PREFIXES = (
     "github/",
     "tmp/",                 # 本地调试脚本与截图
+    # PyInstaller 在**仓库根**写出 dist/ 与 build/（backend/backend.spec 的 COLLECT
+    # 输出）。这里以前只排除了 backend/ 下的同名目录，于是本地跑一次
+    # `python -m PyInstaller backend/backend.spec` 就让门禁把 661 个构建产物当成
+    # "应当发布却缺失"，并从 PyInstaller 的 warn/xref 里扫出本机路径与用户名。
+    # AGENTS §2.34 第 4 类：排除规则要按"构建会写出哪些目录"来定。
+    "dist/",
+    "build/",
     "backend/build/",
     "backend/dist/",
     "backend/data/",
@@ -74,6 +81,15 @@ EXCLUDED_DIR_PREFIXES = (
     "backend/_internal/",
     "src-tauri/target/",
     "src-tauri/gen/",
+    # 2.0 前端工程（ui/）。构建产物与本地缓存不进镜像；**源码要进**——公开仓库
+    # 的价值就是 clone 下来能构建。node_modules/ 已由 EXCLUDED_DIR_NAMES 按
+    # 目录名在任意层级排除，这里补上其余只在构建/测试中出现的目录。
+    "ui/dist/",
+    "ui/coverage/",
+    "ui/.vite/",
+    "ui/playwright-report/",
+    "ui/test-results/",
+    "ui/shots/",
     # 便携版打包产物（exe + _internal 的副本与 zip）：与 backend/dist 同类，
     # 属于构建产物而非源码，整目录不参与镜像。
     "release/",
@@ -297,6 +313,13 @@ FORBIDDEN_GLOBS = (
     "*src-tauri/target/*", "src-tauri/target/*",
     "src-tauri/backend/*", "*src-tauri/backend/*",
     "*backend/dist/*", "backend/dist/*", "*backend/build/*", "backend/build/*",
+    # PyInstaller 在**仓库根**写出 `dist/` 与 `build/`（`backend/backend.spec` 的
+    # COLLECT 输出），而这里以前只排除了 `backend/` 下的同名目录。一次本地打包
+    # 就让门禁报 665 处问题：661 条"缺失"（dist 里的文件被当成应当发布的条目）
+    # 加 3 条隐私命中（PyInstaller 的 warn/xref 含本机绝对路径与用户名）。
+    # 这正是 AGENTS §2.34 第 4 类：排除规则要按"构建会写出哪些目录"来定，
+    # 不能按扩展名猜。
+    "dist/*", "build/*",
     "backend/_internal/*", "*backend/_internal/*",
     "data/*",
     # 应用运行时目录与本地 AI 会话：即使它们在镜像里出现也必须判违规。

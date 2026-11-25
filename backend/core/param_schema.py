@@ -132,12 +132,20 @@ class ParamMeta(BaseModel):
     option_labels: dict | None = None  # 枚举值的中文标签（key->中文）
     placeholder: str | None = None     # 输入框占位提示
     help: str = ""                        # 中文说明（必填）
+    # 一句话短描述，显示在控件下方；`help` 是完整说明，默认折叠。
+    #
+    # 为什么需要两个字段：界面此前把整段 `help` 直接铺在每个控件下面，89 个参数
+    # 加起来就是一面文字墙——用户的原话是"描述内容直接暴露展示，界面臃肿浮夸"。
+    # 留空时由 `_derive_summary()` 从 `help` 里取首句兜底，所以新增参数只写
+    # `help` 也不会退化成空白。
+    summary: str = ""
     # 英文本地化与中文写在**同一处定义**里。曾经它们是两份平行字典
     # （PARAM_LABELS_EN / PARAM_HELP_EN），新增参数要改 4 个地方，漏一处
     # 只能靠奇偶性测试兜底（2026-10-27 加 device 参数时确实漏过英文标签）。
     # 现在只有这一处真相：新增参数在这里同时写中英，测试断言两者都非空。
     label_en: str = ""
     help_en: str = ""
+    summary_en: str = ""
     required: bool = False                # 是否必填
     depends_on: dict | None = None     # 联动依赖，如 {"spec_type": "draft-mtp"} 表示仅当 spec_type=draft-mtp 时启用
     depends_on_any: dict | None = None # 多值联动，如 {"spec_type": ["draft-mtp","draft-simple"]} 表示所选值命中任一即启用
@@ -171,15 +179,19 @@ PARAM_DEFINITIONS: list[ParamMeta] = [
         key="model", label="模型文件路径", cli="-m",
         group=ParamGroup.MODEL_BASIC, type="file",
         default="", placeholder="选择或输入 .gguf 文件路径",
-        help="主模型 GGUF 文件路径。可从扫描列表选择，也可手动输入。建议放在 SSD 上以加快加载。",
-        required=True, order=1,
+            help="主模型 GGUF 文件路径。可从扫描列表选择，也可手动输入。建议放在 SSD 上以加快加载。",
+            summary="要加载的 .gguf 文件；放在 SSD 上加载更快。",
+            summary_en="The .gguf to load; an SSD makes loading faster.",
+            required=True, order=1,
     ),
     ParamMeta(
         key="model_dir", label="模型扫描目录",
         group=ParamGroup.MODEL_BASIC, type="dir",
         default="", placeholder="模型根目录",
-        help="启动器会递归扫描此目录下的所有 .gguf 文件并列出（含文件大小和量化类型）。",
-        order=2,
+            help="启动器会递归扫描此目录下的所有 .gguf 文件并列出（含文件大小和量化类型）。",
+            summary="模型库根目录；会递归扫描其中的 .gguf。",
+            summary_en="Model library root; .gguf files inside are scanned recursively.",
+            order=2,
     ),
     ParamMeta(
         key="jinja", label="启用 Jinja 对话模板", cli="--jinja",
@@ -232,6 +244,8 @@ PARAM_DEFINITIONS: list[ParamMeta] = [
         group=ParamGroup.PERFORMANCE, type="number",
         default=8192, min=512, max=1048576, step=512, unit="tokens",
         help="KV 缓存的上下文 token 数。值越大支持越长的对话，但显存占用线性增长。8GB 显存 + Q4 模型 + 全 GPU 模式建议 ≤8192；16K 以上需用混合模式（降低 -ngl）。",
+        summary="对话能有多长（token）。越大越占显存。",
+        summary_en="How long a conversation can be, in tokens. Larger uses more VRAM.",
         order=1,
     ),
     ParamMeta(
@@ -279,8 +293,10 @@ PARAM_DEFINITIONS: list[ParamMeta] = [
         key="threads", label="CPU 线程数", cli="-t",
         group=ParamGroup.PERFORMANCE, type="number",
         default=-1, min=-1, max=256, step=1, skip_when_default=True,
-        help="生成阶段的 CPU 线程数。-1 = 使用全部逻辑核心。建议设为物理核心数，超线程通常不带来增益。",
-        order=3,
+            help="生成阶段的 CPU 线程数。-1 = 使用全部逻辑核心。建议设为物理核心数，超线程通常不带来增益。",
+            summary="生成用几个 CPU 线程；建议物理核心数。",
+            summary_en="CPU threads for generation; physical core count is usually best.",
+            order=3,
     ),
     ParamMeta(
         key="threads_batch", label="批处理线程数", cli="-tb",
@@ -293,8 +309,10 @@ PARAM_DEFINITIONS: list[ParamMeta] = [
         key="batch_size", label="逻辑批大小", cli="-b",
         group=ParamGroup.PERFORMANCE, type="number",
         default=2048, min=1, max=8192, step=64, unit="tokens", skip_when_default=True,
-        help="逻辑最大批处理大小（prompt 处理时的 token 数）。值越大 prompt 处理越快但显存占用越高。8GB 显存建议 2048，16GB+ 可试 4096。",
-        order=5,
+            help="逻辑最大批处理大小（prompt 处理时的 token 数）。值越大 prompt 处理越快但显存占用越高。8GB 显存建议 2048，16GB+ 可试 4096。",
+            summary="prompt 处理批量；越大越快也越占显存。",
+            summary_en="Prompt batch size; larger is faster but uses more VRAM.",
+            order=5,
     ),
     ParamMeta(
         key="ubatch_size", label="物理批大小", cli="-ub",
@@ -307,8 +325,10 @@ PARAM_DEFINITIONS: list[ParamMeta] = [
         key="parallel", label="最大并发预测", cli="-np",
         group=ParamGroup.PERFORMANCE, type="number",
         default=1, min=1, max=64, step=1,
-        help="最大并发预测/同时处理的请求数（即 slot 数）。多用户访问时调高；单用户保持 1 以省显存。每个 slot 独占一份上下文。",
-        order=7,
+            help="最大并发预测/同时处理的请求数（即 slot 数）。多用户访问时调高；单用户保持 1 以省显存。每个 slot 独占一份上下文。",
+            summary="同时处理的请求数；单用户保持 1。",
+            summary_en="Concurrent request slots; keep 1 for a single user.",
+            order=7,
     ),
     ParamMeta(
         key="flash_attn", label="Flash Attention", cli="-fa",
@@ -316,8 +336,10 @@ PARAM_DEFINITIONS: list[ParamMeta] = [
         default="on",
         options=["on", "off", "auto"],
         option_labels={"on": "强制开启（推荐）", "off": "关闭", "auto": "自动判断"},
-        help="启用 Flash Attention。on = 强制开启（显存占用更少、长序列更快）；off = 关闭；auto = 自动判断。",
-        order=8,
+            help="启用 Flash Attention。on = 强制开启（显存占用更少、长序列更快）；off = 关闭；auto = 自动判断。",
+            summary="省显存、长序列更快；通常保持开启。",
+            summary_en="Saves VRAM and speeds up long sequences; normally leave on.",
+            order=8,
     ),
     # --- 上下文检查点 / 缓存：取自 llama.cpp build 10960 的 --help（旧构建同样支持）---
     ParamMeta(
@@ -906,8 +928,10 @@ PARAM_DEFINITIONS: list[ParamMeta] = [
         key="mmap", label="内存映射", cli="--mmap",
         group=ParamGroup.ADVANCED, type="switch",
         default=True, cli_reverse=True,  # True 输出 --mmap（默认省略），False 输出 --no-mmap
-        help="内存映射模型文件。开启时加载更快、内存占用更少；关闭时直接读入内存（配合 --mlock 使用更稳定）。",
-        order=2,
+            help="内存映射模型文件。开启时加载更快、内存占用更少；关闭时直接读入内存（配合 --mlock 使用更稳定）。",
+            summary="映射模型文件而非整份读入内存；通常开启。",
+            summary_en="Map the model file instead of reading it all in; usually on.",
+            order=2,
     ),
     ParamMeta(
         key="cache_type_k", label="K 缓存类型", cli="-ctk",
@@ -1597,6 +1621,31 @@ def upstream_options_for(meta: ParamMeta, probe: ServerProbe | None) -> list[str
     return None
 
 
+def _derive_summary(help_text: str, limit: int = 60) -> str:
+    """First sentence of `help`, for the one-line description under a control.
+
+    Deterministic on purpose: the alternative is hand-writing 89 pairs of short
+    descriptions, and a hand-written set drifts the moment someone edits `help`.
+    Hand-written `summary` values win when present; this only fills the gaps, so a
+    new parameter that only declares `help` still gets a usable short line instead
+    of an empty one.
+
+    The cut is at the first sentence terminator (`。`, `. `, `！`, `？`) so the
+    result reads as a phrase rather than a mid-word fragment. If there is no
+    terminator the text is truncated at `limit` with an ellipsis.
+    """
+    text = (help_text or "").strip()
+    if not text:
+        return ""
+    for marker in ("。", "！", "？", ". ", "! ", "? "):
+        index = text.find(marker)
+        if 0 < index < limit:
+            return text[: index + len(marker)].strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
 def get_schema_for_frontend(exe_path: str | None = None) -> dict:
     """返回前端可消费的完整 schema（含分组信息、参数列表及中英文文案）。
 
@@ -1627,8 +1676,12 @@ def get_schema_for_frontend(exe_path: str | None = None) -> dict:
                 "options": p.options, "option_labels": p.option_labels,
                 "option_labels_en": OPTION_LABELS_EN.get(p.key),
                 "placeholder": p.placeholder, "help": p.help,
+                # Short line for the collapsed row; full text stays in `help`.
+                "summary": p.summary or _derive_summary(p.help),
                 "label_en": p.label_en or PARAM_LABELS_EN.get(p.key, p.label),
                 "help_en": p.help_en or PARAM_HELP_EN.get(p.key, p.help),
+                "summary_en": p.summary_en
+                or _derive_summary(p.help_en or PARAM_HELP_EN.get(p.key, "")),
                 "required": p.required, "depends_on": p.depends_on,
                 "depends_on_any": p.depends_on_any,
                 "depends_on_nonempty": p.depends_on_nonempty,

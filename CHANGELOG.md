@@ -2,6 +2,162 @@
 
 Notable changes follow the [Keep a Changelog](https://keepachangelog.com/) structure.
 
+## [2.1.0] - 2026-11-25
+
+2.0.1 made the app usable; 2.1 makes it a workspace. A hands-on review found that the
+shell was right and the features behind it were mostly missing. Eleven reported items,
+all confirmed.
+
+### Fixed
+
+- **Saving the default model directory always failed** ("不支持的配置项"). The sheet
+  sent `model_directory`; the backend key is `default_model_dir`, and `update_config`
+  rejects unknown keys outright. Four readers shared the same invented name, so a
+  configured directory also rendered as "not set" everywhere. Fixed in all five
+  places, and `AppConfig` lost its `[key: string]: unknown` index signature — that
+  line is why `tsc` had no opinion about the typo.
+- **The status bar's RAM chip and the monitor's GPU columns were permanently "—".**
+  `SystemOverview` declared `memory_used_mb` (the route sends `_gb`); `GpuInfo`
+  declared `utilization_percent` / `temperature_c` (the route sends `utilization` /
+  `temperature`). Three bidirectional contract gates now pin all of them.
+- **The system prompt was silently discarded**: the chat page wrote
+  `params.system_prompt` while `chat_store.PARAM_KEYS` allows only `system`.
+- **"Disable thinking" did nothing**: `thinkingTemplateArgs` existed and was unit
+  tested but had **no caller**, so the inspector's choice never reached the request.
+- **`chat_reasoning` never took effect** (`ChatThread` hard-coded `"auto"`).
+- **`navigate('settings')` was a no-op** and **`navigate('runtimes')` crashed the
+  window** (no such route).
+
+### Added
+
+- **Ten settings sections** (was five), including **System & engines**: live
+  CPU/RAM/VRAM, data-directory size and free space, llama-server runtime
+  registration and probing, and an external-engine registry with probing.
+- **Chat inspector** on the right: instance, knowledge base, system prompt, thinking
+  mode, sampling, tool folder, plus per-conversation Agent mode and web-search
+  toggles. The store state and CSS tokens had been there since 2.0 with no consumer.
+- **Per-message statistics** (`tokens · tok/s · elapsed`), restored from 1.0.
+- **Write and command tools in the chat transcript** (7 tools total), each approved
+  individually, with a preview endpoint that resolves the target path or the full
+  argv + cwd + risk level before the user decides.
+- **Optional web search** — the only outbound feature, gated three ways (global
+  switch + configured endpoint + per-conversation tick), loopback by default, no
+  proxy, no redirects, every call approved.
+- **Usage statistics**: `/api/usage/summary` and a Usage section, aggregated from the
+  token counts already stored per message.
+- **Relocatable data directory**: `portable.txt` keeps a package's data beside the
+  extracted folder; a migration route copies to another drive with per-file
+  verification and keeps the source (delete the pointer file to roll back).
+- **Chat personalisation restored**: nicknames, uploaded image avatars, and a chat
+  background with opacity and blur. The backend keys had never been removed.
+- **Knowledge-base settings**: all nine retrieval fields editable per base, plus
+  resident-service status and a manual unload.
+- `open_path` Tauri command for "open the data/logs folder" (absolute, existing,
+  non-UNC, non-URL only; `ShellExecuteW`, never a bare `explorer.exe`).
+
+### Changed
+
+- "可观测性" is now "日志", matching what the page actually shows.
+- Toolbar re-laid out (the old version had two greedy columns and a wide dead zone).
+- `docs/OFFLINE.md` and `docs/AGENT_WORKBENCH.md` now describe the web-search
+  exception instead of claiming there is no network tool at all.
+
+### Verified
+
+`pytest` 1386 passed; `ruff` clean; `vitest` 153; Playwright 15 against a real backend
+(including every settings section and a real save round trip); `cargo test` 28;
+offline/mirror gates CLEAN (321 files); real-model chat e2e 18/18.
+
+### Known gaps
+
+Artifacts are unsigned. No 8-hour soak, no multi-hardware matrix. `open_path` has not
+been clicked in a packaged build. No full Mimosa scan conclusion exists for this round
+(its SQL-injection false positive on `agent_tools.py`, documented in `AGENTS.md`,
+blocked several edits). Voice input, the built-in browser and computer control were
+deliberately not attempted — each needs its own safety model.
+
+## [2.0.0] - 2026-11-23
+
+The frontend was rebuilt from scratch as a React 19 + TypeScript + Vite + Tailwind 4
+application. This is not a restyle: the 1.0 interface was 43 hand-written ES modules
+(27k lines, `chat.js` alone at 4,793) with no component reuse, no type checking and no
+code splitting, which is why its polish rounds kept landing on the surface while its
+feature rounds kept losing capability.
+
+### Added
+
+- **Agent workbench.** A server-side agent loop with six tools (`read_file`,
+  `file_glob_search`, `grep_search`, `write_file`, `edit_file`, `run_command`), driven by
+  a per-call approval gate. Reads run without a prompt through the same path sandbox;
+  writes and commands always ask, and the card shows the resolved path or the full argv,
+  the working directory, a diff for edits and a risk level. Budgets: 24 turns, 900 s,
+  60 tool calls, 3 repeats of an identical call — each reported, never a hang.
+- **External inference engines.** Register a vLLM or SGLang server you already run
+  (loopback by default); the launcher probes it, routes chat through it and reports its
+  capabilities. Token counts on such an engine are labelled **estimates**, because a
+  generic OpenAI server has no `/tokenize`. See [`docs/ENGINES.md`](docs/ENGINES.md) —
+  vLLM does not support Windows natively, so the guide gives the WSL2 recipe rather than
+  pretending a one-click install exists.
+- A design token layer (`ui/src/styles/tokens.css`) as the single source of colour, with
+  measured WCAG AA pairs in both themes and a gate that forbids literals elsewhere.
+- A visual acceptance matrix: 10 pages × 5 widths × 2 themes, plus the four states a
+  developer machine cannot reach (no GPU, light theme, slow first paint, empty data).
+- Per-page code splitting and per-language syntax highlighting. The bundled output is
+  5.4 MB; a `shiki` barrel import had produced 14 MB.
+
+### Changed
+
+- **All nine pages rebuilt** on the new design system: chat, agent, dashboard, model
+  library (virtualized), parameter editor, presets, knowledge, local API server,
+  observability, guide.
+- Behaviour was **ported, not re-invented**: the SSE parser, tool path sandbox,
+  attachment classification, conversation import/export and the 1,355-key bilingual
+  dictionary moved to TypeScript with their tests, so no capability was lost in the
+  rewrite.
+- `frontendDist` is now `../ui/dist`; the source-run channel serves the same build.
+- Icon-only buttons now carry accessible names; disabled buttons no longer dim by
+  opacity, which had dropped a label to 3.1:1.
+
+### Removed
+
+- **`frontend/`** — the 1.0 vanilla-JS application, superseded by `ui/`.
+- `backend/tests/test_design_tokens.py` — replaced by `test_ui_tokens.py`, which scans
+  the new tree. Every check it performed is still performed, plus three new ones.
+
+### Fixed
+
+- A write or command could run without approval if the gate were bypassed; a test now
+  fails if the approval branch is ever disabled (verified by injection).
+- A test that measured nothing: the first no-shell test asserted an exit code, which is
+  identical with `shell=True` on Windows because CPython quotes a list argv correctly.
+  The invariant is now pinned at the call site and goes red when a shell is introduced.
+- `text-[var(--text-sm)]` compiles to `color:` in Tailwind 4 and silently lost the font
+  size; a white-on-white button (1.01:1) shipped until axe caught it. 183 call sites
+  corrected, and a gate now forbids the pattern.
+- Conversation sorting degenerated to insertion order: the backend sends `updated_at` as
+  epoch seconds and the port called `Number()` on what it assumed was an ISO string.
+- The log pane's empty state was invisible in the light theme (1.03:1) and
+  `--code-gutter` was below AA (3.56:1).
+- First run showed a red error triangle for a state that is normal, and its checklist
+  steps were mislabelled.
+
+### Known limits at this version
+
+- **8-hour soak and the multi-hardware matrix are still not done.** A 4-hour real-model
+  soak passed. This release does not claim production-grade stability.
+- Artifacts are **unsigned**, so SmartScreen will warn on first run.
+- Only Windows 10/11 is supported and tested.
+- vLLM and SGLang cannot run natively on Windows; external engines require WSL2 or
+  another machine, and the launcher does not install them.
+- `run_command` executes on the host. It never uses a shell and always requires
+  approval, but a user who approves a destructive command is trusting that command, not
+  relying on a sandbox.
+- `playwright`'s keyboard audit reports `NO-FOCUS` on the sidebar rows because it crops
+  tight to the element box while the ring is drawn outside it; full-window captures show
+  the ring. Recorded as a tool limitation rather than a passed check.
+
+---
+
 Before `1.0.0` this file accumulated five separate `[Unreleased]` sections from
 2026-10-21 through 2026-11-03, three of which were dated *before* the `1.0.0`
 entry and sorted after it. Nothing was ever collapsed into a released version,

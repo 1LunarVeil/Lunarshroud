@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import secrets
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -372,3 +373,81 @@ def test_recipes_never_embed_a_key_literal(monkeypatch, tmp_path):
     text = repr(payload)
     assert OTHER_KEY not in text
     assert api_server_admin.KEY_ENV_VAR in text
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-23 engine audit: gateway lifecycle and body budget.
+# ---------------------------------------------------------------------------
+
+
+def test_a_busy_port_is_reported_instead_of_killing_the_process(monkeypatch, tmp_path):
+    """H1: uvicorn's `serve()` calls `sys.exit(3)` on a bind failure.
+
+    `SystemExit` is a `BaseException`, so neither the lifespan's `except Exception`
+    nor a route handler caught it: holding the configured port took the **whole
+    backend down**, both at startup and via `POST /api/api-server/restart`. The
+    manager now pre-binds the socket, turning the failure into a reportable `error`.
+    """
+    import socket
+
+    from api import gateway
+
+    _use_config(monkeypatch, tmp_path, api_server_enabled=True, api_server_key="")
+
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.bind(("127.0.0.1", 0))
+    holder.listen(1)
+    port = holder.getsockname()[1]
+    try:
+        manager = gateway.GatewayManager()
+        # Reaching the assertion at all is the point: before the fix this raised
+        # SystemExit(3) and took the test process with it.
+        asyncio.run(manager.start(port))
+        assert manager.running is False
+        assert "could not bind" in manager.error
+        asyncio.run(manager.stop())
+    finally:
+        holder.close()
+
+
+def test_the_gateway_refuses_an_oversized_body(monkeypatch, tmp_path):
+    """F6: the data plane had no body limit at all.
+
+    A 10 MB body was fully parsed, and a 10-million-character `model` string was
+    stored verbatim in the 200-entry request log and served by every
+    `GET /api/api-server/logs` poll.
+    """
+    from api import gateway
+
+    _use_config(monkeypatch, tmp_path, api_server_enabled=True, api_server_key="")
+    client = TestClient(gateway.create_gateway_app())
+
+    oversized = {
+        "model": "m",
+        "messages": [
+            {"role": "user", "content": "x" * (gateway.GATEWAY_MAX_BODY_BYTES + 1024)}
+        ],
+    }
+    response = client.post("/v1/chat/completions", json=oversized)
+    assert response.status_code == 413
+    assert "too large" in response.text
+
+
+def test_the_request_log_bounds_attacker_controlled_fields(monkeypatch, tmp_path):
+    """F6: `model` is echoed from the request body into a polled log."""
+    from api import gateway
+
+    _use_config(monkeypatch, tmp_path, api_server_enabled=True, api_server_key="")
+    gateway.record_request(
+        time.time(),
+        method="POST",
+        path="/v1/chat/completions",
+        status=200,
+        model="m" * 1_000_000,
+        stream=False,
+        error="e" * 1_000_000,
+    )
+    entry = gateway.REQUEST_LOG.snapshot()[-1]
+    assert len(entry["model"]) <= gateway.LOG_FIELD_CHARS
+    assert len(entry["error"]) <= gateway.LOG_FIELD_CHARS
+    assert len(entry["path"]) <= gateway.LOG_FIELD_CHARS

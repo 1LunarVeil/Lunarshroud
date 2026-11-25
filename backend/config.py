@@ -88,6 +88,80 @@ def _safe_temp_dir() -> Path | None:
         return None
 
 
+DATA_LOCATION_FILE = "data-location.txt"
+PORTABLE_MARKER = "portable.txt"
+ENV_DATA_DIR = "LUNARSHROUD_DATA_DIR"
+
+
+def _app_dir() -> Path:
+    """Directory the launcher/backend executable lives in.
+
+    In frozen mode this is the extracted portable folder; in source mode it is
+    the repository root. Used for the relocation pointer and the portability
+    marker, both of which must be found *before* any of the fallbacks.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def _read_location_pointer(app_dir: Path) -> Path | None:
+    """Read `<app>/data-location.txt` (one absolute path, optional BOM).
+
+    Written by the migration route. A pointer that is unreadable or not absolute
+    is ignored rather than obeyed: this file lives next to a user-writable exe, so
+    it is exactly the kind of input an attacker could plant. Obeying it would let
+    a planted file redirect the whole data directory — with the databases, the
+    API key and the chat history — into a directory of someone else's choosing.
+    Only an absolute, writable path is accepted, and the write probe runs on it
+    like every other candidate.
+    """
+    pointer = app_dir / DATA_LOCATION_FILE
+    try:
+        text = pointer.read_text(encoding="utf-8-sig").strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    candidate = Path(text)
+    if not candidate.is_absolute():
+        LOGGER.warning(
+            "%s is not an absolute path; ignoring it (%s)", DATA_LOCATION_FILE, text
+        )
+        return None
+    return candidate
+
+
+def _portable_data_dir(app_dir: Path) -> Path | None:
+    """`<app>/data` **only when** the package carries the portable marker.
+
+    The marker is `portable.txt`, shipped inside the portable zip next to the
+    launcher. The zip never contains `data/` (§2.34 excludes build output), so a
+    fresh extraction has nothing to detect without the marker.
+
+    **Two places are searched, and that is the point.** In a frozen build the
+    backend lives at `<extract>/backend/backend.exe`, so *its* `_app_dir()` is
+    `<extract>/backend` while the marker sits at `<extract>/portable.txt`. An
+    earlier version only looked beside `backend.exe` and therefore never found it:
+    the shell (which checks both levels) put data in `<extract>/data`, the backend
+    silently kept using `%LOCALAPPDATA%`, and the two sides disagreed about which
+    `config.json` was live. Measured 2026-11-25 on the first real portable launch:
+    `<extract>/data/` existed but was empty while the backend served the previous
+    install's data.
+
+    **The marker is the only trigger; an existing `<app>/data` is deliberately not
+    one.** A source checkout always has `<repo>/data` (the dev data directory), so
+    "the directory exists" would make every developer's tree look like a portable
+    install — measured 2026-11-24, it made `_frozen_data_dir()` return the
+    repository's data directory in tests that expected the %APPDATA% fallback.
+    """
+    candidates = (app_dir, app_dir.parent)
+    for candidate in candidates:
+        if (candidate / PORTABLE_MARKER).is_file():
+            return candidate / "data"
+    return None
+
+
 def _frozen_data_dir() -> Path:
     """选一个真正可写的用户数据目录，而不是盲目信任 %APPDATA%。
 
@@ -97,8 +171,29 @@ def _frozen_data_dir() -> Path:
     里创建日志/历史库失败，uvicorn 以 exit 3 退出，界面上却只剩“后端进程
     启动失败”，用户和我们都拿不到原因。按优先级探测可写性，最后退回 exe
     同目录/系统临时目录，保证后端至少能起来。
+
+    2026-11-24 起多了三条**用户可控**的前置来源，顺序是：环境变量、
+    迁移指针、便携标记。它们都在 %APPDATA% 之前，因为用户显式表达过
+    “数据要放这里”；但每一个都必须**实测可写**才生效，不可写就落到既有
+    候选链 —— §2.16 的保证不因此倒退。
     """
+    app_dir = _app_dir()
     candidates: list[Path] = []
+
+    override = os.environ.get(ENV_DATA_DIR, "").strip()
+    if override and Path(override).is_absolute():
+        candidates.append(Path(override))
+    elif override:
+        LOGGER.warning("%s is not absolute and was ignored: %r", ENV_DATA_DIR, override)
+
+    pointer = _read_location_pointer(app_dir)
+    if pointer is not None:
+        candidates.append(pointer)
+
+    portable = _portable_data_dir(app_dir)
+    if portable is not None:
+        candidates.append(portable)
+
     appdata = os.environ.get("APPDATA")
     local = os.environ.get("LOCALAPPDATA")
     home = os.path.expanduser("~")
@@ -108,20 +203,25 @@ def _frozen_data_dir() -> Path:
         candidates.append(Path(local) / "LunarShroud")
     if home and home != "~":
         candidates.append(Path(home) / "LunarShroud")
-    candidates.append(Path(sys.executable).resolve().parent / "data")
+    candidates.append(app_dir / "data")
     temp = _safe_temp_dir()
     if temp is not None:
         candidates.append(temp / "LunarShroud")
-    for candidate in candidates:
+    for index, candidate in enumerate(candidates):
         if _dir_is_writable(candidate):
+            # Seed only into an explicit override/pointer/portable directory that
+            # ended up different from the historical one — the old behaviour of
+            # copying config.json between %APPDATA% and a fallback stays intact.
             preferred = Path(appdata) / "LunarShroud" if appdata else None
-            if preferred is not None and candidate != preferred:
+            if preferred is not None and candidate != preferred and index >= 3:
                 LOGGER.warning(
                     "preferred user data dir %s is not writable; using %s",
                     preferred,
                     candidate,
                 )
                 _seed_fallback_data_dir(preferred, candidate)
+            elif index < 3:
+                LOGGER.info("data directory overridden to %s", candidate)
             return candidate
     # 走到这里说明连 exe 同目录都不可写。临时目录也可能拿不到（见
     # `_safe_temp_dir`），此时返回 exe 旁的 `data`：它多半也不可写，
@@ -147,7 +247,17 @@ else:
     # ── 正常 Python 开发模式 ──
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
     BACKEND_DIR = PROJECT_ROOT / "backend"
-    FRONTEND_DIR = PROJECT_ROOT / "frontend"
+    # 2.0 的前端是带构建步骤的 React 工程，构建产物在 ui/dist。
+    #
+    # `LUNARSHROUD_FRONTEND_DIR` 可覆盖（例如只用 Vite dev server、或要指向别的
+    # 构建产物）。没有回退目录：1.0 的 `frontend/` 已在 2.0 中移除，指一个不存在
+    # 的目录只会让 `resolve_frontend_file` 静默返回 404，而启动器看起来"没有界面"
+    # 却没有任何错误信息。所以未构建时**明确报告**该跑哪条命令。
+    _env_frontend = os.environ.get("LUNARSHROUD_FRONTEND_DIR", "").strip()
+    if _env_frontend:
+        FRONTEND_DIR = Path(_env_frontend).expanduser().resolve()
+    else:
+        FRONTEND_DIR = PROJECT_ROOT / "ui" / "dist"
     DATA_DIR = PROJECT_ROOT / "data"
 
 # 数据子目录（运行时自动创建）
@@ -245,7 +355,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "api_server_key": "",
     # 是否把每个经过网关的请求记进请求日志（内存环形缓冲，不落盘）。
     "api_server_log_requests": True,
-}
+    # ---------- 可选联网搜索 ----------
+    #
+    # 本产品默认离线（docs/OFFLINE.md 是产品契约）。这是**唯一**一处主动出站，
+    # 所以它必须同时满足"用户显式开启"+"用户填了端点"两个条件，缺一个就什么
+    # 都不做——半个连接好的表单不该悄悄开始把用户的问题发出去。
+    #
+    # 端点由用户提供，代码里没有内置搜索服务：这样"我的查询去了哪里"永远有
+    # 一个看得见的答案。工具本身在对话里逐次批准，批准条会显示查询词。
+    "web_search_enabled": False,
+    "web_search_endpoint": "",
+    # 单次返回条数与超时。条数同时是消息体积的上界（每条 snippet 有上限），
+    # 超时短一点：搜索是对话中的一步，卡 30 秒的体验比"这次没搜到"更差。
+    "web_search_max_results": 5,
+    "web_search_timeout_seconds": 10,}
 
 # 这些字段的唯一约束是长度。上限是防御性的 —— 再长的名字在气泡里也放不下。
 CHAT_IDENTITY_LIMITS = {
@@ -504,6 +627,31 @@ def validate_config(cfg: dict[str, Any], *, repair: bool = False) -> dict[str, A
         _is_one_of(candidate.get("chat_reasoning"), {"auto", "expand", "collapse"}),
         "chat_reasoning must be 'auto', 'expand' or 'collapse'",
     )
+    # 联网搜索：布尔 + 短字符串 + 两个数值。端点本身在**使用时**由
+    # `web_search.validate_endpoint` 再做一次完整校验（httpx 解析、回环策略），
+    # 这里只保证形状合法——配置可以手工编辑，形状检查挡住的是"类型撒谎"。
+    check(
+        "web_search_enabled",
+        isinstance(candidate.get("web_search_enabled"), bool),
+        "web_search_enabled must be a boolean",
+    )
+    endpoint = candidate.get("web_search_endpoint", "")
+    if not isinstance(endpoint, str):
+        reject("web_search_endpoint", "web_search_endpoint must be a string")
+    elif len(endpoint) > 2048:
+        reject("web_search_endpoint", "web_search_endpoint must be at most 2048 characters")
+    elif any(ch in endpoint for ch in ("\x00", "\r", "\n")):
+        reject("web_search_endpoint", "web_search_endpoint must not contain control characters")
+    results = candidate.get("web_search_max_results", 5)
+    if isinstance(results, bool) or not _is_integer(results):
+        reject("web_search_max_results", "web_search_max_results must be an integer")
+    elif not (1 <= results <= 10):
+        reject("web_search_max_results", "web_search_max_results must be within 1-10")
+    timeout = candidate.get("web_search_timeout_seconds", 10)
+    if isinstance(timeout, bool) or not _is_integer(timeout):
+        reject("web_search_timeout_seconds", "web_search_timeout_seconds must be an integer")
+    elif not (1 <= timeout <= 120):
+        reject("web_search_timeout_seconds", "web_search_timeout_seconds must be within 1-120")
     # 显示身份：只校验类型与长度。控制字符必须拒绝——它们能把名字渲染成
     # 不可见内容（U+202E 之类还能把整行视觉顺序反转），而这个名字会被写进
     # 聊天记录并随导出外发。

@@ -1,6 +1,6 @@
 [package]
 name = "lunarshroud"
-version = "1.0.0"
+version = "2.1.0"
 description = "LunarShroud - 本地 llama.cpp 聊天与运行时管理"
 authors = ["LunarShroud contributors"]
 license = "MIT"

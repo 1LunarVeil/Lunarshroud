@@ -9,12 +9,12 @@ parameter editing, presets, multi-instance management, live logs, resource
 monitoring, launch history, a native streaming Chat (with a llama-server WebUI
 fallback), a local knowledge base / RAG, local backup and a tray lifecycle.
 
-> Current version: `1.0.0`. The **only release channel is the portable zip**
-> (`LunarShroud-1.0.0-portable-x64.zip`, unzip and run); no installer ships, and
+> Current version: `2.1.0`. The **only release channel is the portable zip**
+> (`LunarShroud-2.1.0-portable-x64.zip`, unzip and run); no installer ships, and
 > none is built. Artifacts are **not code-signed**; verify the SHA-256 from
 > the release page before running. See [docs/RELEASE.md](docs/RELEASE.md).
 >
-> Positioning: `1.0.0` means **feature-complete and usable daily**, not an
+> Positioning: `2.1.0` means **feature-complete and usable daily**, not an
 > unqualified "production-grade stable". The **8-hour soak and the
 > multi-hardware matrix are not done** (a 4-hour real-model soak passed), and
 > the unsigned package still triggers SmartScreen's unknown-publisher prompt.
@@ -45,20 +45,28 @@ fallback), a local knowledge base / RAG, local backup and a tray lifecycle.
   stop/regenerate, message editing and branching, context usage, local text
   attachments, prompt library, conversation search, Markdown export; the WebUI
   is available as a fallback.
-- **Two-view chat inspector:** `Configuration` (instance, knowledge base, system
-  prompt, sampling, reasoning, context) and `Integrations` (agent and tool
-  status, session-level tool-root authorization, resident embedding/rerank/OCR
-  services, local API gateway). Both resizable.
 - **One-click stop** next to the model capsule in the title bar — no need to
   switch to the dashboard.
 - **Local API gateway:** an OpenAI-compatible server on its own port with an
   on/off switch, port and Bearer key, origin allow-listing, and live request
   logs you can export.
-- **Settings gained `Hardware` and `Developer` categories:** the former shows
-  CPU/memory/GPU/VRAM/temperature and GPU processes, the latter shows version,
-  platform, data and log paths, and runtime probe status.
+- **Eleven settings sections:** General / Appearance / Chat / **System & engines**
+  (live CPU/memory/VRAM and data-directory size, llama-server runtime
+  registration and probing, external engine registry and probing) / Server &
+  ports / Local API server / Scheduled tasks / Usage / Data (relocate and back
+  up) / Developer / About.
+- **Chat inspector** on the right: instance, knowledge base, system prompt,
+  thinking mode, sampling, tool folder, plus per-conversation Agent mode and web
+  search toggles.
+- **Per-message statistics:** tokens · tok/s · elapsed under every reply.
+- **Optional web search**, off by default: needs the global switch, an endpoint
+  you supply, and a per-conversation tick — and every search is approved
+  individually.
 - **Local backup / restore** for config, presets, history and chats (including
   attachments and prompts): SHA-256 manifest, restore applied on next startup.
+- **Relocatable data directory:** a portable package keeps data beside the
+  extracted folder, and the move tool copies to another drive (the old folder is
+  kept; deleting the pointer rolls back).
 - **Tray icon**, optional close-to-tray, explicit quit, and a Ctrl+K command
   palette.
 
@@ -220,10 +228,10 @@ update the desktop shortcut:
 
 ```text
 backend/        FastAPI API, process management, storage and monitoring
-frontend/       Plain-JavaScript UI
+ui/             React 19 + TypeScript frontend (build output ui/dist is embedded by Tauri)
 src-tauri/      Tauri main process, session handshake and Windows Job Object
 backend/tests/  Backend unit and API integration tests
-frontend/tests/ Frontend runtime unit tests
+ui/tests/       Frontend unit tests (vitest) and browser acceptance (Playwright)
 docs/           Architecture, build, release and security notes
 ```
 
@@ -285,7 +293,7 @@ Documentation map: [docs/README.md](docs/README.md).
   exceeding it trims the oldest diagnostic records without touching chats or
   presets.
 - A 4-hour real-model soak passed; the **8-hour soak and the multi-hardware
-  matrix are not done**, so `1.0.0` does not claim "production-grade stable".
+  matrix are not done**, so `2.0.0` does not claim "production-grade stable".
   Both are disclosed before release.
 
 ## Contributing and license
@@ -320,7 +328,7 @@ The design tokens, spacing scale, hierarchy and contrast rules follow the
 
 That plugin supplies **rules and method** (tokens first, contrast thresholds, a
 visual-hierarchy checklist), not a runtime dependency, and it is not part of the
-shipped artifacts. The concrete implementation is in `frontend/css/tokens.css`
+shipped artifacts. The concrete implementation is in `ui/src/styles/tokens.css`
 and [docs/DESIGN_1.0.md](docs/DESIGN_1.0.md).
 
 ### Open source

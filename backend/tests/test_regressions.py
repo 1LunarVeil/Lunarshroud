@@ -4323,6 +4323,41 @@ def test_the_system_config_endpoint_never_returns_the_gateway_key(monkeypatch):
     assert set(body) == set(config.DEFAULT_CONFIG)
 
 
+def test_putting_the_settings_form_back_does_not_clear_the_gateway_key(monkeypatch):
+    """保存设置页不得把已配置的网关密钥覆盖成空串。
+
+    前端把 `GET /api/system/config` 的**脱敏**响应整份播种进草稿，再整体 `PUT`
+    回来。GET 永远回 `api_server_key: ""`，所以"改个端口再保存"曾经等于"删掉
+    网关的 Bearer 要求"，而界面看不出区别（两种状态都是空输入框）。
+
+    空串的语义必须是"保持不变"；清除密钥只能走显式路径。
+    红-绿：去掉 `api_update_config` 里剔除空 key 的那两行，本测试必红。
+    """
+    import config
+    import main as backend_main
+    from fastapi.testclient import TestClient
+
+    secret = "k" + uuid.uuid4().hex
+    config.update_config({"api_server_key": secret, "api_server_port": 4321})
+    monkeypatch.setattr(backend_main, "SESSION_TOKEN", "test-token")
+
+    client = TestClient(backend_main.app)
+    headers = {"X-LunarShroud-Token": "test-token"}
+    # Exactly what the settings form sends: the redacted read, edited, written back.
+    current = client.get("/api/system/config", headers=headers).json()
+    assert current["api_server_key"] == ""
+    current["api_server_port"] = 4322
+    saved = client.put("/api/system/config", headers=headers, json=current)
+    assert saved.status_code == 200, saved.text
+
+    assert config.get_config()["api_server_key"] == secret
+    assert config.get_config()["api_server_port"] == 4322
+
+    # A non-empty value is still accepted (that is how a key is set initially).
+    client.put("/api/system/config", headers=headers, json={"api_server_key": "rotated"})
+    assert config.get_config()["api_server_key"] == "rotated"
+
+
 def test_search_tools_never_follow_a_windows_junction_out_of_the_root(tmp_path):
     """junction 是 `read_file` 与两个搜索工具之间的**边界不一致**。
 

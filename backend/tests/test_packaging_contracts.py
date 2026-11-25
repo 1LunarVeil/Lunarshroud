@@ -19,6 +19,34 @@ def test_packaged_backend_includes_lazily_imported_pyyaml():
     assert "'yaml', 'PyYAML'" not in source
 
 
+def test_every_backend_subpackage_has_an_init_file():
+    """A namespace package works from source and can vanish from a frozen build.
+
+    PyInstaller's import analysis walks real modules. A directory without
+    `__init__.py` is a namespace package: `import storage.scheduled_tasks_db`
+    succeeds in the source tree and can fail in the packaged backend with
+    `ModuleNotFoundError` — on the first scheduled-task request, not at startup, so
+    nothing looks broken until a user clicks the feature.
+
+    Measured 2026-11-25 while adding `backend/storage/`: it had no `__init__.py`.
+    """
+    backend = REPO_ROOT / "backend"
+    # `tests/` is excluded: pytest imports test modules by file path (rootdir-based
+    # `prepend` import mode), so it is not a package the frozen build ever imports.
+    missing = [
+        path.name
+        for path in sorted(backend.iterdir())
+        if path.is_dir()
+        and path.name not in {"__pycache__", "_internal", "tests"}
+        and any(path.glob("*.py"))
+        and not (path / "__init__.py").is_file()
+    ]
+    assert not missing, (
+        "backend subpackages without __init__.py are namespace packages and may be "
+        f"omitted from the frozen build: {missing}"
+    )
+
+
 def test_release_build_rejects_a_missing_or_empty_onedir_runtime():
     """build.rs must validate _internal, not just backend.exe.
 

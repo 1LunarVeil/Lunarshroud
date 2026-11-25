@@ -22,7 +22,7 @@ FastAPI management backend (backend/)
   -> local Chat SQLite store, SSE proxy, text attachments, prompts and search
   -> local user-data backups and delayed restore under DATA_DIR/backups
 
-Static frontend (frontend/)
+React frontend (ui/; build output ui/dist)
   -> authenticated API and WebSocket client
   -> reacquires the session after a supervised backend restart
   -> reconnects WebSockets with exponential backoff; bounded polling/rendering
@@ -51,7 +51,7 @@ The frontend is static HTML/CSS/JavaScript. It uses bounded polling and renderin
   Windows Job Object cleanup.
 - `backend/` owns API contracts, lifecycle state, persistence, and command
   construction; it must not expose secrets in stored or displayed values.
-- `frontend/` owns presentation only; it must not turn backend-provided text
+- `ui/` owns presentation only; it must not turn backend-provided text
   into HTML or bypass the session-authentication contract.
 - `data/` (config, history, chats/attachments, presets, backups) belongs to the
   local user/runtime and is not source or a release input. `github/` is a

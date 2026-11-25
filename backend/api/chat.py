@@ -119,6 +119,25 @@ async def _inject_knowledge_context(
 
     if not result.hit:
         return {"X-LunarShroud-Knowledge": "miss"}
+    _merge_system_context(payload, result.context)
+    return {
+        "X-LunarShroud-Knowledge": "hit",
+        "X-LunarShroud-Sources": _knowledge_sources_header(result.sources),
+    }
+
+
+def _merge_system_context(payload: dict[str, Any], context: str) -> None:
+    """Prepend context to the request's system message, merging instead of adding.
+
+    **One system message, never two.** Chat templates (and llama.cpp's prompt
+    builder) expect exactly one leading `system` turn; inserting a second one
+    produces a prompt the model was never trained on, and the symptom is not an
+    error but a quieter model. Every context source therefore goes through this
+    function: knowledge retrieval and persistent memory both call it, in a fixed
+    order, so the result is deterministic.
+    """
+    if not context:
+        return
     messages = payload["messages"]
     if (
         messages
@@ -127,34 +146,146 @@ async def _inject_knowledge_context(
     ):
         messages[0] = {
             "role": "system",
-            "content": f"{result.context}\n\n{messages[0]['content']}",
+            "content": f"{context}\n\n{messages[0]['content']}",
         }
     else:
-        messages.insert(0, {"role": "system", "content": result.context})
-    return {
-        "X-LunarShroud-Knowledge": "hit",
-        "X-LunarShroud-Sources": _knowledge_sources_header(result.sources),
-    }
+        messages.insert(0, {"role": "system", "content": context})
+
+
+async def _inject_memory_context(payload: dict[str, Any], body: dict[str, Any]) -> bool:
+    """Inject remembered notes, if this conversation opted in.
+
+    Opt-in is **per conversation** (`params.memory`), not global, for the same
+    reason tool approval is: a user who turned memory on for a project chat should
+    not silently get it in every unrelated conversation. Nothing is injected when
+    the flag is absent, so existing conversations behave exactly as before.
+
+    Returns whether anything was injected (used by the response header so the UI
+    can say what happened).
+    """
+    from core import chat_store
+
+    if not body.get("memory"):
+        return False
+    scope = body.get("memory_scope") or chat_store.MEMORY_PERSONAL_SCOPE
+    try:
+        context = await asyncio.to_thread(chat_store.memory_context, scope)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    if not context:
+        return False
+    _merge_system_context(payload, context)
+    return True
+
+
+async def _resolve_skill(
+    body: dict[str, Any], messages: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Which skill applies to this turn, if any.
+
+    Two ways in, in this order:
+
+    1. **An explicit id** (`skill_id`) — a conversation that pinned a skill keeps it
+       until the user changes the choice.
+    2. **An `@mention` in the latest user message** — resolved against *enabled*
+       skills only, so a disabled skill can never be loaded by mentioning it.
+
+    A pinned skill that no longer exists resolves to `None` rather than an error:
+    deleting a skill must not break every conversation that referenced it.
+    """
+    from core import chat_store
+    from core import skills as skills_module
+
+    if body.get("skill_id"):
+        try:
+            pinned = await asyncio.to_thread(chat_store.get_skill, body["skill_id"])
+        except ValueError:
+            pinned = None
+        if pinned and pinned.get("enabled"):
+            return pinned
+        if pinned is None:
+            return None
+    available = await asyncio.to_thread(chat_store.list_skills, enabled_only=True)
+    if not available:
+        return None
+    return skills_module.resolve_active_skill(None, messages, available)
+
+
+async def _inject_skill_context(
+    payload: dict[str, Any], body: dict[str, Any], messages: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Inject the active skill's instructions and return the skill (or `None`).
+
+    The instructions go through the same single-system-message merge as knowledge
+    and memory. The caller uses the returned skill to narrow the tool declarations:
+    declaring tools the skill forbids would produce calls the executor refuses.
+    """
+    from core import skills as skills_module
+
+    skill = await _resolve_skill(body, messages)
+    if skill is None:
+        return None
+    context = skills_module.skill_context(skill)
+    if not context:
+        return skill
+    _merge_system_context(payload, context)
+    return skill
+
+
+@router.post("/api/chat/tools/preview")
+async def api_preview_chat_tool(body: dict):
+    """Describe what an approved call **would** touch, without running it.
+
+    The approval bar already shows the raw arguments; that is not enough to judge
+    a write or a command. `agent_preview.describe` resolves the target path or the
+    full argv + working directory + risk level, which is the difference between
+    "allow write_file" and "allow writing D:/work/report.md (replaces 12 KB)".
+
+    Pure: no execution, no state change. That is why it can be called on every
+    render of the approval card without any approval-gate concern.
+    """
+    from core import agent_preview
+
+    if not isinstance(body, dict):
+        raise HTTPException(400, "body must be an object")
+    name = body.get("name")
+    arguments = body.get("arguments")
+    root = body.get("root")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments) if arguments.strip() else {}
+        except ValueError as error:
+            raise HTTPException(400, "arguments is not valid JSON") from error
+    if arguments is not None and not isinstance(arguments, dict):
+        raise HTTPException(400, "arguments must be an object")
+    return await asyncio.to_thread(agent_preview.describe, name, arguments, root)
 
 
 @router.post("/api/chat/tools/execute")
 async def api_execute_chat_tool(body: dict):
-    """执行一次**用户已批准**的只读工具调用。
+    """执行一次**用户已批准**的工具调用。
 
     这个端点的语义是"人已经点了允许"，不是"模型要求就执行"。谁批准、批准了
-    什么，由前端在弹条里呈现（参数原文，不只是工具名）；后端只负责回答
-    "在这个授权目录内，这个只读工具最多能读到什么"。
+    什么，由前端在弹条里呈现（参数原文 + `preview` 解析出的绝对目标）；后端
+    只负责回答"在这个授权目录内，这个工具最多能做什么"。
 
     为什么必须显式传 ``root``：授权范围不能是"服务端某个全局配置"，否则同一个
     后端上一次被授权看 ``D:\\work``，下一次任何请求都能看它。根目录是**每次
     调用**的入参，由用户在该次对话里选定。
 
-    为什么只读：``llama-server`` 自带的 ``--tools`` 在宿主机直接执行、无批准
-    环节，那条路上写入与命令执行都在射程内。这里只放 read_file /
-    file_glob_search / grep_search 三个只读工具，最坏后果是"读到授权目录里的
-    一份文件"。
+    工具集合与风险分级来自 ``agent_tools``（read / write / command 三类），
+    执行本体复用 Agent 工作台已经审计过的实现：
+
+    * 读：``chat_tools``（只读、路径解析后再比较、硬链接拒绝）
+    * 写：``agent_writes``（原子替换，不跟随链接）
+    * 命令：``agent_commands``（``shell=False``、argv[0] 经 `which_on_path`
+      绝对化、子进程环境清洗、超时与输出上限）
+
+    批准本身**不在后端**：这条路由假定"已经批准"，前端负责在弹条里逐次询问。
+    后端的责任是让"批准了"与"能做什么"之间没有第二条路径。
     """
-    from core import chat_tools
+    from core import agent_tools, chat_tools
+    from core.agent_writes import AgentToolError
 
     if not isinstance(body, dict):
         raise HTTPException(400, "body must be an object")
@@ -169,13 +300,56 @@ async def api_execute_chat_tool(body: dict):
             raise HTTPException(400, "arguments is not valid JSON") from error
     if arguments is not None and not isinstance(arguments, dict):
         raise HTTPException(400, "arguments must be an object")
+
+    tool = str(name or "").strip()
+    if tool == "web_search":
+        # Search is the one tool whose availability depends on runtime config, not
+        # on the dispatch table. It is refused here as well as at declaration time:
+        # a model can echo a tool name it saw in an earlier turn, and "the config
+        # changed since" must not become an unapproved outbound request.
+        from config import get_config
+        from core import web_search
+
+        cfg = get_config()
+        if not cfg.get("web_search_enabled") or not str(cfg.get("web_search_endpoint") or "").strip():
+            raise HTTPException(400, "web search is not enabled in settings")
+        try:
+            return await asyncio.to_thread(
+                web_search.search,
+                (arguments or {}).get("query"),
+                str(cfg.get("web_search_endpoint")),
+                limit=int(cfg.get("web_search_max_results") or 5),
+            )
+        except web_search.WebSearchError as error:
+            raise HTTPException(400, str(error)) from error
+
+    if tool not in agent_tools.ALL_AGENT_TOOLS:
+        # 未知工具一律拒绝（不猜、不降级）。这条先于执行，避免把未知名字
+        # 传进派发表再由下游抛出不可读的 KeyError。
+        raise HTTPException(400, f"tool {tool!r} is not allowed to run")
+    # A skill narrows what the model was offered. The executor must apply the same
+    # narrowing: a model can echo a tool name from a turn before the skill was
+    # active, and "the declaration list changed" is not an authorisation.
+    allowed = body.get("allowed_tools")
+    if allowed is not None:
+        if not isinstance(allowed, list) or not all(isinstance(item, str) for item in allowed):
+            raise HTTPException(400, "allowed_tools must be a list of strings")
+        if tool not in allowed:
+            raise HTTPException(
+                400, f"tool {tool!r} is not enabled by the active skill"
+            )
+    if agent_tools.RISK_LEVELS.get(tool) != "normal" and not str(root or "").strip():
+        # 写与命令必须带授权根：没有根的路径解析无处可依，而"整个磁盘"不是
+        # 一个可接受的默认值。
+        raise HTTPException(400, "this tool needs an authorized root directory")
+
     try:
         result = await asyncio.to_thread(
-            chat_tools.execute_tool, name, arguments, root
+            agent_tools.run, tool, arguments or {}, root
         )
-    except chat_tools.ToolError as error:
-        # 越界、不存在、二进制文件……都是**可预期**的拒绝，用 400 而不是 500：
-        # 它们不是服务器故障，是这次请求不成立。
+    except (chat_tools.ToolError, AgentToolError) as error:
+        # 越界、不存在、二进制文件、命令被拒……都是**可预期**的拒绝，用 400
+        # 而不是 500：它们不是服务器故障，是这次请求不成立。
         raise HTTPException(400, str(error)) from error
     return result
 
@@ -198,6 +372,30 @@ async def api_instance_chat_completions(instance_id: str, body: dict):
         raise HTTPException(409, "instance is not running")
     payload = main._normalize_chat_payload(body)
     knowledge_headers = await _inject_knowledge_context(payload, body)
+    # Memory after knowledge, in a fixed order, through the same merge helper:
+    # a second `system` message would be a prompt shape the model never saw.
+    memory_injected = await _inject_memory_context(payload, body)
+    # The skill's instructions follow the same rule, and its allow-list narrows the
+    # tools this request declares. Applied **before** the upstream call so the model
+    # is never offered a tool the skill forbids.
+    active_skill = await _inject_skill_context(payload, body, payload["messages"])
+    if active_skill is not None:
+        from core import skills as skills_module
+
+        allowed = skills_module.allowed_tools(active_skill)
+        if allowed is not None and payload.get("tools"):
+            permitted = set(allowed)
+            payload["tools"] = [
+                declaration
+                for declaration in payload["tools"]
+                if declaration.get("function", {}).get("name") in permitted
+            ]
+            if not payload["tools"]:
+                # A skill with no tools must not leave `tools: []` behind: llama.cpp
+                # treats an empty array as "tools enabled", and the model then tries
+                # to call one. Removing the keys entirely is the honest request.
+                payload.pop("tools", None)
+                payload.pop("tool_choice", None)
     # 按模型真实上下文窗口（token）准入，必要时丢掉最旧的轮次。裁剪发生在转发
     # 之前，所以请求体自然落回字节上限之内——字节那道墙从此只做传输层护栏，
     # 不再抢先把一条中文长对话用一句 "request body too large" 打发掉。
@@ -223,6 +421,10 @@ async def api_instance_chat_completions(instance_id: str, body: dict):
 
     headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     headers.update(knowledge_headers)
+    if memory_injected:
+        # CORS-exposed (see middleware expose list) so the UI can state that the
+        # notes were used instead of leaving it to faith.
+        headers["X-LunarShroud-Memory"] = "used"
     if dropped_turns:
         # 前端据此提示"为放进上下文丢了 N 轮最早的消息"。丢了东西必须说出来——
         # 静默丢内容正是这一串问题（413/截断）的共同根。

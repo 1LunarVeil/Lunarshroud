@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "open-path"
+description = "Allow the open_path command, which reveals an absolute existing directory or file in the system file manager"
+commands.allow = ["open_path"]
