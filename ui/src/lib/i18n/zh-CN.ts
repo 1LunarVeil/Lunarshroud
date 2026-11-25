@@ -904,6 +904,8 @@ export const ZH_CN: Record<string, string> = {
   "settings.font_system": "系统默认",
   "settings.font_serif": "衬线",
   "settings.font_mono": "等宽",
+  "settings.backgroundWholeWindow": "壁纸铺满整窗",
+  "settings.backgroundWholeWindowHelp": "同一张图也铺到侧栏与面板后面，而不只是对话区。先选一张背景图再开启。",
   "settings.closeToTray": "关闭窗口时隐藏到托盘",
   "settings.closeToTrayHelp": "开启后关闭窗口不会退出，后端和实例继续运行；从托盘菜单可重新打开或退出。重启后仍生效。",
   "settings.trayUnavailable": "系统托盘不可用，关闭窗口仍会退出。",

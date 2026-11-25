@@ -784,6 +784,8 @@ export interface AppConfig {
   chat_sidebar_width: number;
   chat_panel_width: number;
   chat_background_image: string;
+  /** Paint the same image behind the whole window, not just the transcript. */
+  background_whole_window: boolean;
   chat_background_opacity: number;
   chat_background_blur: number;
   api_server_enabled: boolean;

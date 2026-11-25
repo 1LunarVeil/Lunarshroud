@@ -134,6 +134,96 @@ test('the body font preset changes the computed font family', async ({ page }) =
   await expect.poll(bodyFont, { timeout: 10_000 }).toBe(baseline);
 });
 
+test('the whole-window wallpaper paints a real layer behind the app', async ({ page }) => {
+  const evidence = collectEvidence(page);
+  await boot(page, evidence);
+
+  /*
+    This drives the **layer**, not the settings file.
+
+    An earlier version wrote `chat_background_image` through the config API and left
+    it cleared afterwards — which still changed global state for every later spec:
+    `core-paths` compares the body colour in both themes, and a wallpaper makes that
+    ground transparent, so the two themes resolved to the same value and an unrelated
+    test failed. Injecting the same custom properties the effect writes proves the CSS
+    contract without touching shared state.
+  */
+  const onePixel =
+    'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+
+  await page.evaluate((image) => {
+    const style = document.body.style;
+    style.setProperty('--wallpaper-image', `url("${image}")`);
+    style.setProperty('--wallpaper-opacity', '0.5');
+    style.setProperty('--wallpaper-blur', '0px');
+    style.setProperty('--wallpaper-background', 'transparent');
+  }, onePixel);
+
+  // The layer is a `::before` on body; `getComputedStyle` reports its resolved values.
+  const layer = await page.evaluate(() => {
+    const style = getComputedStyle(document.body, '::before');
+    return {
+      image: style.backgroundImage,
+      position: style.position,
+      pointerEvents: style.pointerEvents,
+      bodyBackground: getComputedStyle(document.body).backgroundColor,
+    };
+  });
+
+  expect(layer.position).toBe('fixed');
+  expect(layer.pointerEvents).toBe('none');
+  expect(layer.image).toContain('data:image/png');
+  // The body ground must be transparent, or it paints over the layer: a fixed,
+  // negatively-stacked child paints behind its parent's background. This is the
+  // assertion that catches the real defect (verified by injecting
+  // `--wallpaper-background: var(--canvas)`: the body stays opaque and the image is
+  // completely hidden).
+  expect(layer.bodyBackground).toBe('rgba(0, 0, 0, 0)');
+
+  // The opacity transition is 180 ms; sample until it settles. Reading once measures
+  // a mixed value (observed 0.131 for a target of 0.5) — the same mid-animation race
+  // that made the a11y gate report a varying violation count.
+  // `getComputedStyle().opacity` is a CSS string and `toBeCloseTo` needs a number.
+  // Poll on a parsed numeric value produced **in the browser**, so no string ever
+  // reaches the matcher (an earlier version polled the raw string and failed with
+  // "received value must be a number" even though it printed as 0.5).
+  const settled = () =>
+    page.evaluate(
+      () => Number.parseFloat(getComputedStyle(document.body, '::before').opacity) || 0,
+    );
+  await expect.poll(() => settled(), { timeout: 5000 }).toBeCloseTo(0.5, 2);
+  // Clearing the properties must take the layer away rather than leave it half-on.
+  await page.evaluate(() => {
+    const style = document.body.style;
+    for (const name of [
+      '--wallpaper-image',
+      '--wallpaper-opacity',
+      '--wallpaper-blur',
+      '--wallpaper-background',
+    ]) {
+      style.removeProperty(name);
+    }
+  });
+  // Clearing the properties starts a 180 ms fade-out; poll until it settles rather
+  // than sampling once (the same mid-transition race as the fade-in above).
+  await expect
+    .poll(
+      () =>
+        page.evaluate(
+          () =>
+            Number.parseFloat(getComputedStyle(document.body, '::before').opacity) || 0,
+        ),
+      { timeout: 5000 },
+    )
+    .toBeCloseTo(0, 2);
+  const after = await page.evaluate(() => ({
+    image: getComputedStyle(document.body, '::before').backgroundImage,
+    bodyBackground: getComputedStyle(document.body).backgroundColor,
+  }));
+  expect(after.image === 'none' || after.image === '').toBe(true);
+  expect(after.bodyBackground).not.toBe('rgba(0, 0, 0, 0)');
+});
+
 test('a project groups the conversations assigned to it', async ({ page }) => {
   const evidence = collectEvidence(page);
   await boot(page, evidence);

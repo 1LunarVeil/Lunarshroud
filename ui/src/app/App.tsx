@@ -58,6 +58,45 @@ export function App() {
     if (preset) document.documentElement.dataset.font = preset;
   }, [config.data?.font_preset]);
 
+  /**
+   * Whole-window wallpaper.
+   *
+   * Applied to `<body>` through two CSS custom properties rather than an inline
+   * `background-image` on a React node: the wallpaper must sit **behind** every
+   * surface (sidebar, toolbar, panels) without any of them having to know it exists.
+   * `app.css` uses these to paint a fixed, aria-hidden layer under the app.
+   *
+   * Clearing the properties when the feature is off is deliberate — leaving a stale
+   * `--wallpaper-image` behind would keep the image in memory and could paint it on
+   * the next mount that forgot to reset.
+   */
+  useEffect(() => {
+    const style = document.body.style;
+    const image = config.data?.chat_background_image ?? '';
+    const enabled = config.data?.background_whole_window === true && Boolean(image);
+    if (!enabled) {
+      style.removeProperty('--wallpaper-image');
+      style.removeProperty('--wallpaper-opacity');
+      style.removeProperty('--wallpaper-blur');
+      style.removeProperty('--wallpaper-background');
+      return;
+    }
+    const opacity = config.data?.chat_background_opacity ?? 0.35;
+    const blur = config.data?.chat_background_blur ?? 0;
+    style.setProperty('--wallpaper-image', `url("${image}")`);
+    // The overlay opacity in the settings sheet means "how much theme colour covers
+    // the picture", so the picture's own visibility is its complement.
+    style.setProperty('--wallpaper-opacity', String(Math.max(0, Math.min(1, 1 - opacity))));
+    style.setProperty('--wallpaper-blur', `${blur}px`);
+    // Let the fixed layer show through the body ground.
+    style.setProperty('--wallpaper-background', 'transparent');
+  }, [
+    config.data?.background_whole_window,
+    config.data?.chat_background_image,
+    config.data?.chat_background_opacity,
+    config.data?.chat_background_blur,
+  ]);
+
   // Follow the OS preference while the user is on "system".
   useEffect(() => {
     if (themePreference !== 'system') return;

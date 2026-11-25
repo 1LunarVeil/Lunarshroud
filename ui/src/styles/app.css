@@ -97,12 +97,49 @@
     font-size: var(--text-base);
     line-height: var(--leading-normal);
     color: var(--text);
-    background: var(--canvas);
+    /*
+       When a whole-window wallpaper is on, the body ground has to be transparent or
+       it would paint over the `::before` layer (a fixed, negatively-stacked child
+       paints *behind* its parent's background). JS sets the variable only while the
+       feature is enabled, so the default remains an opaque canvas.
+    */
+    background: var(--wallpaper-background, var(--canvas));
     /* A window, not a page: the app never scrolls as a whole. Each pane owns its
        own scroll container. */
     overflow: hidden;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
+  }
+
+  /*
+     Whole-window wallpaper.
+
+     A fixed layer behind everything instead of a `background-image` on a React node:
+     every surface (sidebar, toolbar, panels) sits on top of it without needing to
+     know it exists, and the transcript keeps its own readable ground.
+
+     The custom properties are set from JS only while the feature is on; with them
+     absent the layer is fully transparent, so the default cost is one empty fixed
+     element. `z-index: -1` puts it behind `body`'s own background painting, so the
+     properties are only honoured because the body background is `--canvas` — a
+     surface colour is still painted on top by each pane.
+  */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background-image: var(--wallpaper-image, none);
+    background-size: cover;
+    background-position: center;
+    filter: blur(var(--wallpaper-blur, 0px));
+    /* Blur leaves soft transparent edges; the slight scale keeps them off-screen. */
+    transform: scale(1.04);
+    opacity: var(--wallpaper-opacity, 0);
+    transition:
+      opacity 180ms ease,
+      filter 180ms ease;
   }
 
   /* Numeric columns, counters and timings line up only with tabular figures. */

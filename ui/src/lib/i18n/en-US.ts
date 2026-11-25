@@ -899,6 +899,8 @@ export const EN_US: Record<string, string> = {
   "settings.font_system": "System",
   "settings.font_serif": "Serif",
   "settings.font_mono": "Monospace",
+  "settings.backgroundWholeWindow": "Wallpaper across the whole window",
+  "settings.backgroundWholeWindowHelp": "Paints the same image behind the sidebar and panels, not just the transcript. Choose an image first.",
   "settings.closeToTray": "Hide to tray when closing the window",
   "settings.closeToTrayHelp": "The backend and instances keep running. Use the tray menu to reopen or quit. Persists across restarts.",
   "settings.trayUnavailable": "The system tray is unavailable; closing the window will still exit.",

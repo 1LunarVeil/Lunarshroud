@@ -249,6 +249,19 @@ export function AppearanceTab() {
           onChange={(changes) => patch(changes)}
           onError={setIdentityError}
         />
+        {/*
+          Reuses the same image rather than adding a second one: two wallpapers would
+          double the config payload and make "change the wallpaper" a two-step action.
+          Disabled while no image is chosen — the switch would otherwise promise
+          something with nothing to show.
+        */}
+        <Switch
+          checked={Boolean(draft.background_whole_window)}
+          onCheckedChange={(next) => patch({ background_whole_window: next })}
+          disabled={!draft.chat_background_image}
+          label={translate('settings.backgroundWholeWindow')}
+          description={translate('settings.backgroundWholeWindowHelp')}
+        />
       </section>
 
       <section className="flex flex-col gap-4 border-t border-[var(--border)] pt-5">

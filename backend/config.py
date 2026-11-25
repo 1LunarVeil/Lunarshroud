@@ -361,6 +361,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 背景图模糊半径（px）。0 = 不模糊。大图直接铺满会让正文难读，
     # 轻模糊是常见解法。
     "chat_background_blur": 0,
+    # 壁纸铺满整窗（侧栏/工具栏/面板也透出），而不只是对话区。
+    #
+    # 复用同一张 `chat_background_image` 与同一个 opacity/blur：两张独立图片会让
+    # 配置体积翻倍、也让"换壁纸"要选两次。关闭时保持 1.0 的行为（只在对话区）。
+    "background_whole_window": False,
     # ---------- 本地 API 服务（OpenAI 兼容网关） ----------
     # 是否开启对外网关。关闭时网关路由一律 503（不是 404：路由确实存在，
     # 只是服务没开，客户端据此能给出"去设置里打开"的提示）。
@@ -835,6 +840,13 @@ def validate_config(cfg: dict[str, Any], *, repair: bool = False) -> dict[str, A
         reject(
             "chat_background_blur",
             f"chat_background_blur must be within {blur_low}-{blur_high}",
+        )
+
+    whole_window = candidate.get("background_whole_window", False)
+    if not isinstance(whole_window, bool):
+        reject(
+            "background_whole_window",
+            "background_whole_window must be a boolean",
         )
 
     if errors:
