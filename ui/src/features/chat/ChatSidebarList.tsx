@@ -1,5 +1,5 @@
-import { Download, FolderPlus, MessageSquarePlus, MoreHorizontal, Pin, Search, Trash2, Upload, X } from 'lucide-react';
-import { useMemo, useRef, useState } from 'react';
+import { Check, Download, FolderPlus, MessageSquarePlus, MoreHorizontal, Pin, Search, Trash2, Upload, X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { chatsApi, projectsApi, type Project } from '@/lib/api';
@@ -37,7 +37,49 @@ export function ChatSidebarList({
   const [renaming, setRenaming] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [menuOpen, setMenuOpen] = useState(false);
+  const [creatingProject, setCreatingProject] = useState(false);
+  const [projectName, setProjectName] = useState('');
   const fileRef = useRef<HTMLInputElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const menuButtonRef = useRef<HTMLButtonElement | null>(null);
+
+  /**
+   * Dismiss the list menu on outside click or Escape.
+   *
+   * It used to close on `onMouseLeave`, which is not a dismissal anyone using a
+   * keyboard can perform, and which also closes the menu the moment the pointer
+   * travels between the trigger and a menu item. Escape + outside-click is the
+   * behaviour every other popup in the app has, and it is what makes the menu
+   * reachable without a mouse at all.
+   */
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onOutsideClick = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (!target) return;
+      if (menuRef.current?.contains(target)) return;
+      if (menuButtonRef.current?.contains(target)) return;
+      setMenuOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setMenuOpen(false);
+        menuButtonRef.current?.focus();
+      }
+    };
+    // `click` rather than `pointerdown`: a `pointerdown` handler that calls
+    // setState makes React flush a re-render before the browser dispatches the
+    // following `click`, which unmounts the menu item the user just pressed — the
+    // item's own onClick then never runs (measured: the menu closed and nothing
+    // happened). `click` fires after the item's handler, so dismissal cannot
+    // swallow the action.
+    document.addEventListener('click', onOutsideClick);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('click', onOutsideClick);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [menuOpen]);
   /**
    * Projects are fetched here rather than at page level: the sidebar is the only
    * consumer, and a project list is tiny. Grouping the conversation list by
@@ -165,13 +207,25 @@ export function ChatSidebarList({
     }
   };
 
+  /**
+   * Create a project from an inline field, not `window.prompt`.
+   *
+   * WebView2 in a Tauri window does not implement the blocking `prompt()` (the
+   * call returns null immediately), so a `window.prompt` here is dead code in the
+   * packaged build — and in the browser suite it blocks the automation. A visible
+   * input row works in both, is styleable, and cannot be dismissed into a null that
+   * looks like "the user cancelled".
+   */
   const createProject = async () => {
-    const name = window.prompt(translate('chat.projectNamePrompt'))?.trim();
+    const name = projectName.trim();
     if (!name) return;
     try {
       await projectsApi.create({ name });
       await client.invalidateQueries({ queryKey: ['projects'] });
+      setProjectName('');
+      setCreatingProject(false);
       toast.success(translate('chat.projectCreated'));
+      setMenuOpen(false);
     } catch (error) {
       toast.error(localizeBackendError(error instanceof Error ? error.message : error));
     }
@@ -208,10 +262,12 @@ export function ChatSidebarList({
           */}
           <button
             type="button"
+            ref={menuButtonRef}
             data-testid="conversation-menu"
             onClick={() => setMenuOpen((value) => !value)}
             aria-label={translate('chat.conversationMenu')}
             aria-expanded={menuOpen}
+            aria-haspopup="menu"
             title={translate('chat.conversationMenu')}
             className={cn(
               'grid size-6 place-items-center rounded-[var(--radius-sm)] text-[length:var(--text-xs)] text-[var(--text-tertiary)]',
@@ -237,9 +293,9 @@ export function ChatSidebarList({
 
           {menuOpen ? (
             <div
+              ref={menuRef}
               role="menu"
-              className="absolute end-0 top-7 z-[var(--z-dropdown)] flex w-52 flex-col rounded-[var(--radius-md)] border border-[var(--border)] bg-[var(--surface)] py-1 shadow-[var(--shadow-pop)]"
-              onMouseLeave={() => setMenuOpen(false)}
+              className="absolute end-0 top-7 z-[var(--z-popover)] flex w-52 flex-col rounded-[var(--radius-md)] border border-[var(--border)] bg-[var(--surface)] py-1 shadow-[var(--shadow-pop)]"
             >
               <button
                 type="button"
@@ -258,7 +314,7 @@ export function ChatSidebarList({
                 role="menuitem"
                 onClick={() => {
                   setMenuOpen(false);
-                  void createProject();
+                  setCreatingProject(true);
                 }}
                 className="flex items-center gap-2 px-2.5 py-1.5 text-start text-[length:var(--text-xs)] hover:bg-[var(--hover)]"
               >
@@ -312,6 +368,58 @@ export function ChatSidebarList({
           />
         </div>
       </div>
+
+      {/*
+        Inline project creation. It replaces `window.prompt`, which WebView2 in a
+        Tauri window does not implement: the packaged app would have created nothing
+        and shown no reason. Enter commits, Escape cancels, and the field keeps its
+        value if the request fails (the Save-in-place rule from AGENTS §2.20).
+      */}
+      {creatingProject ? (
+        <div className="px-2 pb-1.5">
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              void createProject();
+            }}
+            className="flex items-center gap-1"
+          >
+            <input
+              autoFocus
+              value={projectName}
+              onChange={(event) => setProjectName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') {
+                  setCreatingProject(false);
+                  setProjectName('');
+                }
+              }}
+              aria-label={translate('chat.projectNamePrompt')}
+              placeholder={translate('chat.projectNamePrompt')}
+              className="h-[var(--control-h-sm)] w-full min-w-0 rounded-[var(--radius-sm)] border border-[var(--border-control)] bg-[var(--surface)] px-2 text-[length:var(--text-xs)] outline-none"
+            />
+            <button
+              type="submit"
+              disabled={!projectName.trim()}
+              aria-label={translate('common.save')}
+              className="grid size-[var(--control-h-sm)] shrink-0 place-items-center rounded-[var(--radius-sm)] text-[var(--accent-text)] disabled:opacity-50"
+            >
+              <Check size={13} aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setCreatingProject(false);
+                setProjectName('');
+              }}
+              aria-label={translate('common.cancel')}
+              className="grid size-[var(--control-h-sm)] shrink-0 place-items-center rounded-[var(--radius-sm)] text-[var(--text-tertiary)]"
+            >
+              <X size={13} aria-hidden="true" />
+            </button>
+          </form>
+        </div>
+      ) : null}
 
       <div className="px-2 pb-1.5">
         <div className="flex items-center gap-1.5 rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--surface)] px-2">

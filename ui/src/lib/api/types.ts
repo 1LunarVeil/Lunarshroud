@@ -235,10 +235,23 @@ export interface UsageDay {
   tokens: number;
 }
 
+export interface UsageModelRow {
+  model: string;
+  requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  avg_tokens_per_second: number | null;
+}
+
 export interface UsageSummary {
   range_days: number;
   totals: UsageTotals;
   daily: UsageDay[];
+  /** Per-model rows, largest token total first. At most 20 are sent. */
+  models: UsageModelRow[];
+  /** How many models appeared in the window; may exceed `models.length`. */
+  models_total: number;
   active_days: number;
   longest_streak: number;
   top_model: { model: string; tokens: number } | null;

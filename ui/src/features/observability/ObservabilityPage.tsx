@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Download, Info, Pause, Play, RotateCcw, Trash2 } from 'lucide-react';
+import { Copy, Download, FolderOpen, Info, Pause, Play, RotateCcw, Trash2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useInstanceStore } from '@/lib/stores/instances';
 import { instancesApi, historyApi, systemApi } from '@/lib/api';
+import { openPath } from '@/lib/api/client';
 import type { HistoryRecord, LogLine } from '@/lib/api/types';
 import { translate, localizeBackendError } from '@/lib/i18n';
 import { cn, formatDuration, formatTime } from '@/lib/utils';
@@ -139,6 +140,36 @@ function LogsPanel() {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
+  /**
+   * Copy the **filtered** view, not the whole buffer: the filter is what the user is
+   * looking at, and copying rows they already hid makes the paste disagree with the
+   * screen.
+   */
+  const copyVisible = async () => {
+    const body = filtered.map((line) => `${line.timestamp} [${line.source}] ${line.line}`).join('\n');
+    try {
+      await navigator.clipboard.writeText(body);
+      toast.success(translate('logs.copied', { count: filtered.length }));
+    } catch {
+      // The clipboard API needs a secure context and a user gesture. Both are true
+      // here in practice, so a failure is worth reporting rather than swallowing.
+      toast.error(translate('logs.copyFailed'));
+    }
+  };
+
+  const revealLogsFolder = async () => {
+    // Ask the backend where the directory actually is: it depends on the data
+    // directory resolution (portable marker / APPDATA fallback), so the UI must not
+    // guess a path.
+    try {
+      const paths = await systemApi.paths();
+      const result = await openPath(paths.logs_dir);
+      if (!result.ok) toast.error(result.error || translate('logs.openFailed'));
+    } catch (error) {
+      toast.error(localizeBackendError(error instanceof Error ? error.message : error));
+    }
+  };
+
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex flex-wrap items-center gap-2 border-b border-[var(--border)] px-4 py-2">
@@ -209,12 +240,31 @@ function LogsPanel() {
         <Button
           size="sm"
           variant="ghost"
+          onClick={() => void copyVisible()}
+          disabled={!filtered.length}
+          aria-label={translate('logs.copy')}
+          title={translate('logs.copy')}
+        >
+          <Copy size={13} aria-hidden="true" />
+        </Button>
+        <Button
+          size="sm"
+          variant="ghost"
           onClick={download}
           disabled={!filtered.length}
           aria-label={translate('logs.download')}
           title={translate('logs.download')}
         >
           <Download size={13} aria-hidden="true" />
+        </Button>
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => void revealLogsFolder()}
+          aria-label={translate('logs.openFolder')}
+          title={translate('logs.openFolder')}
+        >
+          <FolderOpen size={13} aria-hidden="true" />
         </Button>
       </div>
 

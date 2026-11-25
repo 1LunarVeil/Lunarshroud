@@ -48,6 +48,40 @@ def test_ui_sources_exist():
     assert APP_CSS.is_file(), "app.css is missing"
 
 
+def test_every_var_reference_names_a_declared_token():
+    """A typo'd token is an *invalid declaration*, so the browser drops it silently.
+
+    `z-[var(--z-dropdown)]` shipped on the conversation menu: `--z-dropdown` was
+    never declared, so the menu had no stacking order and was painted **under** the
+    conversation rows. Nothing reported an error — the menu was visible but its
+    items could not be clicked, and only an `elementFromPoint` probe showed a row
+    button where "New project" should have been.
+
+    Same failure shape as the two issues already pinned in this file (a size token
+    used as a colour, a colour token used as a size): Tailwind emits the class, the
+    CSS parser rejects the value, the element silently keeps its default.
+    """
+    declared = set(re.findall(r"(?m)^\s*(--[A-Za-z0-9-]+)\s*:", _read(TOKENS)))
+    # `app.css` declares locally scoped tokens too (the fill classes).
+    declared |= set(re.findall(r"(?m)^\s*(--[A-Za-z0-9-]+)\s*:", _read(APP_CSS)))
+    assert declared, "no custom properties found; the scan is broken"
+
+    missing: dict[str, set[str]] = {}
+    # Only references **without** a fallback: `var(--border-faint, var(--border))`
+    # is a deliberate optional token, and the browser falls back cleanly. A bare
+    # `var(--z-dropdown)` has no such safety net.
+    pattern = re.compile(r"var\(\s*(--[A-Za-z0-9-]+)\s*\)")
+    for path, text in _sources():
+        for name in pattern.findall(text):
+            if name not in declared:
+                missing.setdefault(name, set()).add(path.name)
+
+    assert not missing, (
+        "these custom properties are referenced but never declared (so the CSS "
+        f"declaration is silently dropped): { {k: sorted(v) for k, v in missing.items()} }"
+    )
+
+
 def test_tokens_file_declares_the_required_families():
     declared = set(re.findall(r"(?m)^\s*(--[A-Za-z0-9-]+)\s*:", _read(TOKENS)))
     for name in (

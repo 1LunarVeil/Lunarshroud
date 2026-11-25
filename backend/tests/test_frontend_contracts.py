@@ -422,6 +422,66 @@ def test_numeric_route_ids_are_typed_as_numbers_in_the_client():
         )
 
 
+def test_the_usage_summary_type_matches_the_route_it_reads():
+    """§2.41 for the usage page: the type is an assertion, so reconcile it.
+
+    `UsageSummary` drives a table now (per-model rows), where a renamed field does
+    not throw — it renders an empty column, which is the quietest failure mode this
+    project has shipped twice (`memory_used_mb`, `utilization_percent`).
+
+    Both directions: a field the route emits but the type omits is invisible to the
+    UI; a field the type invents reads `undefined` forever.
+    """
+    import sys
+
+    backend_dir = REPO_ROOT / "backend"
+    if str(backend_dir) not in sys.path:
+        sys.path.insert(0, str(backend_dir))
+    from core import usage_stats  # noqa: E402
+
+    # The empty report is the shape every branch returns, so its keys are the
+    # contract without needing a database.
+    sample = usage_stats.summarize(7, now=0.0)
+    backend_fields = set(sample)
+    assert backend_fields, "summarize() returned nothing"
+
+    api_types = (UI_SRC / "lib" / "api" / "types.ts").read_text(encoding="utf-8")
+    block = api_types.split("export interface UsageSummary {", 1)
+    assert len(block) == 2, "cannot find UsageSummary in types.ts"
+    ui_fields = set(re.findall(r"^\s{2}(\w+)\??:", block[1].split("\n}", 1)[0], re.M))
+
+    assert not sorted(backend_fields - ui_fields), (
+        "usage fields the route returns but UsageSummary omits: "
+        f"{sorted(backend_fields - ui_fields)}"
+    )
+    assert not sorted(ui_fields - backend_fields), (
+        "usage fields UsageSummary declares that nothing sends: "
+        f"{sorted(ui_fields - backend_fields)}"
+    )
+
+    # The per-model table reads exactly these four columns.
+    model_sample = sample["models"][0] if sample["models"] else None
+    expected_model_keys = {
+        "model",
+        "requests",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "avg_tokens_per_second",
+    }
+    row_block = api_types.split("export interface UsageModelRow {", 1)
+    assert len(row_block) == 2, "cannot find UsageModelRow in types.ts"
+    ui_model_fields = set(
+        re.findall(r"^\s{2}(\w+)\??:", row_block[1].split("\n}", 1)[0], re.M)
+    )
+    assert ui_model_fields == expected_model_keys, (
+        "UsageModelRow drifted from the row _model_rows builds: "
+        f"{sorted(ui_model_fields ^ expected_model_keys)}"
+    )
+    if model_sample is not None:
+        assert set(model_sample) == expected_model_keys
+
+
 def test_the_frontend_and_backend_agree_on_the_tool_catalogue():
     """Both sides declare tools; the name sets must match exactly.
 

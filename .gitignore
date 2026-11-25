@@ -122,4 +122,9 @@ docs/archive/
 # rather than protect the tree.
 .*-session/
 *-session-*/
-.mimosa/
+# Dot-prefixed tool state that records absolute paths in its JSON.
+# The patterns key on the *shape* of such a directory (a hidden directory with a
+# hook-state / hook-status child) rather than on a tool name: this file is
+# published, so naming a specific tool would document a private toolchain.
+.*/hook-state/
+.*/hook-status/

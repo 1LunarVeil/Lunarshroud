@@ -2132,6 +2132,12 @@ def test_document_responses_are_not_framable(monkeypatch):
     打包态 FRONTEND_DIR 不存在、后端根本不挂 UI，所以这层实际保护的是源码开发态：
     那时同一份 UI 会被 uvicorn 挂在 http://127.0.0.1:<port>/ 上，用真实浏览器打开
     就既没有 CSP、也能被任意站点框入（clickjacking）。
+
+    前置条件：`ui/dist` 已构建。CI 里 pytest 与 `npm run build` 的先后顺序决定
+    这一条到底测了没有 —— 2026-11-25 之前 CI 先跑 pytest，于是这一段整段静默
+    跳过（`FRONTEND_DIR.exists()` 为假），文档响应的安全头从未被 CI 验证过。
+    CI 已调整为先构建前端；这里在缺少构建产物时**失败**而不是跳过，因为
+    "没构建所以没测"正是这段代码想防的那种假绿。
     """
     from fastapi.testclient import TestClient
 
@@ -2149,24 +2155,39 @@ def test_document_responses_are_not_framable(monkeypatch):
     assert "x-frame-options" not in api.headers
     assert "content-security-policy" not in api.headers
 
-    if backend_main.FRONTEND_DIR.exists():
-        doc = client.get("/", headers=token)
-        assert doc.headers.get("x-frame-options") == "DENY"
-        assert doc.headers.get("referrer-policy") == "no-referrer"
-        csp = doc.headers.get("content-security-policy", "")
-        # 关键指令逐条核对：缺一条就等于没配
-        for directive in (
-            "default-src 'self'",
-            "frame-ancestors 'none'",
-            "base-uri 'none'",
-            "object-src 'none'",
-            "form-action 'self'",
-            "script-src 'self'",
-        ):
-            assert directive in csp, f"{directive!r} missing from {csp!r}"
-        # script-src 不得含 unsafe-inline（前端零内联脚本，这是可维持的）
-        script_src = next(p.strip() for p in csp.split(";") if p.strip().startswith("script-src"))
-        assert "unsafe-inline" not in script_src, script_src
+    # Same predicate as `register_static_ui`: the **index.html** file, not the
+    # directory. A directory can exist while the build is half-present, and that is
+    # exactly the state this test must not mistake for "nothing to check".
+    if not (backend_main.FRONTEND_DIR / "index.html").is_file():
+        # A skip here would be a silent hole: the assertions below are the only
+        # coverage of the document security headers. Fail with the command to run.
+        raise AssertionError(
+            f"{backend_main.FRONTEND_DIR / 'index.html'} is missing, so the "
+            "document-response assertions below cannot run; build the frontend "
+            "first (cd ui && npm ci && npm run build) — this gate must not pass "
+            "vacuously"
+        )
+    doc = client.get("/", headers=token)
+    assert doc.status_code == 200, (
+        "the SPA is mounted but / does not serve; register_static_ui only mounts "
+        "when index.html exists, so this means the build is half-present"
+    )
+    assert doc.headers.get("x-frame-options") == "DENY"
+    assert doc.headers.get("referrer-policy") == "no-referrer"
+    csp = doc.headers.get("content-security-policy", "")
+    # 关键指令逐条核对：缺一条就等于没配
+    for directive in (
+        "default-src 'self'",
+        "frame-ancestors 'none'",
+        "base-uri 'none'",
+        "object-src 'none'",
+        "form-action 'self'",
+        "script-src 'self'",
+    ):
+        assert directive in csp, f"{directive!r} missing from {csp!r}"
+    # script-src 不得含 unsafe-inline（前端零内联脚本，这是可维持的）
+    script_src = next(p.strip() for p in csp.split(";") if p.strip().startswith("script-src"))
+    assert "unsafe-inline" not in script_src, script_src
 
 
 def test_restart_and_relaunch_report_port_exhaustion_as_conflict(monkeypatch):

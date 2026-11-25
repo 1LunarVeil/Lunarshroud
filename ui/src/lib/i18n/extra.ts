@@ -243,6 +243,9 @@ export const ZH_CN_EXTRA: Record<string, string> = {
   'settings.usageStreak': '最长连续天数',
   'settings.usagePeak': '高峰日',
   'settings.usageTopModel': '用量最高模型',
+  'settings.usageByModel': '按模型细分',
+  'settings.usageModel': '模型',
+  'settings.usageModelsMore': '只显示前 {shown} 个，共 {total} 个模型',
   'settings.usageEmpty': '还没有可统计的对话。发送一条消息后这里就会有数据。',
   'settings.usageScope':
     '统计范围是本机保存的对话消息；通过「本地 API 服务」由其它程序发起的请求不在其中。',
@@ -706,6 +709,9 @@ export const EN_US_EXTRA: Record<string, string> = {
   'settings.usageStreak': 'Longest streak',
   'settings.usagePeak': 'Peak day',
   'settings.usageTopModel': 'Top model',
+  'settings.usageByModel': 'By model',
+  'settings.usageModel': 'Model',
+  'settings.usageModelsMore': 'Showing the largest {shown} of {total} models',
   'settings.usageEmpty': 'No conversations to measure yet. Send one message and this page fills in.',
   'settings.usageScope':
     'Covers conversations stored on this machine. Requests other programs sent through the local API gateway are not included.',

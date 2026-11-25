@@ -45,7 +45,23 @@ function UsageBody({ data, pending }: { data: UsageSummary | undefined; pending:
     queryKey: ['usage', 'summary', range],
     queryFn: () => usageApi.summary(range),
   });
-  const view = query.data ?? data;
+  /*
+    Normalise once, here, rather than sprinkling `?? []` at every read.
+    `apiGet<T>` is a cast, not a validator: a backend that predates `models` (a
+    stale dev process, or a UI updated ahead of its backend) sends a document that
+    does not match the type. Reading `view.models.length` then threw
+    `Cannot read properties of undefined` and the app boundary replaced the whole
+    window with the crash screen — a version skew turned into a white screen.
+  */
+  const raw = query.data ?? data;
+  const view: UsageSummary | null = raw
+    ? {
+        ...raw,
+        daily: raw.daily ?? [],
+        models: raw.models ?? [],
+        models_total: raw.models_total ?? raw.models?.length ?? 0,
+      }
+    : null;
 
   return (
     <>
@@ -104,6 +120,70 @@ function UsageBody({ data, pending }: { data: UsageSummary | undefined; pending:
           ) : null}
 
           <DailyChart daily={view.daily} />
+
+          {/*
+            The full per-model table, not just the leader. "Which model costs me the
+            most tokens" and "which model do I call most often" are different
+            questions, and a single top-model line answers neither when the request
+            counts differ. The cap is stated when it applies instead of the table
+            silently ending.
+
+            `?? []` is deliberate: a backend that predates this field (a stale dev
+            process, or a user who updated the UI without the backend) must render an
+            empty table, not crash the whole window. `apiGet<T>` does not validate, so
+            assuming the field exists turns a version skew into a white screen.
+          */}
+          {(view.models ?? []).length ? (
+            <div className="flex flex-col gap-1">
+              <p className="text-[length:var(--text-xs)] font-medium text-[var(--text-secondary)]">
+                {translate('settings.usageByModel')}
+              </p>
+              <table className="w-full border-collapse text-[length:var(--text-2xs)]">
+                <thead>
+                  <tr className="text-[var(--text-tertiary)]">
+                    <th scope="col" className="py-1 pe-2 text-start font-medium">
+                      {translate('settings.usageModel')}
+                    </th>
+                    <th scope="col" className="py-1 pe-2 text-end font-medium">
+                      {translate('settings.usageRequests')}
+                    </th>
+                    <th scope="col" className="py-1 pe-2 text-end font-medium">
+                      {translate('settings.usageTotalTokens')}
+                    </th>
+                    <th scope="col" className="py-1 text-end font-medium">
+                      {translate('settings.usageSpeed')}
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {view.models.map((row) => (
+                    <tr key={row.model} className="border-t border-[var(--border)]">
+                      <td className="max-w-[16rem] truncate py-1 pe-2" title={row.model}>
+                        {row.model}
+                      </td>
+                      <td className="py-1 pe-2 text-end tnum">{row.requests}</td>
+                      <td className="py-1 pe-2 text-end tnum">
+                        {formatTokens(row.total_tokens)}
+                      </td>
+                      <td className="py-1 text-end tnum text-[var(--text-tertiary)]">
+                        {row.avg_tokens_per_second === null
+                          ? '—'
+                          : `${row.avg_tokens_per_second.toFixed(1)} tok/s`}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {view.models_total > view.models.length ? (
+                <p className="text-[length:var(--text-2xs)] text-[var(--text-tertiary)]">
+                  {translate('settings.usageModelsMore', {
+                    shown: view.models.length,
+                    total: view.models_total,
+                  })}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
 
           {!view.has_data ? (
             <p className="text-[length:var(--text-xs)] text-[var(--text-tertiary)]">

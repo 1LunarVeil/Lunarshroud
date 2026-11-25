@@ -104,11 +104,24 @@ class _TypedStaticFiles(StaticFiles):
 
 
 def register_static_ui(app: FastAPI) -> None:
-    """挂载 /assets 与 SPA 回退；``FRONTEND_DIR`` 不存在时什么都不做。"""
+    """挂载 /assets 与 SPA 回退；``FRONTEND_DIR/index.html`` 不存在时什么都不做。
+
+    判据必须是 **index.html 存在**，不是目录存在。构建产物里目录可能已经出现
+    （`vite build` 先建空目录、或上一次构建被清掉一半），此时挂上 `/` 会让
+    每条请求都抛 `RuntimeError: File ... does not exist` —— 500，而且完全不像
+    "前端没构建"。
+
+    2026-11-25 CI 实测：CI 的 pytest 步骤在 `npm run build` **之前**运行，检出树
+    里没有 `ui/dist`；本地因为前端已构建过而全绿。`/` 于是返回 500，
+    `test_auth_coverage` 的"带令牌必须到达 handler"与
+    `test_document_responses_are_not_framable` 一起红。不挂载时 `/` 是 404，
+    那才是诚实的答案。
+    """
     import main
 
     frontend_dir = main.FRONTEND_DIR
-    if not frontend_dir.exists():
+    index_file = frontend_dir / "index.html"
+    if not index_file.is_file():
         return
 
     assets_dir = frontend_dir / "assets"
@@ -137,4 +150,4 @@ def register_static_ui(app: FastAPI) -> None:
         # MIME/语法错误，把"文件根本没发布"伪装成前端代码问题。
         if path.startswith(("js/", "css/", "assets/")) or Path(path).suffix:
             raise HTTPException(404, f"asset not found: /{path}")
-        return FileResponse(str(main.FRONTEND_DIR / "index.html"))
+        return _file_response(main.FRONTEND_DIR / "index.html")

@@ -82,11 +82,17 @@ test('a project groups the conversations assigned to it', async ({ page }) => {
   // The newest row is the one at the top of the list.
   const row = rows().first();
 
-  // Create a project through the list menu.
+  // Create a project through the list menu. The name goes into an inline field, not
+  // a `window.prompt` — WebView2 in a Tauri window does not implement prompt(), so
+  // the packaged app would have created nothing.
   const projectName = `group-${Date.now()}`;
-  page.once('dialog', (dialog) => void dialog.accept(projectName));
   await page.getByTestId('conversation-menu').click();
+  await expect(page.getByRole('menu')).toBeVisible({ timeout: 5000 });
   await page.getByRole('menuitem', { name: /新建项目|New project/ }).click();
+  const nameField = page.getByRole('textbox', { name: /项目名称|Project name/ });
+  await expect(nameField).toBeVisible({ timeout: 5000 });
+  await nameField.fill(projectName);
+  await nameField.press('Enter');
 
   // Assign the conversation to it: the row's project control opens a select, which
   // only exists while that row is being edited.

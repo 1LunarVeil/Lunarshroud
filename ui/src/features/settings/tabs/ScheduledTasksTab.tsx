@@ -413,7 +413,7 @@ function RunHistory({ taskId }: { taskId: string }) {
             className={cn(
               'shrink-0 font-medium',
               run.status === 'ok'
-                ? 'text-[var(--success-text)]'
+                ? 'text-[var(--success)]'
                 : run.status === 'failed'
                   ? 'text-[var(--danger)]'
                   : 'text-[var(--text-secondary)]',

@@ -108,14 +108,25 @@ def summarize(days: int = DEFAULT_RANGE_DAYS, *, now: float | None = None) -> di
         "avg_tokens_per_second": None,
     }
     daily: dict[date, dict[str, int]] = defaultdict(lambda: {"requests": 0, "tokens": 0})
-    by_model: dict[str, int] = defaultdict(int)
+    # Per-model detail, not just a token total: "which model costs me the most" is a
+    # different question from "which model do I use most", and a token-only ranking
+    # cannot answer either when the request counts differ.
+    models: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "requests": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "speed_samples": [],
+        }
+    )
     speed_samples: list[float] = []
     active_days: set[date] = set()
     has_data = False
 
     path = _db_path()
     if not path.is_file():
-        return _empty(window, totals, daily, by_model)
+        return _empty(window, totals, daily, models)
 
     try:
         with _connect() as conn:
@@ -134,7 +145,7 @@ def summarize(days: int = DEFAULT_RANGE_DAYS, *, now: float | None = None) -> di
     except sqlite3.Error:
         # A missing/corrupt database is the storage endpoint's job to report;
         # the statistics page shows zero rather than an opaque 500.
-        return _empty(window, totals, daily, by_model)
+        return _empty(window, totals, daily, models)
 
     for row in rows:
         try:
@@ -169,7 +180,14 @@ def summarize(days: int = DEFAULT_RANGE_DAYS, *, now: float | None = None) -> di
 
         model = str(row["model"] or "").strip()
         if model:
-            by_model[model] += int(total or 0)
+            entry = models[model]
+            entry["requests"] += 1
+            entry["prompt_tokens"] += int(prompt or 0)
+            entry["completion_tokens"] += int(completion or 0)
+            entry["total_tokens"] += int(total or 0)
+            speed = _number(stats.get("predicted_per_second"))
+            if speed:
+                entry["speed_samples"].append(speed)
 
         speed = _number(stats.get("predicted_per_second"))
         if speed:
@@ -179,23 +197,51 @@ def summarize(days: int = DEFAULT_RANGE_DAYS, *, now: float | None = None) -> di
         totals["avg_tokens_per_second"] = round(
             sum(speed_samples) / len(speed_samples), 2
         )
-    return _finish(window, totals, daily, by_model, active_days, has_data)
+    return _finish(window, totals, daily, models, active_days, has_data)
 
 
 def _empty(
     window: int,
     totals: dict[str, Any],
     daily: dict[date, dict[str, int]],
-    by_model: dict[str, int],
+    models: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    return _finish(window, totals, daily, by_model, set(), False)
+    return _finish(window, totals, daily, models, set(), False)
+
+
+def _model_rows(models: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per-model rows, most tokens first.
+
+    Sorting is total tokens with the model name as the tiebreak so the order is
+    stable across calls — an unstable order makes the table jump between refreshes.
+    """
+    rows: list[dict[str, Any]] = []
+    for name, entry in models.items():
+        samples = entry.pop("speed_samples", [])
+        rows.append(
+            {
+                "model": name,
+                "requests": entry["requests"],
+                "prompt_tokens": entry["prompt_tokens"],
+                "completion_tokens": entry["completion_tokens"],
+                "total_tokens": entry["total_tokens"],
+                "avg_tokens_per_second": (
+                    round(sum(samples) / len(samples), 2) if samples else None
+                ),
+            }
+        )
+    rows.sort(key=lambda item: (-item["total_tokens"], item["model"]))
+    # Bound the list: a user with many model files would otherwise get a table that
+    # is longer than the page. The total is preserved in `models_total` so the UI can
+    # say "and N more" instead of silently truncating.
+    return rows
 
 
 def _finish(
     window: int,
     totals: dict[str, Any],
     daily: dict[date, dict[str, int]],
-    by_model: dict[str, int],
+    models: dict[str, dict[str, Any]],
     active_days: set[date],
     has_data: bool,
 ) -> dict[str, Any]:
@@ -216,11 +262,8 @@ def _finish(
         )
         cursor += timedelta(days=1)
 
-    top_model = None
-    if by_model:
-        model, tokens = max(by_model.items(), key=lambda item: (item[1], item[0]))
-        top_model = {"model": model, "tokens": tokens}
-
+    model_rows = _model_rows(models)
+    top_model = model_rows[0] if model_rows else None
     peak_day = None
     if daily:
         day, entry = max(daily.items(), key=lambda item: (item[1]["tokens"], item[0]))
@@ -230,9 +273,17 @@ def _finish(
         "range_days": window,
         "totals": totals,
         "daily": series,
+        # Full breakdown, not just the leader. Bounded to the 20 largest so the
+        # payload stays small; `models_total` says how many there were.
+        "models": model_rows[:20],
+        "models_total": len(model_rows),
+        "top_model": (
+            {"model": top_model["model"], "tokens": top_model["total_tokens"]}
+            if top_model
+            else None
+        ),
+        "peak_day": peak_day,
         "active_days": len(active_days),
         "longest_streak": _longest_streak(active_days),
-        "top_model": top_model,
-        "peak_day": peak_day,
         "has_data": has_data,
     }

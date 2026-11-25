@@ -42,8 +42,13 @@ jobs:
         # 公开镜像 github/ 不必单独 lint —— 镜像门禁已强制它与工作树逐字节
         # 一致，working tree 侧过了就等于过了。
         run: python -m ruff check backend tools
-      - name: Backend tests and product-code coverage
-        run: python -m pytest --cov=backend --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=75
+      # 前端必须在后端测试**之前**构建。
+      #
+      # `register_static_ui` 只在 `ui/dist/index.html` 存在时挂载 `/`，而
+      # `test_regressions.py::test_document_responses_are_not_framable` 与
+      # `test_auth_coverage.py` 的穷举都要请求 `/`。2026-11-25 实测：CI 先跑
+      # pytest 则 `ui/dist` 不存在，`/` 返回 500，两条测试一起红；而在开发机上
+      # 前端早就构建过，本地全绿。这就是 AGENTS §2.35 说的"开发机进不去的状态"。
       - uses: actions/setup-node@0a44ba7841725637a19e28fa30b79a866c81b0a6 # v4.0.4
         with:
           node-version: '22'
@@ -53,6 +58,17 @@ jobs:
         run: |
           npm ci
           if ($LASTEXITCODE -ne 0) { throw 'npm ci failed in ui/.' }
+      - name: UI production build (needed by backend tests)
+        working-directory: ui
+        shell: pwsh
+        run: |
+          # The build output is what Tauri embeds and what the backend serves in
+          # the source-run channel, and it is a precondition for the backend's
+          # document-response tests.
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'UI build failed.' }
+      - name: Backend tests and product-code coverage
+        run: python -m pytest --cov=backend --cov-config=.coveragerc --cov-report=term-missing --cov-fail-under=75
       - name: UI typecheck
         working-directory: ui
         shell: pwsh
@@ -65,16 +81,16 @@ jobs:
         run: |
           npm test
           if ($LASTEXITCODE -ne 0) { throw 'UI unit tests failed.' }
-      - name: UI production build
+      - name: UI production build gate
         working-directory: ui
         shell: pwsh
         run: |
-          # The build output is what Tauri embeds and what the backend serves in
-          # the source-run channel. A tree that passes unit tests but fails to
-          # bundle is not a usable artifact, so this is a gate.
-          npm run build
-          if ($LASTEXITCODE -ne 0) { throw 'UI production build failed.' }
+          # The build already ran above (the backend's document tests need it).
+          # This step keeps the original gate's meaning — a tree that passes unit
+          # tests but bundles to nothing is not a usable artifact — without paying
+          # for a second Vite run.
           if (-not (Test-Path dist/index.html)) { throw 'ui/dist/index.html is missing after build.' }
+          if (-not (Test-Path dist/assets)) { throw 'ui/dist/assets is missing after build.' }
       - name: Browser core-path, accessibility and performance gate
         shell: pwsh
         run: |
