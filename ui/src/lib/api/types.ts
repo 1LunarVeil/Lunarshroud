@@ -775,6 +775,8 @@ export interface AppConfig {
   chat_show_timestamps: boolean;
   /** Closed set; each preset is a hand-checked (fill, text) pair per theme. */
   accent_preset: 'blue' | 'violet' | 'teal' | 'amber' | 'rose' | 'green';
+  /** Closed set; each preset is a full stack including CJK fallbacks. */
+  font_preset: 'system' | 'serif' | 'mono';
   chat_assistant_name: string;
   chat_user_name: string;
   chat_assistant_avatar: string;

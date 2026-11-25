@@ -107,6 +107,33 @@ test('choosing an accent preset repaints real elements, not just an attribute', 
   await expect.poll(accentColor, { timeout: 10_000 }).toBe(baseline);
 });
 
+test('the body font preset changes the computed font family', async ({ page }) => {
+  const evidence = collectEvidence(page);
+  await boot(page, evidence);
+  const sheet = await openSettings(page);
+  await sheet.getByRole('button', { name: /外观|Appearance/ }).click();
+
+  // The computed `font-family` of <body> is what actually renders — asserting the
+  // `data-font` attribute would pass even if no CSS block matched (that is exactly
+  // how `--z-dropdown` shipped: attribute/class present, declaration invalid).
+  const bodyFont = () =>
+    page.evaluate(() => getComputedStyle(document.body).fontFamily.toLowerCase());
+
+  // Reset to a known state first: the shared dev backend keeps config across runs.
+  await sheet.getByTestId('font-system').click();
+  await sheet.getByRole('button', { name: /保存|Save/ }).click();
+  await expect.poll(bodyFont, { timeout: 10_000 }).toContain('inter');
+  const baseline = await bodyFont();
+
+  await sheet.getByTestId('font-mono').click();
+  await sheet.getByRole('button', { name: /保存|Save/ }).click();
+  await expect.poll(bodyFont, { timeout: 10_000 }).toContain('mono');
+
+  await sheet.getByTestId('font-system').click();
+  await sheet.getByRole('button', { name: /保存|Save/ }).click();
+  await expect.poll(bodyFont, { timeout: 10_000 }).toBe(baseline);
+});
+
 test('a project groups the conversations assigned to it', async ({ page }) => {
   const evidence = collectEvidence(page);
   await boot(page, evidence);

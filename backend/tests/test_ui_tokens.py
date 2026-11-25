@@ -426,6 +426,39 @@ def test_every_accent_preset_meets_wcag_aa_in_both_themes():
     assert not failures, "accent presets below WCAG AA:\n" + "\n".join(failures)
 
 
+def test_every_font_preset_has_a_css_block_and_sets_the_body_token():
+    """A preset offered in the UI with no CSS block is a control that does nothing.
+
+    Same shape as the missing `--z-dropdown`: the button renders, `aria-pressed`
+    flips, and the page never changes. This reconciles the list in `AppearanceTab`
+    against the `[data-font='…']` blocks in tokens.css, in both directions.
+    """
+    appearance = (UI_SRC / "features" / "settings" / "tabs" / "AppearanceTab.tsx").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(r"const FONT_PRESETS = \[([^\]]+)\]", appearance)
+    assert match, "cannot find FONT_PRESETS in AppearanceTab.tsx"
+    offered = set(re.findall(r"'([a-z]+)'", match.group(1)))
+    assert offered, "FONT_PRESETS is empty"
+
+    tokens = _read(TOKENS)
+    declared: dict[str, str] = {}
+    for block in re.finditer(r"\[data-font='([a-z]+)'\]\s*\{([^}]*)\}", tokens):
+        declared[block.group(1)] = block.group(2)
+
+    assert not sorted(offered - set(declared)), (
+        "font presets offered by the UI with no CSS block (picking them does "
+        f"nothing): {sorted(offered - set(declared))}"
+    )
+    assert not sorted(set(declared) - offered), (
+        f"font CSS blocks nothing offers: {sorted(set(declared) - offered)}"
+    )
+    # Each block must actually retarget the body token; setting some other property
+    # would compile and have no effect.
+    for name, body in declared.items():
+        assert "--font-body" in body, f"font preset {name!r} does not set --font-body"
+
+
 def test_the_accent_gate_rejects_a_low_contrast_preset():
     """Meta-check: the gate above must actually fail on a bad pair.
 

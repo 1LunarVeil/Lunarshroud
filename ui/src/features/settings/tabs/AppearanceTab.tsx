@@ -22,6 +22,8 @@ import { Laptop, Moon, Sun } from 'lucide-react';
  * and `test_ui_tokens.py` fails because it requires a block per preset name.
  */
 const ACCENT_PRESETS = ['blue', 'violet', 'teal', 'amber', 'rose', 'green'] as const;
+/** Body font presets; each is a full stack in tokens.css with CJK fallbacks. */
+const FONT_PRESETS = ['system', 'serif', 'mono'] as const;
 
 /**
  * Appearance: theme, language, chat identity and the chat background.
@@ -160,6 +162,37 @@ export function AppearanceTab() {
         </div>
         <p className="text-[length:var(--text-2xs)] text-[var(--text-tertiary)]">
           {translate('settings.accentPresetHelp')}
+        </p>
+      </fieldset>
+
+      <fieldset className="flex flex-col gap-2">
+        <legend className="mb-1 text-[length:var(--text-xs)] font-medium text-[var(--text-secondary)]">
+          {translate('settings.fontPreset')}
+        </legend>
+        <div className="flex gap-2">
+          {FONT_PRESETS.map((preset) => {
+            const active = (draft.font_preset ?? 'system') === preset;
+            return (
+              <button
+                key={preset}
+                type="button"
+                aria-pressed={active}
+                data-testid={`font-${preset}`}
+                onClick={() => patch({ font_preset: preset })}
+                className={cn(
+                  'min-h-[var(--control-h)] flex-1 rounded-[var(--radius-md)] border px-2 text-[length:var(--text-xs)]',
+                  active
+                    ? 'border-[var(--accent)] bg-[var(--accent-subtle)] font-medium text-[var(--accent-text)]'
+                    : 'border-[var(--border-control)] text-[var(--text-secondary)] hover:bg-[var(--hover)]',
+                )}
+              >
+                {translate(`settings.font_${preset}`)}
+              </button>
+            );
+          })}
+        </div>
+        <p className="text-[length:var(--text-2xs)] text-[var(--text-tertiary)]">
+          {translate('settings.fontPresetHelp')}
         </p>
       </fieldset>
 

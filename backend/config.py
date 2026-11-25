@@ -333,6 +333,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 满足两者。每个预设是一对手工选过、并由 test_ui_tokens.py 逐个重算对比度的
     # 值；加预设必须同时证明它过 AA。
     "accent_preset": "blue",
+    # 正文族预设：system / serif / mono。同样是闭集而不是"任意字体名"——
+    # 每个预设是一串含中文字体的回退栈，只写一个拉丁字体名会让中文回退到
+    # 不匹配的字形。system 是唯一在任何机器上都存在的选项。
+    "font_preset": "system",
     # 原生 Chat 的显示身份。名字是短文本；头像既可以是短文本（emoji/首字母），
     # 也可以是 `data:image/…;base64,…` 图片 —— **不落盘**，避免 CSP 以外的
     # 路径校验与清理问题。图片尺寸在前端裁剪到 128×128、编码后 ≤ 64 KiB，
@@ -669,6 +673,11 @@ def validate_config(cfg: dict[str, Any], *, repair: bool = False) -> dict[str, A
             {"blue", "violet", "teal", "amber", "rose", "green"},
         ),
         "accent_preset must be one of the declared presets",
+    )
+    check(
+        "font_preset",
+        _is_one_of(candidate.get("font_preset"), {"system", "serif", "mono"}),
+        "font_preset must be 'system', 'serif' or 'mono'",
     )
     # 联网搜索：布尔 + 短字符串 + 两个数值。端点本身在**使用时**由
     # `web_search.validate_endpoint` 再做一次完整校验（httpx 解析、回环策略），

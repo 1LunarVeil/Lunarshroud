@@ -160,6 +160,10 @@
     'Segoe UI', 'PingFang SC', 'Microsoft YaHei UI', 'Microsoft YaHei', sans-serif;
   --font-mono:
     'JetBrains Mono Variable', 'Cascadia Mono', 'SF Mono', Consolas, 'Courier New', monospace;
+  /* Body stack, overridable by `data-font` below. Kept as its own token so a preset
+     only has to restate one property, and so nothing else in the app has to know
+     which family is active. */
+  --font-body: var(--font-sans);
 
   --text-2xs: 11px;
   --text-xs: 12px;
@@ -431,4 +435,24 @@
   --accent: #6fd394;
   --accent-text: #93e0b0;
   --accent-hover: #81d9a2;
+}
+
+/* ---------------------------------------------------------------------------
+   Body font presets.
+
+   Also a closed set, for a different reason than the accent: each of these is a
+   stack of fonts that ship with (or commonly exist on) Windows, and the CJK faces
+   matter as much as the Latin ones — a "pretty" Latin-only choice makes Chinese
+   text fall back to a mismatched face. `system` is the default and the only one
+   guaranteed present everywhere.
+   --------------------------------------------------------------------------- */
+[data-font='system'] {
+  --font-body: var(--font-sans);
+}
+[data-font='serif'] {
+  --font-body:
+    'Georgia', 'Source Serif Pro', 'Songti SC', 'SimSun', 'Noto Serif CJK SC', serif;
+}
+[data-font='mono'] {
+  --font-body: var(--font-mono);
 }

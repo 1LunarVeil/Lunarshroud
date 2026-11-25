@@ -51,6 +51,13 @@ export function App() {
     if (preset) document.documentElement.dataset.accent = preset;
   }, [config.data?.accent_preset]);
 
+  // Same mechanism for the body font: a closed set in tokens.css, applied as an
+  // attribute so the cascade (not JS) decides the stack.
+  useEffect(() => {
+    const preset = config.data?.font_preset;
+    if (preset) document.documentElement.dataset.font = preset;
+  }, [config.data?.font_preset]);
+
   // Follow the OS preference while the user is on "system".
   useEffect(() => {
     if (themePreference !== 'system') return;
