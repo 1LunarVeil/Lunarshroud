@@ -358,3 +358,87 @@ def test_code_panel_text_meets_wcag_aa_in_both_themes():
             assert fg is not None, f"{theme}: missing {name}"
             ratio = _contrast(fg, ground)
             assert ratio >= 4.5, f"{theme}: {name} on --code-bg is {ratio:.2f}:1 (needs 4.5)"
+
+
+def _accent_blocks() -> list[tuple[str, str, str]]:
+    """Every `data-accent` preset block as `(theme, accent name, body)`.
+
+    The blocks live at the end of tokens.css and are written as
+    `:root[data-accent='x']` (light) and `:root.theme-dark[data-accent='x']` (dark).
+    """
+    tokens = _read(TOKENS)
+    found: list[tuple[str, str, str]] = []
+    # Two selector shapes: `[data-accent='x']` (any element — the light values and
+    # the settings swatches) and `:root.theme-dark[data-accent='x']` (dark variants).
+    # The dark ones are parsed first so the lighter match can skip their ranges.
+    dark_pattern = re.compile(
+        r":root\.theme-dark\[data-accent='([a-z]+)'\]\s*\{([^}]*)\}"
+    )
+    dark_ranges: list[tuple[int, int]] = []
+    for match in dark_pattern.finditer(tokens):
+        found.append(("dark", match.group(1), match.group(2)))
+        dark_ranges.append((match.start(), match.end()))
+    for match in re.finditer(r"\[data-accent='([a-z]+)'\]\s*\{([^}]*)\}", tokens):
+        if any(start <= match.start() < end for start, end in dark_ranges):
+            continue
+        found.append(("light", match.group(1), match.group(2)))
+    return found
+
+
+def test_every_accent_preset_meets_wcag_aa_in_both_themes():
+    """Accent colours are a **closed set** precisely so this can be proven.
+
+    `--accent` is used two ways: as a fill with white/black text on it, and as text
+    on `--surface`. Those need different lightnesses — the shipped blue is
+    `#2c5fd6` for fills and a darker `#1f4fc0` for text — which is why a free colour
+    picker cannot be made safe and the setting is a list of presets instead.
+
+    This is the gate that keeps the list honest: add a preset and it must pass both
+    checks in both themes, or the suite goes red. Measured failures here are real —
+    `--text-quaternary` shipped below AA twice (AGENTS §2.44).
+    """
+    blocks = _accent_blocks()
+    assert blocks, "no data-accent preset blocks found; the scan is broken"
+    light_surface = _hex(dict(_theme_blocks())["light"], "--surface")
+    dark_surface = _hex(dict(_theme_blocks())["dark"], "--surface")
+    assert light_surface is not None and dark_surface is not None
+
+    failures: list[str] = []
+    for theme, name, body in blocks:
+        surface = light_surface if theme == "light" else dark_surface
+        fill = _hex(body, "--accent")
+        text = _hex(body, "--accent-text")
+        if fill is None or text is None:
+            failures.append(f"{theme}/{name}: missing --accent or --accent-text")
+            continue
+        # Text use: the token must be readable on the page surface.
+        text_ratio = _contrast(text, surface)
+        if text_ratio < 4.5:
+            failures.append(f"{theme}/{name}: --accent-text on surface {text_ratio:.2f}:1")
+        # Fill use: a filled control carries `--on-primary`-like contrast. The accent
+        # fill is used behind light text in the light theme and dark text in the dark
+        # theme, so check against whichever of white/black is actually used there.
+        on_fill = (255.0, 255.0, 255.0) if theme == "light" else (17.0, 17.0, 17.0)
+        fill_ratio = _contrast(on_fill, fill)
+        if fill_ratio < 4.5:
+            failures.append(f"{theme}/{name}: text on --accent fill {fill_ratio:.2f}:1")
+
+    assert not failures, "accent presets below WCAG AA:\n" + "\n".join(failures)
+
+
+def test_the_accent_gate_rejects_a_low_contrast_preset():
+    """Meta-check: the gate above must actually fail on a bad pair.
+
+    A contrast test that cannot fail is worse than none — it reads as a guarantee.
+    This feeds the same arithmetic a preset that is obviously wrong and asserts it
+    is rejected, so a future refactor of `_rest`/`_contrast` cannot silently neuter
+    the real check.
+    """
+    white = (255.0, 255.0, 255.0)
+    surface = _hex(dict(_theme_blocks())["light"], "--surface")
+    assert surface is not None
+    # A pastel accent as *text* on a white surface: the exact mistake a free colour
+    # picker invites.
+    assert _contrast((255.0, 240.0, 200.0), surface) < 4.5
+    # And the same value as a *fill* behind white text also fails.
+    assert _contrast(white, (255.0, 240.0, 200.0)) < 4.5

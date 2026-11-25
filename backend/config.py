@@ -327,6 +327,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "chat_show_stats": "always",
     # 是否在消息旁显示时间戳。
     "chat_show_timestamps": False,
+    # 强调色预设名（`data-accent` 属性的取值）。**闭集而不是取色器**：
+    # `--accent` 同时用作填充色（上面压白/黑字）和页面上的文字色，两种用途需要
+    # 不同的明度（现有蓝色是填充 #2c5fd6、文字 #1f4fc0），一个自由色值无法同时
+    # 满足两者。每个预设是一对手工选过、并由 test_ui_tokens.py 逐个重算对比度的
+    # 值；加预设必须同时证明它过 AA。
+    "accent_preset": "blue",
     # 原生 Chat 的显示身份。名字是短文本；头像既可以是短文本（emoji/首字母），
     # 也可以是 `data:image/…;base64,…` 图片 —— **不落盘**，避免 CSP 以外的
     # 路径校验与清理问题。图片尺寸在前端裁剪到 128×128、编码后 ≤ 64 KiB，
@@ -655,6 +661,14 @@ def validate_config(cfg: dict[str, Any], *, repair: bool = False) -> dict[str, A
         "chat_show_timestamps",
         isinstance(candidate.get("chat_show_timestamps"), bool),
         "chat_show_timestamps must be a boolean",
+    )
+    check(
+        "accent_preset",
+        _is_one_of(
+            candidate.get("accent_preset"),
+            {"blue", "violet", "teal", "amber", "rose", "green"},
+        ),
+        "accent_preset must be one of the declared presets",
     )
     # 联网搜索：布尔 + 短字符串 + 两个数值。端点本身在**使用时**由
     # `web_search.validate_endpoint` 再做一次完整校验（httpx 解析、回环策略），

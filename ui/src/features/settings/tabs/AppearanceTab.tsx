@@ -11,6 +11,19 @@ import { identityFromConfig, AvatarField, BackgroundField } from '@/features/set
 import { Laptop, Moon, Sun } from 'lucide-react';
 
 /**
+ * The accent presets, in the order the picker shows them.
+ *
+ * No colour values live here: each swatch sets `data-accent` on **itself**, so the
+ * cascade in `tokens.css` gives it that preset's `--accent` for the current theme.
+ * That is what keeps AGENTS §2.36 true (colours only in `tokens.css`) and it also
+ * means the dots automatically show the dark-theme variant when the theme changes.
+ *
+ * A preset added here without a matching CSS block simply renders an unstyled dot,
+ * and `test_ui_tokens.py` fails because it requires a block per preset name.
+ */
+const ACCENT_PRESETS = ['blue', 'violet', 'teal', 'amber', 'rose', 'green'] as const;
+
+/**
  * Appearance: theme, language, chat identity and the chat background.
  *
  * Theme and language live in the UI store (localStorage) because they decide how
@@ -101,6 +114,53 @@ export function AppearanceTab() {
             </button>
           ))}
         </div>
+      </fieldset>
+
+      {/*
+        Accent presets, not a colour picker. `--accent` is used both as a fill (text
+        on top) and as text on the page surface, and those roles need different
+        lightness — hence a hand-checked pair per preset per theme, recomputed by
+        `test_ui_tokens.py`. A free picker could produce a value that fails AA in one
+        of the two roles.
+
+        Each swatch sets `data-accent` on itself so its dot is painted by the same
+        CSS block the UI will use, with no colour literal in this file (AGENTS §2.36).
+      */}
+      <fieldset className="flex flex-col gap-2">
+        <legend className="mb-1 text-[length:var(--text-xs)] font-medium text-[var(--text-secondary)]">
+          {translate('settings.accentPreset')}
+        </legend>
+        <div className="flex flex-wrap gap-2">
+          {ACCENT_PRESETS.map((preset) => {
+            const active = (draft.accent_preset ?? 'blue') === preset;
+            return (
+              <button
+                key={preset}
+                type="button"
+                aria-pressed={active}
+                aria-label={translate(`settings.accent_${preset}`)}
+                title={translate(`settings.accent_${preset}`)}
+                onClick={() => patch({ accent_preset: preset })}
+                data-testid={`accent-${preset}`}
+                className={cn(
+                  'grid size-8 place-items-center rounded-full border-2',
+                  active
+                    ? 'border-[var(--text)]'
+                    : 'border-transparent hover:border-[var(--border-control)]',
+                )}
+              >
+                <span
+                  aria-hidden="true"
+                  data-accent={preset}
+                  className="block size-5 rounded-full bg-[var(--accent)]"
+                />
+              </button>
+            );
+          })}
+        </div>
+        <p className="text-[length:var(--text-2xs)] text-[var(--text-tertiary)]">
+          {translate('settings.accentPresetHelp')}
+        </p>
       </fieldset>
 
       <section className="flex flex-col gap-4 border-t border-[var(--border)] pt-5">

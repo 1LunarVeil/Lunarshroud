@@ -62,6 +62,51 @@ test('the scheduled-tasks tab creates a task and shows its schedule', async ({ p
   await expect(sheet.getByText(name, { exact: false })).toHaveCount(0, { timeout: 10_000 });
 });
 
+test('choosing an accent preset repaints real elements, not just an attribute', async ({
+  page,
+}) => {
+  const evidence = collectEvidence(page);
+  await boot(page, evidence);
+  const sheet = await openSettings(page);
+  await sheet.getByRole('button', { name: /外观|Appearance/ }).click();
+
+  // Read the computed colour of an element that really uses the accent, before and
+  // after. Asserting `data-accent` alone would pass even if no CSS block matched.
+  const accentColor = () =>
+    page.evaluate(() => {
+      const node = document.querySelector('[data-testid="nav-chat"]');
+      if (!node) return '';
+      return getComputedStyle(node).getPropertyValue('--accent').trim();
+    });
+
+  const before = await accentColor();
+  expect(before).not.toBe('');
+
+  // Reset to a known value first. The shared dev backend keeps state across runs, so
+  // a previous failed attempt could have left another preset applied; without this
+  // the "changed" assertion can start from the value it is about to set.
+  const blue = sheet.getByTestId('accent-blue');
+  await blue.click();
+  await sheet.getByRole('button', { name: /保存|Save/ }).click();
+  await expect.poll(accentColor, { timeout: 10_000 }).toBe('#2c5fd6');
+  const baseline = await accentColor();
+
+  const swatch = sheet.getByTestId('accent-teal');
+  await expect(swatch).toBeVisible({ timeout: 5000 });
+  await swatch.click();
+  await sheet.getByRole('button', { name: /保存|Save/ }).click();
+  // Wait for the config to land; the effect reads from the config query.
+  await expect
+    .poll(accentColor, { timeout: 10_000 })
+    .not.toBe(baseline);
+
+  // Restore, so the shared dev backend is left as it was.
+  const reset = sheet.getByTestId('accent-blue');
+  await reset.click();
+  await sheet.getByRole('button', { name: /保存|Save/ }).click();
+  await expect.poll(accentColor, { timeout: 10_000 }).toBe(baseline);
+});
+
 test('a project groups the conversations assigned to it', async ({ page }) => {
   const evidence = collectEvidence(page);
   await boot(page, evidence);

@@ -21,6 +21,7 @@ export function App() {
   const themePreference = useUiStore((state) => state.themePreference);
   const syncResolvedTheme = useUiStore((state) => state.syncResolvedTheme);
   const locale = useUiStore((state) => state.locale);
+  const config = useQuery({ queryKey: ['system', 'config'], queryFn: systemApi.getConfig });
 
   useInstanceFeed();
 
@@ -31,6 +32,24 @@ export function App() {
     root.classList.toggle('theme-dark', resolvedTheme === 'dark');
     root.style.colorScheme = resolvedTheme;
   }, [resolvedTheme]);
+
+  /**
+   * Apply the accent preset.
+   *
+   * A `data-accent` attribute rather than an inline custom property: the presets in
+   * `tokens.css` are per-theme (a value that reads on white is wrong on black), and
+   * an inline `--accent` would have to be recomputed on every theme change in JS.
+   * With the attribute, the CSS cascade picks the right pair for the current theme.
+   *
+   * The value is validated on the backend (closed set) and again here by omission:
+   * an unknown preset simply matches no rule, which leaves the defaults in place —
+   * a bad stored value degrades to the shipped accent instead of to an unstyled
+   * window.
+   */
+  useEffect(() => {
+    const preset = config.data?.accent_preset;
+    if (preset) document.documentElement.dataset.accent = preset;
+  }, [config.data?.accent_preset]);
 
   // Follow the OS preference while the user is on "system".
   useEffect(() => {

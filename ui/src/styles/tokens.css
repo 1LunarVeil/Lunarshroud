@@ -345,3 +345,90 @@
     --on-primary: ButtonText;
   }
 }
+
+/* ---------------------------------------------------------------------------
+   Accent presets.
+
+   A **closed set** rather than a colour picker, and that is a deliberate
+   accessibility decision. `--accent` is used both as a fill (with white text on
+   it) and as text on `--surface`, and those two uses need different lightness:
+   the shipped blue is `#2c5fd6` for fills but a darker `#1f4fc0` for text, because
+   one value cannot satisfy both. A free picker would let a user choose a colour
+   that fails AA in one of the two roles, and the failure is invisible until axe
+   runs — which is exactly how `--text-quaternary` shipped below AA twice
+   (AGENTS §2.44).
+
+   Each preset therefore carries a *hand-checked pair* per theme: the fill value
+   and the text value. `test_ui_tokens.py` recomputes the contrast for every pair
+   and fails if any of them drops under 4.5:1, so adding a preset means proving
+   it rather than eyeballing it.
+
+   The selectors are attribute-based **without** `:root`, so the same block paints
+   the settings swatches (which set `data-accent` on a `<span>`) and the app root.
+   The dark variants are scoped to `:root.theme-dark`, so a swatch inside a dark
+   app shows the dark value it will actually apply.
+   --------------------------------------------------------------------------- */
+[data-accent='blue'] {
+  --accent: #2c5fd6;
+  --accent-text: #1f4fc0;
+  --accent-hover: #2450b8;
+}
+[data-accent='violet'] {
+  --accent: #6d3fc4;
+  --accent-text: #5a2fa8;
+  --accent-hover: #5d34ab;
+}
+[data-accent='teal'] {
+  --accent: #0f6f6b;
+  --accent-text: #0a5b58;
+  --accent-hover: #0b605d;
+}
+[data-accent='amber'] {
+  --accent: #8a5a00;
+  --accent-text: #744c00;
+  --accent-hover: #774e00;
+}
+[data-accent='rose'] {
+  --accent: #a52c4e;
+  --accent-text: #8e2442;
+  --accent-hover: #911f43;
+}
+[data-accent='green'] {
+  --accent: #1f6b3a;
+  --accent-text: #185a30;
+  --accent-hover: #1a5f33;
+}
+
+/* Dark theme: the same hues, lightened so they read against a dark surface.
+   Kept as a separate block because the light values above are deliberately
+   darker than their hue's midpoint. */
+:root.theme-dark[data-accent='blue'] {
+  --accent: #7aa2ff;
+  --accent-text: #9cbbff;
+  --accent-hover: #93b4ff;
+}
+:root.theme-dark[data-accent='violet'] {
+  --accent: #b79cff;
+  --accent-text: #cbb8ff;
+  --accent-hover: #c4adff;
+}
+:root.theme-dark[data-accent='teal'] {
+  --accent: #5fd3ca;
+  --accent-text: #8ce0d9;
+  --accent-hover: #7cd9d1;
+}
+:root.theme-dark[data-accent='amber'] {
+  --accent: #f0c368;
+  --accent-text: #f6d795;
+  --accent-hover: #f4cd82;
+}
+:root.theme-dark[data-accent='rose'] {
+  --accent: #ff96b4;
+  --accent-text: #ffb4c9;
+  --accent-hover: #ffa9c0;
+}
+:root.theme-dark[data-accent='green'] {
+  --accent: #6fd394;
+  --accent-text: #93e0b0;
+  --accent-hover: #81d9a2;
+}
