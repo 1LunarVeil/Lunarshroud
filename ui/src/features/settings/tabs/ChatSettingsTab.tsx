@@ -60,11 +60,85 @@ export function ChatSettingsTab() {
         </div>
       </Field>
 
+      {/*
+        Display preferences for the composer and the transcript. Both are stored in
+        the backend config rather than localStorage: a layout habit should not be
+        lost by clearing the webview cache, and the same reasoning applies to the
+        sidebar widths stored a few fields above.
+      */}
+      <Field
+        label={translate('settings.chatSendKey')}
+        hint={translate('settings.chatSendKeyHelp')}
+        htmlFor="settings-chat-send-key"
+      >
+        <div className="flex gap-2">
+          {(
+            [
+              ['enter', 'settings.chatSendKeyEnter'],
+              ['ctrl-enter', 'settings.chatSendKeyCtrlEnter'],
+            ] as const
+          ).map(([value, key]) => {
+            const active = (draft.chat_send_key ?? 'enter') === value;
+            return (
+              <button
+                key={value}
+                type="button"
+                id={value === 'enter' ? 'settings-chat-send-key' : undefined}
+                aria-pressed={active}
+                onClick={() => patch({ chat_send_key: value })}
+                className={
+                  'min-h-[var(--control-h)] flex-1 rounded-[var(--radius-md)] border px-2 text-[length:var(--text-xs)] ' +
+                  (active
+                    ? 'border-[var(--accent)] bg-[var(--accent-subtle)] font-medium text-[var(--accent-text)]'
+                    : 'border-[var(--border-control)] text-[var(--text-secondary)] hover:bg-[var(--hover)]')
+                }
+              >
+                {translate(key)}
+              </button>
+            );
+          })}
+        </div>
+      </Field>
+
+      <Field
+        label={translate('settings.chatShowStats')}
+        hint={translate('settings.chatShowStatsHelp')}
+        htmlFor="settings-chat-show-stats"
+      >
+        <div className="flex gap-2">
+          {(
+            [
+              ['always', 'settings.chatShowStatsAlways'],
+              ['never', 'settings.chatShowStatsNever'],
+            ] as const
+          ).map(([value, key]) => {
+            const active = (draft.chat_show_stats ?? 'always') === value;
+            return (
+              <button
+                key={value}
+                type="button"
+                id={value === 'always' ? 'settings-chat-show-stats' : undefined}
+                aria-pressed={active}
+                onClick={() => patch({ chat_show_stats: value })}
+                className={
+                  'min-h-[var(--control-h)] flex-1 rounded-[var(--radius-md)] border px-2 text-[length:var(--text-xs)] ' +
+                  (active
+                    ? 'border-[var(--accent)] bg-[var(--accent-subtle)] font-medium text-[var(--accent-text)]'
+                    : 'border-[var(--border-control)] text-[var(--text-secondary)] hover:bg-[var(--hover)]')
+                }
+              >
+                {translate(key)}
+              </button>
+            );
+          })}
+        </div>
+      </Field>
+
       <Switch
-        checked={Boolean(draft.persist_instance_logs)}
-        onCheckedChange={(next) => patch({ persist_instance_logs: next })}
-        label={translate('settings.persistLogs')}
-        description={translate('settings.persistLogsHelp')}
+        checked={Boolean(draft.chat_show_timestamps)}
+        onCheckedChange={(next) => patch({ chat_show_timestamps: next })}
+        label={translate('settings.chatShowTimestamps')}
+        description={translate('settings.chatShowTimestampsHelp')}
       />
 
       <div className="grid gap-3 sm:grid-cols-2">

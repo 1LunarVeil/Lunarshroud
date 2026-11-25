@@ -476,6 +476,9 @@ export function ChatPage() {
           loading={loadingConversation}
           instance={activeInstance}
           reasoningMode={reasoningMode}
+          sendKey={config.data?.chat_send_key === 'ctrl-enter' ? 'ctrl-enter' : 'enter'}
+          showStats={config.data?.chat_show_stats !== 'never'}
+          showTimestamps={config.data?.chat_show_timestamps === true}
           toolRoot={toolRoot}
           toolResults={toolResults}
           identity={identity}

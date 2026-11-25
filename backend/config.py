@@ -313,6 +313,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
     #   collapse 始终折叠
     # 用户手动点过某一条之后，那一条以他的选择为准，不再被这个偏好覆盖。
     "chat_reasoning": "auto",
+    # 输入框里哪个组合键发送消息：
+    #   enter        Enter 发送 / Shift+Enter 换行（默认，与主流一致）
+    #   ctrl-enter   Ctrl+Enter 发送 / Enter 换行
+    # 存在后端而不是 localStorage：换机器后习惯不该丢（与侧栏宽度同一理由）。
+    # 中文/日文输入法合成期间的 Enter 一律不发送，两种取值都如此。
+    "chat_send_key": "enter",
+    # 每条回复下方的统计行（tokens · tok/s · 耗时）何时显示：
+    #   always  始终显示（默认）
+    #   never   不显示
+    # 不给"仅悬停"取值：触摸设备没有悬停，那种取值在平板上等价于 never 而没有
+    # 说明，这正是"设置看起来生效、实际不生效"的一类。
+    "chat_show_stats": "always",
+    # 是否在消息旁显示时间戳。
+    "chat_show_timestamps": False,
     # 原生 Chat 的显示身份。名字是短文本；头像既可以是短文本（emoji/首字母），
     # 也可以是 `data:image/…;base64,…` 图片 —— **不落盘**，避免 CSP 以外的
     # 路径校验与清理问题。图片尺寸在前端裁剪到 128×128、编码后 ≤ 64 KiB，
@@ -626,6 +640,21 @@ def validate_config(cfg: dict[str, Any], *, repair: bool = False) -> dict[str, A
         "chat_reasoning",
         _is_one_of(candidate.get("chat_reasoning"), {"auto", "expand", "collapse"}),
         "chat_reasoning must be 'auto', 'expand' or 'collapse'",
+    )
+    check(
+        "chat_send_key",
+        _is_one_of(candidate.get("chat_send_key"), {"enter", "ctrl-enter"}),
+        "chat_send_key must be 'enter' or 'ctrl-enter'",
+    )
+    check(
+        "chat_show_stats",
+        _is_one_of(candidate.get("chat_show_stats"), {"always", "never"}),
+        "chat_show_stats must be 'always' or 'never'",
+    )
+    check(
+        "chat_show_timestamps",
+        isinstance(candidate.get("chat_show_timestamps"), bool),
+        "chat_show_timestamps must be a boolean",
     )
     # 联网搜索：布尔 + 短字符串 + 两个数值。端点本身在**使用时**由
     # `web_search.validate_endpoint` 再做一次完整校验（httpx 解析、回环策略），

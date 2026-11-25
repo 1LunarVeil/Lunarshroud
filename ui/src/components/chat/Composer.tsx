@@ -61,6 +61,8 @@ export interface ComposerProps {
   contextLabel?: string;
   contextPercent?: number | null;
   placeholder?: string;
+  /** Which key combo sends. Defaults to `enter` so a caller that omits it is unchanged. */
+  sendKey?: 'enter' | 'ctrl-enter';
 }
 
 const MAX_ROWS_PX = 220;
@@ -77,6 +79,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     contextLabel,
     contextPercent = null,
     placeholder,
+    sendKey = 'enter',
   },
   ref,
 ) {
@@ -276,12 +279,18 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
               composing.current = false;
             }}
             onKeyDown={(event) => {
-              if (event.key === 'Enter' && !event.shiftKey) {
-                // Never send mid-composition: an IME commit is not a send intent.
-                if (composing.current || event.nativeEvent.isComposing) return;
-                event.preventDefault();
-                submit();
-              }
+              // `sendKey` is a user preference: 'enter' (default) or 'ctrl-enter'.
+              // With 'ctrl-enter', a bare Enter must insert a newline, so it is
+              // **not** prevented here — the textarea's default does the right thing.
+              const sends =
+                sendKey === 'ctrl-enter'
+                  ? event.key === 'Enter' && (event.ctrlKey || event.metaKey)
+                  : event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.metaKey;
+              if (!sends) return;
+              // Never send mid-composition: an IME commit is not a send intent.
+              if (composing.current || event.nativeEvent.isComposing) return;
+              event.preventDefault();
+              submit();
             }}
             onPaste={(event) => {
               const files = event.clipboardData?.files;

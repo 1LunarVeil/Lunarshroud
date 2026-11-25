@@ -41,6 +41,10 @@ export interface MessageRowProps {
    * and a settings change repaints immediately.
    */
   identity?: ChatIdentity;
+  /** Show the stats row (config `chat_show_stats`). Defaults to on. */
+  showStats?: boolean;
+  /** Show when the message was created (config `chat_show_timestamps`). */
+  showTimestamp?: boolean;
   onCopy?: (message: ChatMessage, includeReasoning: boolean) => void;
   onEdit?: (message: ChatMessage) => void;
   onBranch?: (message: ChatMessage) => void;
@@ -207,6 +211,8 @@ export const MessageRow = memo(function MessageRow({
   onDenyTool,
   canRegenerate = false,
   identity,
+  showStats = true,
+  showTimestamp = false,
   editing = false,
   onEditCancel,
   onEditSubmit,
@@ -424,7 +430,13 @@ export const MessageRow = memo(function MessageRow({
           line. Only rendered when a number is actually present, so an aborted or
           usage-less reply does not show "0 tokens · — tok/s".
         */}
-        <MessageStats stats={message.stats} streaming={streaming} />
+        <MessageStats
+          stats={message.stats}
+          streaming={streaming}
+          show={showStats}
+          createdAt={message.created_at}
+          showTimestamp={showTimestamp}
+        />
         {actions}
       </div>
     </article>
@@ -434,28 +446,54 @@ export const MessageRow = memo(function MessageRow({
 function MessageStats({
   stats,
   streaming,
+  show = true,
+  createdAt,
+  showTimestamp = false,
 }: {
   stats?: Record<string, unknown>;
   streaming?: boolean;
+  /** `chat_show_stats === 'never'` hides the whole row. */
+  show?: boolean;
+  createdAt?: number | string | null;
+  showTimestamp?: boolean;
 }) {
-  if (streaming || !stats) return null;
+  if (streaming) return null;
   const number = (key: string): number | null => {
-    const value = stats[key];
+    const value = stats?.[key];
     return typeof value === 'number' && Number.isFinite(value) ? value : null;
   };
-  const total = number('total_tokens');
-  const completion = number('completion_tokens');
-  const speed = number('predicted_per_second');
-  const elapsed = number('elapsed_ms');
 
   const parts: string[] = [];
-  const tokens = total ?? completion;
-  if (tokens !== null) parts.push(translate('chat.statsTokens', { count: Math.round(tokens) }));
-  if (speed !== null) parts.push(`${speed.toFixed(1)} tok/s`);
-  if (elapsed !== null) {
-    const seconds = Math.max(0, elapsed / 1000);
-    parts.push(translate('chat.statsTime', { seconds: seconds.toFixed(1) }));
+  if (show && stats) {
+    const total = number('total_tokens');
+    const completion = number('completion_tokens');
+    const speed = number('predicted_per_second');
+    const elapsed = number('elapsed_ms');
+    const tokens = total ?? completion;
+    if (tokens !== null) {
+      parts.push(translate('chat.statsTokens', { count: Math.round(tokens) }));
+    }
+    if (speed !== null) parts.push(`${speed.toFixed(1)} tok/s`);
+    if (elapsed !== null) {
+      const seconds = Math.max(0, elapsed / 1000);
+      parts.push(translate('chat.statsTime', { seconds: seconds.toFixed(1) }));
+    }
   }
+
+  // The timestamp honours its own setting independently: someone who hides token
+  // counts may still want "when was this said".
+  if (showTimestamp) {
+    const seconds =
+      typeof createdAt === 'number'
+        ? createdAt
+        : typeof createdAt === 'string' && createdAt
+          ? Number(createdAt)
+          : Number.NaN;
+    if (Number.isFinite(seconds) && seconds > 0) {
+      parts.push(new Date(seconds * 1000).toLocaleString());
+    }
+  }
+
   if (!parts.length) return null;
 
   return (

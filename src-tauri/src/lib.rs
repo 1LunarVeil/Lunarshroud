@@ -1990,10 +1990,7 @@ async fn open_file_dialog(
 
 /// Tauri command：打开目录选择对话框（异步回调包装，避免阻塞 WebView2 主线程）
 #[tauri::command]
-async fn open_directory_dialog(
-    app: tauri::AppHandle,
-    current: Option<String>,
-) -> Option<String> {
+async fn open_directory_dialog(app: tauri::AppHandle, current: Option<String>) -> Option<String> {
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let mut dialog = app.dialog().file();
@@ -2072,11 +2069,10 @@ fn open_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
 mod tests {
     use super::{
         append_launcher_log_at, backend_readiness_is_authentic, backend_runtime_temp,
-        dir_is_writable, external_url_is_allowed, navigation_is_internal,
-        next_generation_failures, open_path_verdict, parse_backend_port, parse_close_to_tray,
-        random_session_secret, readiness_proof, ready_probe_url, supervision_backoff,
-        system_tool, wait_for_process_exit, webview2_data_dir, BackendSupervisor,
-        LAUNCHER_LOG_MAX_BYTES,
+        dir_is_writable, external_url_is_allowed, navigation_is_internal, next_generation_failures,
+        open_path_verdict, parse_backend_port, parse_close_to_tray, random_session_secret,
+        readiness_proof, ready_probe_url, supervision_backoff, system_tool, wait_for_process_exit,
+        webview2_data_dir, BackendSupervisor, LAUNCHER_LOG_MAX_BYTES,
     };
     use std::path::Path;
     use std::time::Duration;
@@ -2255,7 +2251,10 @@ mod tests {
             "http://localhost:5173/",
             "https://localhost/",
         ] {
-            assert!(navigation_is_internal(&Url::parse(allowed).unwrap()), "{allowed}");
+            assert!(
+                navigation_is_internal(&Url::parse(allowed).unwrap()),
+                "{allowed}"
+            );
         }
         // 远程页面、协议处理器、以及伪装成子域的地址。
         for blocked in [

@@ -768,6 +768,11 @@ export interface AppConfig {
   theme: string;
   close_to_tray: boolean;
   chat_reasoning: 'auto' | 'expand' | 'collapse';
+  /** Which key combo sends: Enter, or Ctrl+Enter (Enter inserts a newline). */
+  chat_send_key: 'enter' | 'ctrl-enter';
+  /** Whether the per-message stats row is shown at all. */
+  chat_show_stats: 'always' | 'never';
+  chat_show_timestamps: boolean;
   chat_assistant_name: string;
   chat_user_name: string;
   chat_assistant_avatar: string;

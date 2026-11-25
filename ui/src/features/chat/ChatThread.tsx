@@ -94,6 +94,9 @@ export function ChatThread({
   onDenyTool,
   onChooseToolRoot,
   onClearToolRoot,
+  sendKey = 'enter',
+  showStats = true,
+  showTimestamps = false,
 }: {
   messages: ChatMessage[];
   live: LiveStreamShape;
@@ -101,6 +104,11 @@ export function ChatThread({
   loading: boolean;
   instance: Instance | null;
   reasoningMode: 'auto' | 'expand' | 'collapse' | string;
+  /** Which key combo sends. See `AppConfig.chat_send_key`. */
+  sendKey?: 'enter' | 'ctrl-enter';
+  /** Show the per-message stats row. */
+  showStats?: boolean;
+  showTimestamps?: boolean;
   toolRoot: string | null;
   toolResults: Record<string, { ok: boolean; content: string }>;
   identity?: ChatIdentity;
@@ -267,6 +275,8 @@ export function ChatThread({
                 toolResults={resolvedToolResults}
                 identity={identity}
                 toolNamesByCallId={toolNamesByCallId}
+                showStats={showStats}
+                showTimestamp={showTimestamps}
                 canRegenerate={index === lastAssistantIndex && !streaming}
                 onDelete={(item) => void onDeleteMessage(item)}
                 onBranch={(item) => void onBranchMessage(item)}
@@ -320,6 +330,7 @@ export function ChatThread({
           percent: Math.round(usage.ratio * 100),
         })}
         contextPercent={usage.used === null ? null : Math.round(usage.ratio * 100)}
+        sendKey={sendKey}
       />
 
       <ToolFolderBar
