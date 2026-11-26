@@ -870,8 +870,10 @@ def load_config() -> dict[str, Any]:
     保证"外壳探测端口"与"后端监听端口"永远来自同一个决策点）。
     覆盖只作用于本进程内存，**不回写** config.json —— 用户的文件值保持原样。
     """
+    global _env_port_override_value
     cfg = _load_config_from_file()
     override = _env_port_override()
+    _env_port_override_value = override
     if override is not None and cfg.get("launcher_port") != override:
         LOGGER.warning(
             "launcher_port 以环境变量 LUNARSHROUD_LAUNCHER_PORT=%d 为准"
@@ -1017,6 +1019,18 @@ _config_load_failed = False
 # 计算 candidate，后落盘者会把先落盘者的键覆盖回去，静默丢更新。
 _update_lock = threading.Lock()
 
+# `LUNARSHROUD_LAUNCHER_PORT` 的生效值（None = 没有覆盖）。
+#
+# 记下来是为了把它**排除在落盘之外**：`load_config` 把覆盖写进内存 cfg，而
+# `update_config` 用 `dict(get_config())` 当基线做读-改-写，于是用户改任何一个
+# 无关设置（换主题、改字体）都会顺手把这个环境变量的值固化进 config.json。
+# 后果是下一次不带该环境变量启动时后端去绑一个错误的端口，或者与外壳探测的端口
+# 不一致 —— 2026-11-26 在打包态实测到：手动用
+# `LUNARSHROUD_LAUNCHER_PORT=17777` 起了一次后端并保存了一次设置，config.json
+# 里就留下了 `launcher_port: 17777`，随后正常启动外壳时后端抢不到端口、以
+# exit code 3 退出，界面只报"后端启动失败"。
+_env_port_override_value: int | None = None
+
 
 def get_config() -> dict[str, Any]:
     """获取全局配置单例"""
@@ -1057,6 +1071,19 @@ def update_config(updates: dict[str, Any]) -> dict[str, Any]:
         candidate = dict(get_config())
         candidate.update(updates)
         validated = validate_config(candidate)
+        # The env override is process-scoped, so it must not be written to the file.
+        # `get_config()` above already folded it into `candidate`; restore the file's
+        # own value in a **copy** and persist that copy. `validated` keeps the override
+        # in memory so this process keeps listening where the shell probes — the whole
+        # point of the override. Without this split, changing an unrelated setting
+        # (theme, font) while the shell had injected a port rewrote the user's
+        # `launcher_port`; see the note on `_env_port_override_value`.
+        to_persist = validated
+        if _env_port_override_value is not None:
+            to_persist = dict(validated)
+            to_persist["launcher_port"] = _load_config_from_file().get(
+                "launcher_port", DEFAULT_CONFIG["launcher_port"]
+            )
         # 重绑模块全局，而不是 clear() + update() 就地改。
         # 就地改会在这两行之间把共享单例暴露成空 dict：并发的
         # process_manager.py:221 直接 cfg["llama_server_path"] 会 KeyError → 500，
@@ -1065,6 +1092,6 @@ def update_config(updates: dict[str, Any]) -> dict[str, Any]:
         #
         # 先落盘再重绑：持久化失败时内存配置保持不变，
         # 不会出现"界面显示已保存、重启后又是旧值"。
-        save_config(validated)
+        save_config(to_persist)
         _config = validated
         return _config

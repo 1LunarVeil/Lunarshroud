@@ -2246,6 +2246,46 @@ def test_launcher_port_env_override_wins_but_is_not_persisted(monkeypatch, tmp_p
         assert backend_config.load_config()["launcher_port"] == 17520
 
 
+def test_the_env_port_override_is_not_baked_in_by_an_unrelated_save(monkeypatch, tmp_path):
+    """覆盖值必须只活在内存里 —— 连同**后续任何一次保存**都不能把它写进文件。
+
+    2026-11-26 打包态实测：手动用 ``LUNARSHROUD_LAUNCHER_PORT=17777`` 起了一次后端，
+    然后在界面里改了个强调色，config.json 里就留下了 ``launcher_port: 17777``。
+    下一次不带该环境变量启动外壳时，后端去绑 17777（与外壳探测的 17520 不一致，
+    且可能被别的进程占着），以 **exit code 3** 退出，用户只看到"后端启动失败"。
+
+    根因是 `update_config` 的读-改-写用 `dict(get_config())` 当基线，而
+    `get_config()` 里已经折进了环境变量覆盖。这个测试走的是真实调用链
+    （`update_config`，不是纯函数），因为缺陷正出在那条链上。
+    """
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    import config as backend_config
+
+    config_file = tmp_path / "config.json"
+    monkeypatch.setattr(backend_config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(backend_config, "PRESETS_DIR", tmp_path / "presets")
+    monkeypatch.setattr(backend_config, "CONFIG_FILE", config_file)
+    monkeypatch.setattr(backend_config, "_config", None)
+    monkeypatch.setattr(backend_config, "_env_port_override_value", None)
+
+    monkeypatch.setenv("LUNARSHROUD_LAUNCHER_PORT", "17777")
+    assert backend_config.get_config()["launcher_port"] == 17777
+
+    # An unrelated setting is saved while the override is in effect.
+    saved = backend_config.update_config({"accent_preset": "teal"})
+    assert saved["accent_preset"] == "teal"
+    # In memory the override still wins — that is the whole point of it.
+    assert saved["launcher_port"] == 17777
+
+    # On disk it must stay the user's own value.
+    stored = json.loads(config_file.read_text(encoding="utf-8"))
+    assert stored["launcher_port"] == 17520, (
+        "the environment override was persisted; the next launch without it will "
+        "bind the wrong port and the shell will report 'backend failed to start'"
+    )
+    assert stored["accent_preset"] == "teal"
+
+
 def test_switch_integer_values_behave_like_booleans():
     """导入的预设可能携带整型布尔（1/0）；开关行为必须与 True/False 完全一致。
 
