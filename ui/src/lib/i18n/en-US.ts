@@ -742,6 +742,7 @@ export const EN_US: Record<string, string> = {
   "logs.copyFailed": "Copy failed: the browser refused clipboard access",
   "logs.openFolder": "Open logs folder",
   "logs.openFailed": "Could not open the logs folder",
+  "logs.downloadBundle": "Download all logs (zip)",
   "logs.count": "Showing {shown} / {total} lines",
   "logs.noInstances": "No instances",
   "logs.empty": "No logs yet",

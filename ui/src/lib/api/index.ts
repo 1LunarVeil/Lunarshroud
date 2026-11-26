@@ -80,6 +80,15 @@ export const systemApi = {
   overview: () => apiGet<SystemOverview>('/api/system/overview'),
   paths: () => apiGet<SystemPaths>('/api/system/paths'),
   storage: () => apiGet<StorageReport>('/api/system/storage'),
+  /**
+   * URL for the zip of everything under `logs/`.
+   *
+   * Returned as a URL rather than fetched: the browser owns the download, so a 50 MiB
+   * archive never becomes a Blob in the page's heap. The caller navigates an anchor to
+   * it; the session token is added by `authorizedDownloadUrl` in the caller, because a
+   * bare href cannot carry a header.
+   */
+  logsBundlePath: () => '/api/system/logs/bundle',
   capabilities: (model?: string, runtimeId?: string) =>
     apiGet<Record<string, unknown>>(
       `/api/system/capabilities${qs({ model, runtime_id: runtimeId })}`,

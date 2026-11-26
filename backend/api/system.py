@@ -418,3 +418,83 @@ async def api_system_paths():
         "listening_port": getattr(main, "LISTENING_PORT", None),
         "configured_port": get_config().get("launcher_port"),
     }
+
+
+# Log bundle size ceiling. A chatty model produces megabytes per hour; an unbounded
+# bundle would be a memory spike on a machine already busy with a model.
+MAX_LOG_BUNDLE_BYTES = 50 * 1024 * 1024
+
+
+@router.get("/api/system/logs/bundle")
+async def api_log_bundle():
+    """Zip everything under `logs/` for a support report.
+
+    Two deliberate bounds:
+
+    - **Only the `logs` directory**, resolved and compared with `is_relative_to` on
+      the resolved path: a symlink or a crafted name cannot reach `chats.db` or
+      `config.json` from here, and a sibling named `logs-evil` does not share a
+      prefix by accident.
+    - **A total-bytes ceiling.** Files are added until the ceiling is reached; the
+      rest are listed in `_OMITTED.txt` inside the archive rather than being dropped
+      silently, because whoever opens the zip has no other way to know it is partial.
+
+    Built in memory: the caller is the same machine, and a temp file would need
+    cleanup on every failure path.
+    """
+    import io
+    import time
+    import zipfile
+
+    import main
+    from fastapi.responses import StreamingResponse
+
+    root = (Path(main.DATA_DIR) / "logs").resolve()
+    if not root.is_dir():
+        raise HTTPException(404, "no logs directory")
+
+    buffer = io.BytesIO()
+    omitted: list[str] = []
+    total = 0
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            try:
+                resolved = path.resolve()
+            except OSError:
+                omitted.append(path.name)
+                continue
+            if not resolved.is_relative_to(root):
+                continue
+            rel = resolved.relative_to(root).as_posix()
+            try:
+                size = resolved.stat().st_size
+            except OSError:
+                omitted.append(rel)
+                continue
+            if total + size > MAX_LOG_BUNDLE_BYTES:
+                omitted.append(rel)
+                continue
+            try:
+                archive.write(resolved, arcname=rel)
+            except OSError:
+                omitted.append(rel)
+                continue
+            total += size
+        if omitted:
+            archive.writestr(
+                "_OMITTED.txt",
+                "Left out: the bundle reached its "
+                f"{MAX_LOG_BUNDLE_BYTES // (1024 * 1024)} MiB limit, or the file could "
+                "not be read.\n\n" + "\n".join(omitted) + "\n",
+            )
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return StreamingResponse(
+        iter([buffer.getvalue()]),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="lunarshroud-logs-{stamp}.zip"'
+        },
+    )

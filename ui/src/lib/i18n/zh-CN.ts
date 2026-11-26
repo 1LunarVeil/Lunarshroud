@@ -747,6 +747,7 @@ export const ZH_CN: Record<string, string> = {
   "logs.copyFailed": "复制失败：浏览器拒绝了剪贴板访问",
   "logs.openFolder": "打开日志文件夹",
   "logs.openFailed": "无法打开日志文件夹",
+  "logs.downloadBundle": "下载全部日志（zip）",
   "logs.count": "显示 {shown} / {total} 行",
   "logs.noInstances": "暂无实例",
   "logs.empty": "暂无日志",

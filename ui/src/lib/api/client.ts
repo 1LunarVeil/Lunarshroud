@@ -511,3 +511,46 @@ export function watchSocket(path: string, handlers: SocketHandlers): SocketWatch
 export function readContractHeader(response: Response, name: string): string | null {
   return response.headers.get(name);
 }
+
+/**
+ * Download a binary endpoint as a file.
+ *
+ * The session token travels in a **header**, so a bare `<a href>` to the endpoint
+ * would arrive unauthenticated and get a 401. This reuses `attempt` (the same auth
+ * path as every other call) and then hands the bytes to a blob URL.
+ *
+ * Blob rather than streaming: the only caller is the log bundle, which the backend
+ * caps at 50 MiB — a size the page can hold once. A larger export would need a
+ * stream-to-disk path through Tauri, which is a different feature.
+ */
+export async function downloadFile(
+  path: string,
+  filename: string,
+  options: RequestOptions = {},
+): Promise<void> {
+  const response = await attempt('GET', path, undefined, {
+    ...options,
+    noRetry: true,
+    // Bundling logs takes a moment on a machine with many instance logs.
+    timeoutMs: options.timeoutMs ?? 60_000,
+  });
+  if (!response.ok) {
+    // Surface the backend's own message: "no logs directory" is actionable, a bare
+    // 404 rendered as a failed download is not.
+    let detail = `HTTP ${response.status}`;
+    try {
+      const body = await response.json();
+      if (body && typeof body.error === 'string') detail = body.error;
+    } catch {
+      /* body was not JSON; keep the status */
+    }
+    throw new ApiError(detail, response.status, null);
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}

@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Copy, Download, FolderOpen, Info, Pause, Play, RotateCcw, Trash2 } from 'lucide-react';
+import { Archive, Copy, Download, FolderOpen, Info, Pause, Play, RotateCcw, Trash2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useInstanceStore } from '@/lib/stores/instances';
 import { instancesApi, historyApi, systemApi } from '@/lib/api';
 import { openPath } from '@/lib/api/client';
+import { downloadFile } from '@/lib/api/client';
 import type { HistoryRecord, LogLine } from '@/lib/api/types';
 import { translate, localizeBackendError } from '@/lib/i18n';
 import { cn, formatDuration, formatTime } from '@/lib/utils';
@@ -170,6 +171,24 @@ function LogsPanel() {
     }
   };
 
+  /**
+   * Download every log file as one zip.
+   *
+   * The in-memory buffer view is what the user is looking at; this is the file on
+   * disk, which is what a bug report needs. They are different things and the two
+   * buttons say so.
+   */
+  const downloadBundle = async () => {
+    try {
+      await downloadFile(
+        systemApi.logsBundlePath(),
+        `lunarshroud-logs-${Date.now()}.zip`,
+      );
+    } catch (error) {
+      toast.error(localizeBackendError(error instanceof Error ? error.message : error));
+    }
+  };
+
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex flex-wrap items-center gap-2 border-b border-[var(--border)] px-4 py-2">
@@ -256,6 +275,15 @@ function LogsPanel() {
           title={translate('logs.download')}
         >
           <Download size={13} aria-hidden="true" />
+        </Button>
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => void downloadBundle()}
+          aria-label={translate('logs.downloadBundle')}
+          title={translate('logs.downloadBundle')}
+        >
+          <Archive size={13} aria-hidden="true" />
         </Button>
         <Button
           size="sm"
