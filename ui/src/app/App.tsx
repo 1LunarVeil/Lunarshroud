@@ -70,6 +70,14 @@ export function App() {
     if (preset) document.documentElement.dataset.font = preset;
   }, [config.data?.font_preset]);
 
+  // Opt-in high contrast. An attribute rather than inline property overrides, so the
+  // theme-specific block in tokens.css picks the right ramp for light vs dark.
+  useEffect(() => {
+    const root = document.documentElement;
+    if (config.data?.high_contrast === true) root.dataset.contrast = 'high';
+    else delete root.dataset.contrast;
+  }, [config.data?.high_contrast]);
+
   /**
    * Whole-window wallpaper.
    *

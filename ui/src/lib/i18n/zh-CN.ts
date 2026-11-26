@@ -905,6 +905,8 @@ export const ZH_CN: Record<string, string> = {
   "settings.font_system": "系统默认",
   "settings.font_serif": "衬线",
   "settings.font_mono": "等宽",
+  "settings.highContrast": "高对比模式",
+  "settings.highContrastHelp": "把次要文字与边框加粗一级，不改变色相。与系统的高对比主题互不影响。",
   "settings.appearanceProfile": "外观档案",
   "settings.appearanceProfileHelp": "只导出外观相关的设置（主题、强调色、字体、身份、背景、聊天显示偏好）。不含模型路径、密钥或窗口位置——那不是主题该带走的东西。导入后需要按「保存」才会生效。",
   "settings.appearanceExport": "导出",

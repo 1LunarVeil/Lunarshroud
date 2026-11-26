@@ -276,6 +276,18 @@ export function AppearanceTab() {
         </p>
       </fieldset>
 
+      {/*
+        Separate from the OS high-contrast theme (`forced-colors`), which the app
+        already honours: this raises the text ramp and borders for users who want it
+        without switching the whole system, or who cannot switch it.
+      */}
+      <Switch
+        checked={Boolean(draft.high_contrast)}
+        onCheckedChange={(next) => patch({ high_contrast: next })}
+        label={translate('settings.highContrast')}
+        description={translate('settings.highContrastHelp')}
+      />
+
       <section className="flex flex-col gap-4 border-t border-[var(--border)] pt-5">
         <SectionHeader title={translate('settings.identityTitle')} />
         <div className="grid gap-4 sm:grid-cols-2">

@@ -900,6 +900,8 @@ export const EN_US: Record<string, string> = {
   "settings.font_system": "System",
   "settings.font_serif": "Serif",
   "settings.font_mono": "Monospace",
+  "settings.highContrast": "High contrast",
+  "settings.highContrastHelp": "Strengthens secondary text and borders without changing hues. Independent of the OS high-contrast theme.",
   "settings.appearanceProfile": "Appearance profile",
   "settings.appearanceProfileHelp": "Exports appearance settings only (theme, accent, font, identity, background, chat display). No model paths, keys or window geometry — those do not belong in a theme file. An import stages the values; press Save to apply.",
   "settings.appearanceExport": "Export",

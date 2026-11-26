@@ -145,3 +145,47 @@ test('keyboard reaches every sidebar destination @a11y', async ({ page }) => {
   });
   expect(outline?.style).not.toBe('none');
 });
+
+/*
+  High contrast gets its own pass rather than riding along with the default one.
+
+  The opt-in ramp changes the text tokens, so the default-theme result says nothing
+  about it — and a regression there would be invisible: the page still renders, it just
+  stops being more readable than the default, which is the one thing the setting
+  promises. Same page list as above, so a page whose copy hard-codes a colour cannot
+  hide in the unvisited half.
+*/
+for (const theme of ['light', 'dark'] as const) {
+  test(`no WCAG A/AA violations in ${theme} theme with high contrast @a11y`, async ({
+    page,
+  }) => {
+    const evidence = collectEvidence(page);
+    await boot(page, evidence);
+    await page.evaluate((isDark) => {
+      document.documentElement.classList.toggle('theme-dark', isDark);
+      // Set the attribute directly: this suite is about rendering, and going through
+      // the settings sheet would add a save round trip per theme.
+      document.documentElement.dataset.contrast = 'high';
+    }, theme === 'dark');
+
+    const failures: string[] = [];
+    for (const pageId of PAGES) {
+      await goTo(page, pageId);
+      await page.waitForTimeout(250);
+      await settle(page);
+      const violations = await runAxe(page);
+      const blocking = violations.filter(
+        (violation) => violation.impact === 'critical' || violation.impact === 'serious',
+      );
+      if (blocking.length) {
+        failures.push(`[${pageId}]\n${describeViolations(blocking)}`);
+      }
+    }
+
+    expect(
+      failures.join('\n\n'),
+      `accessibility violations (${theme}, high contrast):\n${failures.join('\n\n')}`,
+    ).toBe('');
+    expect(evidence.consoleErrors, evidence.consoleErrors.join('\n')).toEqual([]);
+  });
+}

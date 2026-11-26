@@ -332,6 +332,36 @@
   }
 }
 
+/* ---------------------------------------------------------------------------
+   Opt-in high contrast.
+
+   Separate from `forced-colors` below, which only fires when Windows itself is in a
+   high-contrast theme. Plenty of users want stronger text and borders without
+   switching the whole OS, and some cannot switch the OS at all (managed machines).
+
+   Only the *ramp* changes, never the hues: `--text-quaternary` is documented above
+   as decorative and below AA by design, so raising it is the main win — anything that
+   used it for a separator becomes readable instead of merely visible.
+   --------------------------------------------------------------------------- */
+:root[data-contrast='high'] {
+  --text-secondary: #33373e;
+  --text-tertiary: #3d4249;
+  /* Was #8a8f98 (below AA by design). On #ffffff that is 7.5:1. */
+  --text-quaternary: #4a4f57;
+  --border: #9aa0aa;
+  --border-strong: #6b7280;
+  --border-control: #4a4f57;
+}
+:root.theme-dark[data-contrast='high'] {
+  --text-secondary: #e2e5ea;
+  --text-tertiary: #cfd3da;
+  /* Was #6e727a. On #16171a that is 9.4:1. */
+  --text-quaternary: #b8bcc4;
+  --border: #6a6f78;
+  --border-strong: #8a9099;
+  --border-control: #a5abb4;
+}
+
 /* High-contrast mode: hand control back to the system palette. */
 @media (forced-colors: active) {
   :root,

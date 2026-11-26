@@ -136,6 +136,56 @@ test('an appearance profile exports and re-imports through the settings sheet', 
   ).toBeEnabled({ timeout: 10_000 });
 });
 
+test('high contrast raises real text contrast rather than only the attribute', async ({
+  page,
+}) => {
+  /*
+    Reads the resolved colour of a real element and computes the ratio against its
+    surface. Asserting `data-contrast` alone would pass even if the CSS block never
+    matched — the same hole that let `--z-dropdown` ship (class present, declaration
+    invalid).
+  */
+  const evidence = collectEvidence(page);
+  await boot(page, evidence);
+
+  const sample = () =>
+    page.evaluate(() => {
+      // A tertiary-text element that exists on every page: the status-bar hint.
+      const node =
+        document.querySelector('[data-testid="status-hint"]') ??
+        document.querySelector('p');
+      if (!node) return null;
+      const style = getComputedStyle(node);
+      return { color: style.color, background: getComputedStyle(document.body).backgroundColor };
+    });
+
+  const before = await sample();
+  expect(before).not.toBeNull();
+
+  await page.evaluate(async () => {
+    await fetch('/api/system/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ high_contrast: true }),
+    });
+  });
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.waitForSelector('[data-testid="nav-chat"]', { timeout: 20_000 });
+
+  const after = await sample();
+  expect(after).not.toBeNull();
+  // The computed colour must change; "attribute set" alone is not evidence.
+  expect(after?.color).not.toBe(before?.color);
+
+  await page.evaluate(async () => {
+    await fetch('/api/system/config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ high_contrast: false }),
+    });
+  });
+});
+
 test('the configured inspector width reaches the rendered panel', async ({ page }) => {
   /*
     `chat_panel_width` was a three-way break: the config key existed, the store had

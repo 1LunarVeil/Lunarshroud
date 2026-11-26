@@ -459,6 +459,58 @@ def test_every_font_preset_has_a_css_block_and_sets_the_body_token():
         assert "--font-body" in body, f"font preset {name!r} does not set --font-body"
 
 
+def test_high_contrast_actually_increases_contrast_in_both_themes():
+    """The `data-contrast='high'` block must be strictly stronger than the defaults.
+
+    A "high contrast" switch whose values happen to be equal — or worse, weaker — is
+    a control that does nothing, which is the same failure as a typo'd CSS token: it
+    compiles, it renders, and the user concludes their eyes are the problem.
+
+    Each overriding block is compared against the theme it belongs to, on the surface
+    that theme paints text on.
+    """
+    tokens = _read(TOKENS)
+    blocks = dict(_theme_blocks())
+    light_block, dark_block = blocks["light"], blocks["dark"]
+    light_surface = _hex(light_block, "--surface")
+    dark_surface = _hex(dark_block, "--surface")
+    assert light_surface is not None and dark_surface is not None
+
+    high_blocks = {
+        "light": re.search(r":root\[data-contrast='high'\]\s*\{([^}]*)\}", tokens),
+        "dark": re.search(r":root\.theme-dark\[data-contrast='high'\]\s*\{([^}]*)\}", tokens),
+    }
+    assert high_blocks["light"] and high_blocks["dark"], (
+        "missing a data-contrast='high' block for one of the themes"
+    )
+
+    problems: list[str] = []
+    for theme in ("light", "dark"):
+        base = light_block if theme == "light" else dark_block
+        surface = light_surface if theme == "light" else dark_surface
+        high = high_blocks[theme]
+        assert high is not None
+        for name in ("--text-secondary", "--text-tertiary", "--text-quaternary"):
+            before = _hex(base, name)
+            after = _hex(high.group(1), name)
+            if before is None or after is None:
+                problems.append(f"{theme}: {name} missing from one of the blocks")
+                continue
+            before_ratio = _contrast(before, surface)
+            after_ratio = _contrast(after, surface)
+            if after_ratio <= before_ratio:
+                problems.append(
+                    f"{theme}: {name} went from {before_ratio:.2f}:1 to "
+                    f"{after_ratio:.2f}:1 — high contrast must be stronger"
+                )
+            if after_ratio < 4.5:
+                problems.append(
+                    f"{theme}: {name} is only {after_ratio:.2f}:1 in high contrast"
+                )
+
+    assert not problems, "high-contrast overrides are not stronger:\n" + "\n".join(problems)
+
+
 def test_the_accent_gate_rejects_a_low_contrast_preset():
     """Meta-check: the gate above must actually fail on a bad pair.
 

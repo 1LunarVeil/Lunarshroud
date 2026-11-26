@@ -337,6 +337,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 每个预设是一串含中文字体的回退栈，只写一个拉丁字体名会让中文回退到
     # 不匹配的字形。system 是唯一在任何机器上都存在的选项。
     "font_preset": "system",
+    # 高对比模式：把文本色阶与边框加粗一级。与系统的 `forced-colors` 不是一回事
+    # （后者只在 Windows 自身开了高对比时生效），这里允许用户在普通系统设置下
+    # 主动要更强的文字与边框。
+    "high_contrast": False,
     # 原生 Chat 的显示身份。名字是短文本；头像既可以是短文本（emoji/首字母），
     # 也可以是 `data:image/…;base64,…` 图片 —— **不落盘**，避免 CSP 以外的
     # 路径校验与清理问题。图片尺寸在前端裁剪到 128×128、编码后 ≤ 64 KiB，
@@ -683,6 +687,11 @@ def validate_config(cfg: dict[str, Any], *, repair: bool = False) -> dict[str, A
         "font_preset",
         _is_one_of(candidate.get("font_preset"), {"system", "serif", "mono"}),
         "font_preset must be 'system', 'serif' or 'mono'",
+    )
+    check(
+        "high_contrast",
+        isinstance(candidate.get("high_contrast"), bool),
+        "high_contrast must be a boolean",
     )
     # 联网搜索：布尔 + 短字符串 + 两个数值。端点本身在**使用时**由
     # `web_search.validate_endpoint` 再做一次完整校验（httpx 解析、回环策略），

@@ -777,6 +777,8 @@ export interface AppConfig {
   accent_preset: 'blue' | 'violet' | 'teal' | 'amber' | 'rose' | 'green';
   /** Closed set; each preset is a full stack including CJK fallbacks. */
   font_preset: 'system' | 'serif' | 'mono';
+  /** Strengthen the text ramp and borders without changing hues. */
+  high_contrast: boolean;
   chat_assistant_name: string;
   chat_user_name: string;
   chat_assistant_avatar: string;
