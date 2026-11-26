@@ -459,6 +459,106 @@ def test_the_usage_summary_type_matches_the_route_it_reads():
         f"{sorted(ui_fields - backend_fields)}"
     )
 
+    expected_model_keys = {
+        "model",
+        "requests",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "avg_tokens_per_second",
+    }
+    row_block = api_types.split("export interface UsageModelRow {", 1)
+    assert len(row_block) == 2, "cannot find UsageModelRow in types.ts"
+    ui_model_fields = set(
+        re.findall(r"^\s{2}(\w+)\??:", row_block[1].split("\n}", 1)[0], re.M)
+    )
+    assert ui_model_fields == expected_model_keys, (
+        "UsageModelRow drifted from the row _model_rows builds: "
+        f"{sorted(ui_model_fields ^ expected_model_keys)}"
+    )
+
+
+def test_the_appearance_profile_exports_only_real_config_keys():
+    """Every key an exported appearance profile carries must be a config key.
+
+    The export writes `APPEARANCE_KEYS`, and the import feeds those keys straight into
+    the settings form, which PUTs them. A typo there would produce a profile that the
+    user cannot import — `update_config` rejects unknown keys with 400, and the message
+    ("unsupported config key(s)") tells someone holding a theme file nothing.
+
+    Also checks the reverse intent: the list must stay narrow. `llama_server_path` or
+    the gateway key appearing in a file called "-appearance-.json" would be a
+    credential export wearing a theme file's name.
+    """
+    import sys
+
+    backend_dir = REPO_ROOT / "backend"
+    if str(backend_dir) not in sys.path:
+        sys.path.insert(0, str(backend_dir))
+    import config as backend_config  # noqa: E402
+
+    source = (
+        UI_SRC / "features" / "settings" / "tabs" / "AppearanceTab.tsx"
+    ).read_text(encoding="utf-8")
+    block = source.split("const APPEARANCE_KEYS = [", 1)
+    assert len(block) == 2, "cannot find APPEARANCE_KEYS in AppearanceTab.tsx"
+    keys = re.findall(r"'([a-z_]+)'", block[1].split("] as const", 1)[0])
+    assert keys, "APPEARANCE_KEYS is empty"
+
+    config_keys = set(backend_config.DEFAULT_CONFIG)
+    unknown = sorted(set(keys) - config_keys)
+    assert not unknown, f"appearance profile exports keys the backend rejects: {unknown}"
+
+    # Nothing secret may travel in a theme file.
+    forbidden = {
+        "api_server_key",
+        "llama_server_path",
+        "default_model_dir",
+        "launcher_port",
+        "web_search_endpoint",
+        "model_directory",
+    }
+    leaked = sorted(set(keys) & forbidden)
+    assert not leaked, (
+        f"appearance profile carries non-appearance settings: {leaked}. A file the "
+        "user shares as a theme must not contain machine paths or credentials."
+    )
+    """§2.41 for the usage page: the type is an assertion, so reconcile it.
+
+    `UsageSummary` drives a table now (per-model rows), where a renamed field does
+    not throw — it renders an empty column, which is the quietest failure mode this
+    project has shipped twice (`memory_used_mb`, `utilization_percent`).
+
+    Both directions: a field the route emits but the type omits is invisible to the
+    UI; a field the type invents reads `undefined` forever.
+    """
+    import sys
+
+    backend_dir = REPO_ROOT / "backend"
+    if str(backend_dir) not in sys.path:
+        sys.path.insert(0, str(backend_dir))
+    from core import usage_stats  # noqa: E402
+
+    # The empty report is the shape every branch returns, so its keys are the
+    # contract without needing a database.
+    sample = usage_stats.summarize(7, now=0.0)
+    backend_fields = set(sample)
+    assert backend_fields, "summarize() returned nothing"
+
+    api_types = (UI_SRC / "lib" / "api" / "types.ts").read_text(encoding="utf-8")
+    block = api_types.split("export interface UsageSummary {", 1)
+    assert len(block) == 2, "cannot find UsageSummary in types.ts"
+    ui_fields = set(re.findall(r"^\s{2}(\w+)\??:", block[1].split("\n}", 1)[0], re.M))
+
+    assert not sorted(backend_fields - ui_fields), (
+        "usage fields the route returns but UsageSummary omits: "
+        f"{sorted(backend_fields - ui_fields)}"
+    )
+    assert not sorted(ui_fields - backend_fields), (
+        "usage fields UsageSummary declares that nothing sends: "
+        f"{sorted(ui_fields - backend_fields)}"
+    )
+
     # The per-model table reads exactly these four columns.
     model_sample = sample["models"][0] if sample["models"] else None
     expected_model_keys = {

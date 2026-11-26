@@ -97,6 +97,45 @@ test('dragging the sidebar handle writes the width back to config', async ({ pag
   });
 });
 
+test('an appearance profile exports and re-imports through the settings sheet', async ({
+  page,
+}) => {
+  /*
+    Drives the file round trip a user actually performs. The export is a download and
+    the import is a file input, so this intercepts the download and feeds the file
+    back through `setInputFiles` — the same bytes in both directions.
+  */
+  const evidence = collectEvidence(page);
+  await boot(page, evidence);
+  const sheet = page.getByRole('dialog');
+  await page.getByTestId('nav-settings').click();
+  await expect(sheet).toBeVisible({ timeout: 10_000 });
+  await sheet.getByRole('button', { name: /外观|Appearance/ }).click();
+
+  const downloadPromise = page.waitForEvent('download');
+  await sheet.getByTestId('appearance-export').click();
+  const download = await downloadPromise;
+  const path = await download.path();
+  expect(path, 'the export produced no file').not.toBeNull();
+
+  const fs = await import('node:fs/promises');
+  const text = await fs.readFile(path as string, 'utf8');
+  const profile = JSON.parse(text) as Record<string, unknown>;
+
+  // The profile must carry appearance keys and nothing sensitive.
+  expect(Object.keys(profile)).toContain('accent_preset');
+  expect(Object.keys(profile)).toContain('font_preset');
+  expect(profile).not.toHaveProperty('llama_server_path');
+  expect(profile).not.toHaveProperty('api_server_key');
+
+  // Import it back. It stages into the draft, so Save becomes available.
+  const input = sheet.locator('input[type="file"][accept*="json"]').last();
+  await input.setInputFiles(path as string);
+  await expect(
+    sheet.getByRole('button', { name: /保存|Save/ }),
+  ).toBeEnabled({ timeout: 10_000 });
+});
+
 test('the configured inspector width reaches the rendered panel', async ({ page }) => {
   /*
     `chat_panel_width` was a three-way break: the config key existed, the store had

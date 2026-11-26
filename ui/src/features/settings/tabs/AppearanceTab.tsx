@@ -7,6 +7,7 @@ import { Field, Input, Switch } from '@/components/ui/Input';
 import { SectionHeader } from '@/components/ui/Feedback';
 import { translate } from '@/lib/i18n';
 import { cn } from '@/lib/utils';
+import type { AppConfig } from '@/lib/api/types';
 import { identityFromConfig, AvatarField, BackgroundField } from '@/features/settings/persona';
 import { Laptop, Moon, Sun } from 'lucide-react';
 
@@ -26,6 +27,39 @@ const ACCENT_PRESETS = ['blue', 'violet', 'teal', 'amber', 'rose', 'green'] as c
 const FONT_PRESETS = ['system', 'serif', 'mono'] as const;
 
 /**
+ * The appearance keys an export carries.
+ *
+ * Deliberately narrow. An "export my theme" that dumped the whole config would also
+ * carry `llama_server_path`, the gateway key and the window geometry — a credential
+ * file wearing a theme file's name. Only presentation settings travel.
+ */
+const APPEARANCE_KEYS = [
+  'theme',
+  'accent_preset',
+  'font_preset',
+  'chat_reasoning',
+  'chat_user_name',
+  'chat_assistant_name',
+  'chat_user_avatar',
+  'chat_assistant_avatar',
+  'chat_background_image',
+  'chat_background_opacity',
+  'chat_background_blur',
+  'background_whole_window',
+  'chat_send_key',
+  'chat_show_stats',
+  'chat_show_timestamps',
+] as const;
+
+function pickAppearance(config: Partial<AppConfig>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of APPEARANCE_KEYS) {
+    if (key in config) out[key] = config[key as keyof AppConfig];
+  }
+  return out;
+}
+
+/**
  * Appearance: theme, language, chat identity and the chat background.
  *
  * Theme and language live in the UI store (localStorage) because they decide how
@@ -38,6 +72,52 @@ export function AppearanceTab() {
   const locale = useUiStore((state) => state.locale);
   const setLocale = useUiStore((state) => state.setLocale);
   const [identityError, setIdentityError] = useState<string | null>(null);
+  const [profileError, setProfileError] = useState<string | null>(null);
+
+  /**
+   * Import an appearance profile.
+   *
+   * It stages the values into the form draft rather than saving immediately: an
+   * imported profile overwrites the identity and wallpaper the user currently has,
+   * and silently committing that from a file dialog would be a write the user never
+   * confirmed. They still press Save — and the Save button appears because the draft
+   * is now dirty.
+   */
+  const importProfile = async (file: File | undefined) => {
+    if (!file) return;
+    setProfileError(null);
+    try {
+      const text = await file.text();
+      const parsed: unknown = JSON.parse(text);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        setProfileError(translate('settings.appearanceBadFile'));
+        return;
+      }
+      const incoming = parsed as Record<string, unknown>;
+      const accepted: Record<string, unknown> = {};
+      for (const key of APPEARANCE_KEYS) {
+        if (!(key in incoming)) continue;
+        // Shape check per key happens in the backend; here only "is this a key we
+        // own" and "is the type plausible" — an unknown key would make the PUT 400
+        // with a message about config keys, which is not actionable for a user.
+        const value = incoming[key];
+        if (
+          typeof value === 'string' ||
+          typeof value === 'number' ||
+          typeof value === 'boolean'
+        ) {
+          accepted[key] = value;
+        }
+      }
+      if (!Object.keys(accepted).length) {
+        setProfileError(translate('settings.appearanceNoFields'));
+        return;
+      }
+      patch(accepted as Partial<AppConfig>);
+    } catch {
+      setProfileError(translate('settings.appearanceBadFile'));
+    }
+  };
 
   const themes: Array<{ id: ThemePreference; labelKey: string; icon: typeof Sun }> = [
     { id: 'system', labelKey: 'settings.themeSystem', icon: Laptop },
@@ -301,6 +381,50 @@ export function AppearanceTab() {
             onChange={(event) => patch({ chat_panel_width: Number(event.target.value) })}
           />
         </Field>
+      </section>
+
+      <section className="flex flex-col gap-3 border-t border-[var(--border)] pt-5">
+        <SectionHeader title={translate('settings.appearanceProfile')} />
+        <p className="text-[length:var(--text-2xs)] text-[var(--text-tertiary)]">
+          {translate('settings.appearanceProfileHelp')}
+        </p>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            data-testid="appearance-export"
+            onClick={() => {
+              // Only the appearance keys, not the whole config: a profile that carried
+              // `llama_server_path` or the gateway key would be a credential export
+              // masquerading as a theme file.
+              const profile = pickAppearance(draft);
+              const blob = new Blob([JSON.stringify(profile, null, 2)], {
+                type: 'application/json',
+              });
+              const url = URL.createObjectURL(blob);
+              const anchor = document.createElement('a');
+              anchor.href = url;
+              anchor.download = `lunarshroud-appearance-${Date.now()}.json`;
+              anchor.click();
+              setTimeout(() => URL.revokeObjectURL(url), 1000);
+            }}
+            className="h-[var(--control-h-sm)] rounded-[var(--radius-sm)] border border-[var(--border-control)] px-3 text-[length:var(--text-xs)] text-[var(--text-secondary)] hover:bg-[var(--hover)]"
+          >
+            {translate('settings.appearanceExport')}
+          </button>
+          <label className="flex h-[var(--control-h-sm)] cursor-pointer items-center rounded-[var(--radius-sm)] border border-[var(--border-control)] px-3 text-[length:var(--text-xs)] text-[var(--text-secondary)] hover:bg-[var(--hover)]">
+            {translate('settings.appearanceImport')}
+            <input
+              type="file"
+              accept="application/json,.json"
+              aria-label={translate('settings.appearanceImport')}
+              className="sr-only"
+              onChange={(event) => void importProfile(event.target.files?.[0])}
+            />
+          </label>
+        </div>
+        {profileError ? (
+          <p className="text-[length:var(--text-2xs)] text-[var(--danger)]">{profileError}</p>
+        ) : null}
       </section>
 
       <SaveRow onSave={() => void save()} saving={saving} dirty={dirty} />
