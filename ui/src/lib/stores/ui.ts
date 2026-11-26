@@ -51,6 +51,24 @@ function readNumber(key: string, fallback: number): number {
   }
 }
 
+/**
+ * Whether this machine has ever stored a layout width.
+ *
+ * The backend `chat_sidebar_width` / `chat_panel_width` keys exist so a layout
+ * survives moving to another machine (see the comment on them in `config.py`). They
+ * were **never read** — the settings sheet wrote them and layout came from
+ * localStorage only. `hydrateLayoutFromConfig` below closes that gap, and this
+ * predicate is what makes it non-destructive: an existing local value always wins,
+ * because it is the one the user last dragged on this machine.
+ */
+function hasStored(key: string): boolean {
+  try {
+    return localStorage.getItem(key) !== null;
+  } catch {
+    return false;
+  }
+}
+
 function readBool(key: string, fallback: boolean): boolean {
   try {
     const raw = localStorage.getItem(key);
@@ -112,6 +130,7 @@ interface UiState {
   setSidebarCollapsed: (collapsed: boolean) => void;
   setInspectorWidth: (width: number) => void;
   setInspectorOpen: (open: boolean) => void;
+  hydrateLayoutFromConfig: (config: { sidebar?: number; panel?: number }) => void;
   setSettingsOpen: (open: boolean) => void;
   setSettingsTab: (tab: string) => void;
   openSettings: (tab?: string) => void;
@@ -186,6 +205,28 @@ export const useUiStore = create<UiState>((set, get) => ({
   setInspectorWidth: (width) => {
     write(STORAGE.inspectorWidth, String(width));
     set({ inspectorWidth: width });
+  },
+
+  /**
+   * Seed layout widths from backend config, but only where this machine has no
+   * stored value.
+   *
+   * The config keys exist so a layout survives moving to another machine; before
+   * this they were written by the settings sheet and never read, so the promise was
+   * empty. A local value always wins: it is what the user last dragged *here*, and
+   * overwriting it on every launch would make resizing appear not to stick.
+   *
+   * `0` is the config's "unset" sentinel (see `config.py`), not a width.
+   */
+  hydrateLayoutFromConfig: (config: { sidebar?: number; panel?: number }) => {
+    const patch: { sidebarWidth?: number; inspectorWidth?: number } = {};
+    if (!hasStored(STORAGE.sidebarWidth) && (config.sidebar ?? 0) > 0) {
+      patch.sidebarWidth = config.sidebar;
+    }
+    if (!hasStored(STORAGE.inspectorWidth) && (config.panel ?? 0) > 0) {
+      patch.inspectorWidth = config.panel;
+    }
+    if (Object.keys(patch).length) set(patch);
   },
 
   setInspectorOpen: (open) => {

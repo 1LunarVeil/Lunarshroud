@@ -35,12 +35,15 @@ export function ChatInspector({
   toolRoot,
   onClose,
   onSaved,
+  width = 0,
 }: {
   conversation: Conversation | null;
   instances: Instance[];
   activeInstanceId: string | null;
   toolRoot: string | null;
   onClose: () => void;
+  /** Pixels; 0 means "use the CSS default". */
+  width?: number;
   onSaved: (settings: ResolvedChatSettings) => void;
 }) {
   const resolved = useMemo(() => resolveChatSettings(conversation), [conversation]);
@@ -103,6 +106,13 @@ export function ChatInspector({
     <aside
       data-testid="chat-inspector"
       aria-label={translate('chat.inspector')}
+      /*
+        `--inspector-w` is the default; a stored/configured width overrides it inline.
+        Without the override the store's `inspectorWidth` (fed from
+        `chat_panel_width`) reached nothing, which is why the setting had no visible
+        effect even after the config key was hydrated.
+      */
+      style={width > 0 ? ({ ['--inspector-w' as string]: `${width}px` } as React.CSSProperties) : undefined}
       className="flex min-h-0 w-[var(--inspector-w)] shrink-0 flex-col border-s border-[var(--border)] bg-[var(--panel)]"
     >
       <header className="flex items-center gap-2 border-b border-[var(--border)] px-3 py-2">

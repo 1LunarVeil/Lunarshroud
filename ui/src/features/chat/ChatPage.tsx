@@ -74,6 +74,7 @@ export function ChatPage() {
   const [promptLibraryOpen, setPromptLibraryOpen] = useState(false);
   const inspectorOpen = useUiStore((state) => state.inspectorOpen);
   const setInspectorOpen = useUiStore((state) => state.setInspectorOpen);
+  const inspectorWidth = useUiStore((state) => state.inspectorWidth);
   const navigate = useUiStore((state) => state.navigate);
   const composerRef = useRef<{ focus: () => void; clear: () => void; insertText: (text: string) => void } | null>(null);
   const { streaming, live, run, stop, executeTool } = useChatStream();
@@ -542,6 +543,7 @@ export function ChatPage() {
           instances={instanceList}
           activeInstanceId={activeInstance?.id ?? null}
           toolRoot={toolRoot}
+          width={inspectorWidth}
           onClose={() => setInspectorOpen(false)}
           onSaved={(next) => {
             setSettings(next);

@@ -51,6 +51,18 @@ export function App() {
     if (preset) document.documentElement.dataset.accent = preset;
   }, [config.data?.accent_preset]);
 
+  // Seed layout widths from backend config where this machine has no stored value.
+  // The keys exist for "move to another machine and keep your layout"; they were
+  // never read before, so that promise was empty.
+  const hydrateLayout = useUiStore((state) => state.hydrateLayoutFromConfig);
+  useEffect(() => {
+    if (!config.data) return;
+    hydrateLayout({
+      sidebar: config.data.chat_sidebar_width,
+      panel: config.data.chat_panel_width,
+    });
+  }, [config.data, hydrateLayout]);
+
   // Same mechanism for the body font: a closed set in tokens.css, applied as an
   // attribute so the cascade (not JS) decides the stack.
   useEffect(() => {

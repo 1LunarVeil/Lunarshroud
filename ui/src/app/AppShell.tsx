@@ -1,5 +1,7 @@
 import { useEffect, useRef } from 'react';
+import { useMutation } from '@tanstack/react-query';
 import { PanelLeftOpen, Settings } from 'lucide-react';
+import { systemApi } from '@/lib/api';
 import { useUiStore } from '@/lib/stores/ui';
 import { useInstanceStore } from '@/lib/stores/instances';
 import { translate } from '@/lib/i18n';
@@ -41,6 +43,10 @@ export function AppShell() {
   const setSettingsOpen = useUiStore((state) => state.setSettingsOpen);
 
   const dragging = useRef(false);
+  // Fire-and-forget write of the dragged width into backend config (see onUp).
+  const saveWidth = useMutation({
+    mutationFn: (body: { chat_sidebar_width: number }) => systemApi.updateConfig(body),
+  });
 
   // Sidebar resize. Pointer capture keeps the drag alive when the cursor leaves
   // the 6px handle, and the keyboard path is handled in the handle's own onKeyDown.
@@ -50,7 +56,19 @@ export function AppShell() {
       const next = Math.min(440, Math.max(224, event.clientX));
       setWidth(next);
     };
+    /**
+     * Persist the width to backend config **on pointer-up**, not on every move.
+     *
+     * The local store is the source of truth during a drag (a write per pointermove
+     * would issue dozens of PUTs per second), but the config copy is what makes the
+     * layout follow a user to another machine — the reason those keys exist at all.
+     * A failed write is swallowed on purpose: the local value already applied, and a
+     * toast for a layout preference would be noise.
+     */
     const onUp = () => {
+      if (dragging.current) {
+        saveWidth.mutate({ chat_sidebar_width: useUiStore.getState().sidebarWidth });
+      }
       dragging.current = false;
       document.body.style.cursor = '';
     };
@@ -60,7 +78,7 @@ export function AppShell() {
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
     };
-  }, [setWidth]);
+  }, [setWidth, saveWidth]);
 
   return (
     <div className="flex h-full min-w-0 flex-col bg-[var(--canvas)] text-[var(--text)]">

@@ -1,4 +1,4 @@
-import { AtSign, Paperclip, SendHorizontal, Square } from 'lucide-react';
+import { Paperclip, SendHorizontal, Square } from 'lucide-react';
 import {
   forwardRef,
   useCallback,
@@ -336,14 +336,6 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
             >
               <Paperclip size={15} aria-hidden="true" />
             </button>
-            {!supportsVision ? (
-              <span
-                className="grid size-[26px] place-items-center text-[length:var(--text-2xs)] text-[var(--text-quaternary)]"
-                title={translate('chat.attachNoVision')}
-              >
-                <AtSign size={14} aria-hidden="true" />
-              </span>
-            ) : null}
 
             <span className="flex-1" />
 
